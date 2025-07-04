@@ -21,9 +21,9 @@ from collections import defaultdict
 import traceback
 
 # --- Integrated Imports from interactive_chunker.py ---
-from Semantic_Grouping import semantic_chunk_passage_from_grouping_logic
-from Semantic_Splitter import chunk_passage_text_splitter
-from Text_Splitter import chunk_passage_text_splitter
+from Method.Semantic_Grouping import semantic_chunk_passage_from_grouping_logic
+from Method.Semantic_Splitter import chunk_passage_text_splitter
+from Method.Text_Splitter import chunk_passage_text_splitter
 
 # Attempt to import OIE and Sentence Embedding tools
 try:
