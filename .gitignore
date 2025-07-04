@@ -1,0 +1,61 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Cấu hình server CoreNLP
+corenlp_server-*.props
+
+# Môi trường ảo
+env*/
+.venv/
+venv/
+env_3124/
+env310/
+env379/
+env3124/
+.env3124/
+
+# Output và dữ liệu tạm
+*.log
+*.tmp
+*.tsv
+*.zip
+*.bak
+*.swp
+.DS_Store
+*.props
+*.md
+*.csv
+
+# Dataset và output
+output_data/
+training_datasets/
+eval_results/
+robustirdata/
+*.zip
+*.txt
+training_datasets/
+TrainingData_MatchZoo_BEIR/
+robus_corpus/
+ranking_results/
+data/
+# Thư viện bên ngoài
+EmbeddingModel/
+CoreNLP_Lib/
+MatchZoo-2.2/
+MatchZoo-py-master/
+oie_cache/
+ranking/
+embedding/
+
+# IDE / Editor files
+.vscode/
+.idea/
+
+# Tập tin hệ thống
+*.sublime-workspace
+*.sublime-project
+
+integrated_robust04_data.csv
+F:\SematicSearch\data\data.csv
