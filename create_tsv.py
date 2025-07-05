@@ -3,7 +3,6 @@ import csv
 import os
 import re
 
-# Set a large but safe field size limit
 csv.field_size_limit(min(sys.maxsize, 2147483647))
 
 def detect_delimiter(file_path, sample_lines=5):
@@ -15,8 +14,7 @@ def detect_delimiter(file_path, sample_lines=5):
                 if i >= sample_lines:
                     break
                 sample += line
-        
-        # Count occurrences - prioritize tab for .tsv files
+
         tab_count = sample.count('\t')
         pipe_count = sample.count('|')
         comma_count = sample.count(',')
@@ -45,17 +43,15 @@ def detect_delimiter(file_path, sample_lines=5):
         best_count = delimiter_counts[best_delimiter]
         
         print(f"Best delimiter: '{best_delimiter}' (count: {best_count})")
-        
-        # Validate the choice by testing if it gives reasonable column count
+
         if best_count > 0:
             test_lines = sample.strip().split('\n')
             if len(test_lines) > 0:
                 test_columns = test_lines[0].split(best_delimiter)
                 print(f"Test split with '{best_delimiter}': {len(test_columns)} columns")
-                
-                # For the problematic case, pipe should give 6 columns
+
                 if len(test_columns) >= 6:
-                    print(f"✅ Delimiter '{best_delimiter}' gives reasonable column count")
+                    print(f"Delimiter '{best_delimiter}' gives reasonable column count")
                     return best_delimiter
         
         # Fallback logic
@@ -68,7 +64,7 @@ def detect_delimiter(file_path, sample_lines=5):
             
     except Exception as e:
         print(f"Error detecting delimiter: {e}")
-        return ','  # Default to comma
+        return ','  
 
 def validate_tsv_format(file_path):
     """Validate if TSV file has proper format"""
@@ -93,7 +89,7 @@ def validate_tsv_format(file_path):
         return False, f"Error validating: {e}"
 
 def fix_tsv_header(file_path):
-    """Fix TSV file header that has mixed delimiters"""
+    
     print(f"Fixing TSV header in: {file_path}")
     
     try:
@@ -107,8 +103,7 @@ def fix_tsv_header(file_path):
         # Show original header
         original_header = lines[0].strip()
         print(f"Original header: {repr(original_header)}")
-        
-        # Check if header needs fixing
+
         header_parts = original_header.split('\t')
         if len(header_parts) == 3:
             print("Header already has 3 tab-separated parts, no fix needed")
@@ -133,9 +128,9 @@ def fix_tsv_header(file_path):
         # Validate fixed file
         is_valid, message = validate_tsv_format(output_path)
         if is_valid:
-            print("✅ Fixed file has valid format!")
+            print("Fixed file has valid format!")
         else:
-            print(f"❌ Fixed file still has issues: {message}")
+            print(f"Fixed file still has issues: {message}")
             return None
         
         return output_path
@@ -145,18 +140,7 @@ def fix_tsv_header(file_path):
         return None
 
 def create_tsv_file(input_filename, output_filename, query_type="title_description", delimiter=None):
-    """
-    Create TSV file with format: query \t passage \t label
-    
-    Args:
-        input_filename: Input CSV file path
-        output_filename: Output TSV file path
-        query_type: Type of query to create
-                   - "title_description": Combine title and description
-                   - "description": Use description only
-                   - "title": Use title only
-        delimiter: CSV delimiter (',' or '|')
-    """
+
     rows_processed = 0
     
     try:
@@ -291,7 +275,7 @@ def get_delimiter_choice():
 
 def analyze_file_structure(file_path):
     """Analyze file structure to understand format better"""
-    print(f"📊 Analyzing file structure: {file_path}")
+    print(f"Analyzing file structure: {file_path}")
     
     try:
         with open(file_path, 'r', encoding='utf-8') as f:
@@ -367,7 +351,7 @@ def main():
         
         # Special handling for TSV files
         if input_file.lower().endswith('.tsv'):
-            print(f"\n📋 Detected TSV file: {input_file}")
+            print(f"\nDetected TSV file: {input_file}")
             
             # Validate current format
             is_valid, message = validate_tsv_format(input_file)
@@ -385,23 +369,23 @@ def main():
                     # Fix TSV header
                     fixed_file = fix_tsv_header(input_file)
                     if fixed_file:
-                        print(f"\n✅ Use this fixed file:")
+                        print(f"\nUse this fixed file:")
                         print(f"   {fixed_file}")
                         
                         use_fixed = input("\nUse fixed file for further processing? (y/n, default=n): ").strip().lower()
                         if use_fixed == 'y':
                             input_file = fixed_file
                         else:
-                            print("✅ Header fix complete. You can now use the fixed file.")
+                            print("Header fix complete. You can now use the fixed file.")
                             return
                     else:
-                        print("❌ Could not fix header automatically")
+                        print("Could not fix header automatically")
                         return
                 elif choice == "3":
                     return
                 # choice == "2" continues to full processing
             else:
-                print("✅ TSV file format is valid!")
+                print("TSV file format is valid!")
                 
                 # Offer to just copy/validate
                 copy_choice = input("File is already valid TSV. Just copy/validate? (y/n, default=y): ").strip().lower()
@@ -414,15 +398,15 @@ def main():
                     try:
                         import shutil
                         shutil.copy2(input_file, output_file)
-                        print(f"✅ File copied to: {output_file}")
+                        print(f"File copied to: {output_file}")
                         
                         # Quick validation
                         with open(output_file, 'r', encoding='utf-8') as f:
                             lines = f.readlines()
-                            print(f"📊 Total lines: {len(lines)}")
+                            print(f"Total lines: {len(lines)}")
                             if len(lines) > 1:
                                 first_data = lines[1].strip().split('\t')
-                                print(f"📋 First data row: {len(first_data)} fields")
+                                print(f"First data row: {len(first_data)} fields")
                         return
                     except Exception as e:
                         print(f"Error copying file: {e}")
@@ -483,13 +467,13 @@ def main():
     success = create_tsv_file(input_file, output_file, query_type, delimiter)
     
     if success:
-        print("\n🎉 TSV file created successfully!")
+        print("\nTSV file created successfully!")
         print("You can now use this file for your semantic search project.")
         print(f"\nNext step - Run controller:")
         print(f"python data_create_controller.py")
         print(f"Input file: {output_file}")
     else:
-        print("\n❌ Processing failed.")
+        print("\nProcessing failed.")
 
 if __name__ == "__main__":
     main()

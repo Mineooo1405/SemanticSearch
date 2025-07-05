@@ -27,7 +27,7 @@ env3124/
 *.props
 *.md
 *.csv
-
+*.env
 # Dataset và output
 output_data/
 training_datasets/
@@ -40,6 +40,7 @@ TrainingData_MatchZoo_BEIR/
 robus_corpus/
 ranking_results/
 data/
+combined_results/
 # Thư viện bên ngoài
 EmbeddingModel/
 CoreNLP_Lib/

@@ -6,9 +6,6 @@ import os
 from pathlib import Path
 from sklearn.metrics.pairwise import cosine_similarity
 
-# Ensure the Tool directory is in the Python path
-# This allows importing modules from the 'Tool' directory
-# Get the absolute path of the directory where this script is located
 try:
     script_dir = Path(__file__).resolve().parent
     project_root = script_dir
@@ -18,41 +15,18 @@ except NameError:
     project_root = Path(os.getcwd())
     sys.path.append(str(project_root))
 
+from Sentence_Embedding import sentence_embedding
+from rank_bm25 import BM25Okapi
 
-try:
-    from Tool.Sentence_Embedding import sentence_embedding
-except ImportError:
-    print("Error: Could not import sentence_embedding from Tool.Sentence_Embedding.")
-    print(f"Please ensure the script is run from the project root ({project_root}) or the path is correctly set.")
-    sys.exit(1)
-
-try:
-    from rank_bm25 import BM25Okapi
-except ImportError:
-    print("Error: 'rank_bm25' library not found.")
-    print("Please install it by running: pip install rank-bm25")
-    sys.exit(1)
 
 def simple_tokenizer(text):
-    """
-    A simple tokenizer that splits text into lowercased words.
-    """
+
     if not isinstance(text, str):
         return []
     return text.lower().split()
 
 def rank_by_bm25(query: str, chunks_df: pd.DataFrame, text_column: str = 'chunk_text') -> pd.DataFrame:
-    """
-    Ranks chunks in a DataFrame based on BM25 scores against a query.
 
-    Args:
-        query: The search query.
-        chunks_df: DataFrame containing the chunks.
-        text_column: The name of the column containing the chunk text.
-
-    Returns:
-        A new DataFrame with chunks sorted by BM25 score.
-    """
     print("\n--- Ranking with BM25 ---")
     if text_column not in chunks_df.columns:
         raise ValueError(f"Text column '{text_column}' not found in the DataFrame. Available columns: {chunks_df.columns.tolist()}")
@@ -61,11 +35,15 @@ def rank_by_bm25(query: str, chunks_df: pd.DataFrame, text_column: str = 'chunk_
     tokenized_corpus = [simple_tokenizer(doc) for doc in corpus]
     
     print(f"Fitting BM25 on {len(tokenized_corpus)} documents...")
-    bm25 = BM25Okapi(tokenized_corpus)
+    # Use epsilon smoothing (default 0.25) so IDF never becomes negative, avoiding negative BM25 scores
+    bm25 = BM25Okapi(tokenized_corpus, epsilon=0.25)
     
     print(f"Scoring query: '{query}'")
     tokenized_query = simple_tokenizer(query)
     doc_scores = bm25.get_scores(tokenized_query)
+    
+    # Ensure scores are non-negative (BM25 may still yield small negatives even with epsilon smoothing)
+    doc_scores = np.maximum(doc_scores, 0.0)
     
     ranked_df = chunks_df.copy()
     ranked_df['bm25_score'] = doc_scores
@@ -79,19 +57,6 @@ def rank_by_bm25(query: str, chunks_df: pd.DataFrame, text_column: str = 'chunk_
     return ranked_df
 
 def rank_by_cosine_similarity(query: str, chunks_df: pd.DataFrame, text_column: str = 'chunk_text', model_name: str = 'all-MiniLM-L6-v2', batch_size: int = 32) -> pd.DataFrame:
-    """
-    Ranks chunks in a DataFrame based on cosine similarity with a query embedding.
-
-    Args:
-        query: The search query.
-        chunks_df: DataFrame containing the chunks.
-        text_column: The name of the column containing the chunk text.
-        model_name: The name of the sentence embedding model to use.
-        batch_size: The batch size for embedding.
-
-    Returns:
-        A new DataFrame with chunks sorted by cosine similarity score.
-    """
     print("\n--- Ranking with Cosine Similarity ---")
     if text_column not in chunks_df.columns:
         raise ValueError(f"Text column '{text_column}' not found in the DataFrame. Available columns: {chunks_df.columns.tolist()}")
@@ -129,25 +94,22 @@ def rank_by_cosine_similarity(query: str, chunks_df: pd.DataFrame, text_column: 
     return ranked_df
 
 def interactive_mode():
-    """
-    Guides the user through an interactive session to get ranking parameters.
-    Returns a namespace object similar to what argparse produces.
-    """
+
     print("\n--- Interactive Chunk Ranker ---")
     
     # 1. Get input file path
     input_file = ""
     while True:
         try:
-            path_str = input("➡️ Enter the path to your input TSV file: ")
+            path_str = input("Enter the path to your input TSV file: ")
             input_path = Path(path_str.strip())
             if input_path.is_file():
                 input_file = str(input_path)
                 break
             else:
-                print(f"❌ Error: File not found at '{path_str}'. Please try again.")
+                print(f"Error: File not found at '{path_str}'. Please try again.")
         except KeyboardInterrupt:
-            print("\n👋 Exiting.")
+            print("\nExiting.")
             sys.exit(0)
         except Exception as e:
             print(f"An unexpected error occurred: {e}")
@@ -156,21 +118,21 @@ def interactive_mode():
     try:
         df = pd.read_csv(input_file, sep='\t', on_bad_lines='warn', nrows=5)
         df.columns = df.columns.str.strip()
-        print("\n✅ File loaded. Found columns:")
+        print("\nFile loaded. Found columns:")
         print(" | ".join(df.columns.tolist()))
     except Exception as e:
-        print(f"❌ Error reading file columns: {e}")
+        print(f"Error reading file columns: {e}")
         sys.exit(1)
         
     # 3. Get column names from user
     print("\nPlease confirm the column names to use (press Enter to accept default).")
-    query_id_column = input("➡️ Query ID column (default: query_id): ") or "query_id"
-    query_text_column = input("➡️ Query text column (default: query_text): ") or "query_text"
-    text_column = input("➡️ Chunk text column to rank (default: chunk_text): ") or "chunk_text"
+    query_id_column = input("Query ID column (default: query_id): ") or "query_id"
+    query_text_column = input("Query text column (default: query_text): ") or "query_text"
+    text_column = input("Chunk text column to rank (default: chunk_text): ") or "chunk_text"
     
     # 4. Get other parameters
-    output_dir = input("➡️ Output directory (default: ./ranking_results): ") or "./ranking_results"
-    embedding_model = input("➡️ Embedding model (default: all-MiniLM-L6-v2): ") or "all-MiniLM-L6-v2"
+    output_dir = input("Output directory (default: ./ranking_results): ") or "./ranking_results"
+    embedding_model = input("Embedding model (default: all-MiniLM-L6-v2): ") or "all-MiniLM-L6-v2"
     
     # 4b. Hỏi ngưỡng (tùy chọn)
     def _ask_float(prompt: str, default: float):
@@ -180,10 +142,10 @@ def interactive_mode():
         except ValueError:
             return default
 
-    cosine_pos_thr = _ask_float("➡️ Cosine POS threshold (default 0.75): ", 0.75)
-    cosine_neg_thr = _ask_float("➡️ Cosine NEG threshold (default 0.25): ", 0.25)
-    bm25_pos_thr   = _ask_float("➡️ BM25 POS threshold   (default 3.0): ", 3.0)
-    bm25_neg_thr   = _ask_float("➡️ BM25 NEG threshold   (default 1.0): ", 1.0)
+    cosine_pos_thr = _ask_float("Cosine POS threshold (default 0.75): ", 0.75)
+    cosine_neg_thr = _ask_float("Cosine NEG threshold (default 0.25): ", 0.25)
+    bm25_pos_thr   = _ask_float("BM25 POS threshold   (default 3.0): ", 3.0)
+    bm25_neg_thr   = _ask_float("BM25 NEG threshold   (default 1.0): ", 1.0)
 
     # 5. Return a namespace object similar to argparse
     class Args:
@@ -211,7 +173,7 @@ def interactive_mode():
     args.bm25_pos_threshold = bm25_pos_thr
     args.bm25_neg_threshold = bm25_neg_thr
     
-    print("\n👍 Configuration complete. Starting ranking process...")
+    print("\nConfiguration complete. Starting ranking process...")
     return args
 
 def main():
@@ -328,7 +290,7 @@ def main():
         final_cosine_df = pd.concat(all_cosine_ranked).reset_index(drop=True)
         cosine_output_path = output_dir / f"{input_path.stem}_ranked_cosine.tsv"
         final_cosine_df.to_csv(cosine_output_path, sep='\t', index=False)
-        print(f"\n✅ All Cosine Similarity results saved to: {cosine_output_path}")
+        print(f"\nAll Cosine Similarity results saved to: {cosine_output_path}")
 
         # Lưu dataset có nhãn
         if cosine_labeled_rows:
@@ -340,13 +302,13 @@ def main():
             neg_path = output_dir / f"{input_path.stem}_cosine_neg.tsv"
             pos_df.to_csv(pos_path, sep='\t', index=False)
             neg_df.to_csv(neg_path, sep='\t', index=False)
-            print(f"✅ Cosine datasets saved to: {pos_path} (pos) & {neg_path} (neg)")
+            print(f"Cosine datasets saved to: {pos_path} (pos) & {neg_path} (neg)")
 
     if all_bm25_ranked:
         final_bm25_df = pd.concat(all_bm25_ranked).reset_index(drop=True)
         bm25_output_path = output_dir / f"{input_path.stem}_ranked_bm25.tsv"
         final_bm25_df.to_csv(bm25_output_path, sep='\t', index=False)
-        print(f"✅ All BM25 results saved to: {bm25_output_path}")
+        print(f"All BM25 results saved to: {bm25_output_path}")
 
         # Lưu dataset có nhãn
         if bm25_labeled_rows:
@@ -358,7 +320,7 @@ def main():
             neg_path = output_dir / f"{input_path.stem}_bm25_neg.tsv"
             pos_df.to_csv(pos_path, sep='\t', index=False)
             neg_df.to_csv(neg_path, sep='\t', index=False)
-            print(f"✅ BM25 datasets saved to: {pos_path} (pos) & {neg_path} (neg)")
+            print(f"BM25 datasets saved to: {pos_path} (pos) & {neg_path} (neg)")
 
 
 if __name__ == "__main__":

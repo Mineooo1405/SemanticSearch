@@ -189,14 +189,6 @@ class DatasetController:
         self.logger.addHandler(file_handler)
         self.logger.addHandler(console_handler)
         
-        # Emoji replacement map for Windows console
-        self.emoji_replacements = {
-            '🎯': '[TARGET]', '📊': '[STATS]', '🔄': '[PROCESS]', '✅': '[SUCCESS]', '❌': '[FAILED]',
-            '⚠️': '[WARNING]', '🚀': '[PARALLEL]', '⏳': '[WAITING]', '📁': '[FILE]', '🧹': '[CLEANUP]',
-            '🎉': '[COMPLETE]', '✓': '[OK]', '✗': '[ERROR]', '📋': '[INFO]', '🔧': '[CONFIG]',
-            '📈': '[RESULT]', '🔍': '[ANALYZE]'
-        }
-        
         # Target models that work best with 90-150 tokens (adaptive range)
         self.target_models = ["knrm", "drmm", "anmm", "dssm", "cdssm", "conv_knrm"]
         
@@ -213,12 +205,8 @@ class DatasetController:
             self._log_safe('info', "OIE tool appears to be available.")
 
     def _log_safe(self, level: str, message: str):
-        """Safe logging that replaces emoji for console compatibility"""
-        safe_message = message
-        for emoji, replacement in self.emoji_replacements.items():
-            safe_message = safe_message.replace(emoji, replacement)
-        
-        getattr(self.logger, level.lower(), self.logger.info)(safe_message)
+        """Helper to log messages without emoji processing"""
+        getattr(self.logger, level.lower(), self.logger.info)(message)
     
     def validate_input_file(self) -> bool:
         """Validate that input TSV file exists and has correct format"""
@@ -410,7 +398,7 @@ class DatasetController:
             in_range = sum(1 for count in chunk_token_counts if target_min <= count <= target_max)
             in_range_percent = (in_range / len(chunk_token_counts)) * 100 if chunk_token_counts else 0
             
-            self.logger.info(f"📊 Chunk Analysis for {task_name}:")
+            self.logger.info(f"Chunk Analysis for {task_name}:")
             self.logger.info(f"   Total chunks: {len(chunk_token_counts)}")
             self.logger.info(f"   Token range: {min_tokens}-{max_tokens} (avg: {avg_tokens:.1f})")
             self.logger.info(f"   In target range ({target_min}-{target_max}): {in_range}/{len(chunk_token_counts)} ({in_range_percent:.1f}%)")
@@ -492,9 +480,9 @@ class DatasetController:
             
             if success:
                 successful_tasks += 1
-                self._log_safe('info', f"✅ Completed {config['name']} in {task_result['execution_time_seconds']:.1f}s")
+                self._log_safe('info', f"Completed {config['name']} in {task_result['execution_time_seconds']:.1f}s")
             else:
-                self._log_safe('error', f"❌ Failed {config['name']} after {task_result['execution_time_seconds']:.1f}s")
+                self._log_safe('error', f"Failed {config['name']} after {task_result['execution_time_seconds']:.1f}s")
         
         summary = self._create_summary(results, successful_tasks)
         self._save_and_print_summary(summary)
@@ -508,7 +496,7 @@ class DatasetController:
         
         if max_workers is None:
             max_workers = min(multiprocessing.cpu_count(), 4)
-        self.logger.info(f"🚀 Using up to {max_workers} parallel workers")
+        self.logger.info(f"Using up to {max_workers} parallel workers")
         
         if not self.validate_input_file():
             self.logger.error("Input file validation failed. Aborting.")
@@ -523,7 +511,7 @@ class DatasetController:
         
         # Run non-OIE configurations in parallel
         if non_oie_configs:
-            self.logger.info(f"🔄 Running {len(non_oie_configs)} non-OIE configurations in parallel...")
+            self.logger.info(f"Running {len(non_oie_configs)} non-OIE configurations in parallel...")
             with ProcessPoolExecutor(max_workers=max_workers) as executor:
                 future_to_config = {
                     executor.submit(run_chunking_config_process, config, self.input_tsv_path, str(self.output_base_dir)): config
@@ -536,12 +524,12 @@ class DatasetController:
                         results.append(result)
                         if result["success"]: successful_tasks += 1
                     except Exception as e:
-                        self.logger.error(f"❌ Process for {config_name} generated an exception: {e}")
+                        self.logger.error(f"Process for {config_name} generated an exception: {e}")
                         results.append({"config_name": config_name, "success": False, "error": str(e)})
 
         # Run OIE configurations sequentially
         if oie_configs:
-            self.logger.info(f"🔄 Running {len(oie_configs)} OIE configurations sequentially...")
+            self.logger.info(f"Running {len(oie_configs)} OIE configurations sequentially...")
             for config in oie_configs:
                 results.append(run_chunking_config_process(config, self.input_tsv_path, str(self.output_base_dir)))
                 if results[-1]["success"]: successful_tasks += 1
@@ -580,7 +568,7 @@ class DatasetController:
         self.logger.info("="*80)
         
         for result in summary["task_results"]:
-            status = "✅ SUCCESS" if result.get("success") else "❌ FAILED "
+            status = "SUCCESS" if result.get("success") else "FAILED"
             compliance_str = ""
             if result.get("success"):
                 compliance = result.get("final_compliance_rate")
@@ -623,7 +611,7 @@ def main():
     # Get input parameters
     input_tsv_path = input("Enter path to input TSV file (query<tab>passage<tab>label): ").strip()
     if not input_tsv_path:
-        print("❌ Input file path is required!")
+        print("ERROR: Input file path is required!")
         return
     
     output_base_dir = input("Enter output base directory (default: ./training_datasets): ").strip() or "./training_datasets"
@@ -644,9 +632,9 @@ def main():
         controller.create_all_datasets(use_parallel=use_parallel, max_workers=max_workers)
             
     except KeyboardInterrupt:
-        print("\n❌ Interrupted by user.")
+        print("\nInterrupted by user.")
     except Exception as e:
-        print(f"❌ A critical error occurred in main: {e}")
+        print(f"A critical error occurred in main: {e}")
         traceback.print_exc()
 
 if __name__ == "__main__":
