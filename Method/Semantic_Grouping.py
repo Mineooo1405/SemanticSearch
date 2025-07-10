@@ -59,8 +59,9 @@ def embed_sentences_in_batches(sentences, model_name, batch_size=32, device=None
             print(f"  Processing batch {i // batch_size + 1}/{(len(sentences) + batch_size - 1) // batch_size}...")
         
         try:
-            # Use the corrected function call
-            batch_embeddings = embed_text_list(batch, model_name=model_name, batch_size=len(batch), device_preference=device)
+            # Ensure device_preference is always str for typing
+            device_pref = str(device) if device is not None else "cpu"
+            batch_embeddings = embed_text_list(batch, model_name=model_name, batch_size=len(batch), device_preference=device_pref)
             if batch_embeddings is not None and len(batch_embeddings) > 0:
                 all_embeddings.append(batch_embeddings)
             else:
@@ -472,7 +473,7 @@ def _force_split_too_large_chunk(text: str, max_tokens: int) -> List[str]:
 
     return [chunk for chunk in chunks if chunk]
 
-def extract_oie_for_chunk(chunk_text: str, max_triples: int = 5, silent: bool = True) -> Optional[str]:
+def extract_oie_for_chunk(chunk_text: str, max_triples: Optional[int] = None, silent: bool = True) -> Optional[str]:
     """Extract OIE relations for a chunk and format them"""
     if not chunk_text or not chunk_text.strip():
         return None
@@ -509,7 +510,6 @@ def semantic_chunk_passage_from_grouping_logic(
     min_chunk_len_tokens: int = 50,      
     max_chunk_len_tokens: int = 200,     
     include_oie: bool = False,
-    oie_max_triples_per_chunk: int = 5,
     save_raw_oie: bool = False,
     output_dir: str = "./output",
     initial_percentile: str = "85",  
@@ -524,7 +524,7 @@ def semantic_chunk_passage_from_grouping_logic(
     Returns:
         List of tuples: (chunk_id, chunk_text_with_oie, oie_string_only)
     """
-    
+
     if not silent:
         print(f"🔄 Processing passage {doc_id} with Enhanced Semantic Grouping")
         print(f"   Model: {embedding_model}")
@@ -542,7 +542,7 @@ def semantic_chunk_passage_from_grouping_logic(
         final_text = passage_text
         if include_oie:
             print(f"🔧 DEBUG: OIE enabled for semantic_grouping")
-            oie_string = extract_oie_for_chunk(passage_text, oie_max_triples_per_chunk, silent)
+            oie_string = extract_oie_for_chunk(passage_text, silent=silent)
             if oie_string:
                 final_text = f"{passage_text} {oie_string}"
         
@@ -557,7 +557,7 @@ def semantic_chunk_passage_from_grouping_logic(
         oie_string = None
         final_text = passage_text
         if include_oie:
-            oie_string = extract_oie_for_chunk(passage_text, oie_max_triples_per_chunk, silent)
+            oie_string = extract_oie_for_chunk(passage_text, silent=silent)
             if oie_string:
                 final_text = f"{passage_text} {oie_string}"
         
@@ -583,7 +583,7 @@ def semantic_chunk_passage_from_grouping_logic(
         oie_string = None
         final_text = passage_text
         if include_oie:
-            oie_string = extract_oie_for_chunk(passage_text, oie_max_triples_per_chunk, silent)
+            oie_string = extract_oie_for_chunk(passage_text, silent=silent)
             if oie_string:
                 final_text = f"{passage_text} {oie_string}"
         
@@ -611,11 +611,19 @@ def semantic_chunk_passage_from_grouping_logic(
                 if not silent:
                     print(f"   Auto min_threshold ({min_percentile}th percentile): {actual_min_threshold:.4f}")
             
+            # Ensure numeric comparison
+            try:
+                init_val = float(actual_initial_threshold)
+                min_val  = float(actual_min_threshold)
+            except (TypeError, ValueError):
+                init_val, min_val = 0.75, 0.5  # sensible defaults
+
             # Ensure initial >= min
-            if actual_initial_threshold < actual_min_threshold:
-                actual_min_threshold = actual_initial_threshold * 0.7
-                if not silent:
-                    print(f"   Adjusted min_threshold to: {actual_min_threshold:.4f}")
+            if init_val < min_val:
+                min_val = init_val * 0.7
+
+            actual_initial_threshold = init_val
+            actual_min_threshold = min_val
         else:
             if not silent:
                 print(f"   Could not analyze distribution, using defaults")
@@ -645,7 +653,7 @@ def semantic_chunk_passage_from_grouping_logic(
         oie_string = None
         final_text = passage_text
         if include_oie:
-            oie_string = extract_oie_for_chunk(passage_text, oie_max_triples_per_chunk, silent)
+            oie_string = extract_oie_for_chunk(passage_text, silent=silent)
             if oie_string:
                 final_text = f"{passage_text} {oie_string}"
         
@@ -679,7 +687,7 @@ def semantic_chunk_passage_from_grouping_logic(
         final_chunk_text = chunk_text
         
         if include_oie:
-            oie_string = extract_oie_for_chunk(chunk_text, oie_max_triples_per_chunk, silent)
+            oie_string = extract_oie_for_chunk(chunk_text, silent=silent)
             if oie_string:
                 final_chunk_text = f"{chunk_text} {oie_string}"
         
@@ -702,7 +710,7 @@ def semantic_chunk_passage_from_grouping_logic(
         oie_string = None
         final_text = passage_text
         if include_oie:
-            oie_string = extract_oie_for_chunk(passage_text, oie_max_triples_per_chunk, silent)
+            oie_string = extract_oie_for_chunk(passage_text, silent=silent)
             if oie_string:
                 final_text = f"{passage_text} {oie_string}"
         
@@ -735,7 +743,7 @@ def semantic_chunk_passage_from_grouping_logic(
                 sub_oie_string = None
                 final_sub_chunk_text = sub_chunk_text_item
                 if include_oie:
-                    sub_oie_string = extract_oie_for_chunk(sub_chunk_text_item, oie_max_triples_per_chunk, silent)
+                    sub_oie_string = extract_oie_for_chunk(sub_chunk_text_item, silent=silent)
                     if sub_oie_string:
                         final_sub_chunk_text = f"{sub_chunk_text_item} {sub_oie_string}"
                 

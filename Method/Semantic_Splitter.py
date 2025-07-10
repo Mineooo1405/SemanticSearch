@@ -8,6 +8,9 @@ from typing import List, Dict, Union, Optional, Callable, Tuple
 from dotenv import load_dotenv
 from Tool.Sentence_Detector import extract_and_simplify_sentences
 from Tool.OIE import extract_relations_from_paragraph
+# --- Semantic embedding imports ---
+import numpy as np
+from Tool.Sentence_Embedding import sentence_embedding as embed_text_list
 import hashlib
 import traceback
 from datetime import datetime
@@ -65,12 +68,15 @@ def calculate_chunk_stats(chunks: List[str]) -> Dict[str, Union[int, float]]:
     return stats
 
 def split_by_sentence_optimized(
-    text: str, 
-    chunk_size: int = 1000, 
+    text: str,
+    chunk_size: int = 1000,
     chunk_overlap: int = 0,
     target_tokens: Optional[int] = None,
     tolerance: float = 0.25,
-    enable_adaptive: bool = False
+    enable_adaptive: bool = False,
+    semantic_threshold: Optional[float] = None,
+    embedding_model: str = "all-MiniLM-L6-v2",
+    device: Optional[object] = None,
 ) -> Tuple[List[str], List[str], List[List[int]]]:
     """
     Optimized sentence-based text splitting with adaptive token control.
@@ -83,6 +89,29 @@ def split_by_sentence_optimized(
     
     # Extract sentences
     sentences = to_sentences(text)
+
+    # --- NEW: Compute embeddings when semantic_threshold is set ---
+    embeddings: Optional[np.ndarray] = None
+    if semantic_threshold is not None and sentences:
+        try:
+            # Ensure device preference is a string to satisfy typing
+            device_pref = str(device) if device is not None else "cpu"
+            embeddings = np.array(
+                embed_text_list(
+                    sentences,
+                    model_name=embedding_model,
+                    batch_size=32,
+                    device_preference=device_pref,
+                )
+            )
+            # Normalize for cosine similarity
+            norms = np.linalg.norm(embeddings, axis=1, keepdims=True)
+            norms[norms == 0] = 1e-9
+            embeddings = embeddings / norms
+        except Exception as e:
+            print(f"⚠️  Semantic embedding failed ({e}); fallback to length-only splitter")
+            semantic_threshold = None
+            embeddings = None
     
     if not sentences:
         return [text] if text.strip() else [], [], [[0]] if text.strip() else []
@@ -117,6 +146,35 @@ def split_by_sentence_optimized(
     for i, sentence in enumerate(sentences):
         sentence_len = sentence_lengths[i]
         
+        # --- NEW: semantic cut based on similarity with previous sentence ---
+        if (
+            semantic_threshold is not None
+            and current_chunk_sentences
+            and embeddings is not None
+        ):
+            last_idx = current_group_indices[-1]
+            sim_val = float(np.dot(embeddings[last_idx], embeddings[i]))
+            if sim_val < semantic_threshold:
+                # Finish current chunk before adding new sentence
+                chunk_text = " ".join(current_chunk_sentences)
+                chunks.append(chunk_text)
+                sentence_groups.append(list(current_group_indices))
+
+                # Handle overlap if requested
+                if chunk_overlap > 0 and len(current_chunk_sentences) > 1:
+                    overlap_sentences, overlap_indices = create_overlap(
+                        current_chunk_sentences, current_group_indices, chunk_overlap
+                    )
+                    current_chunk_sentences = overlap_sentences
+                    current_group_indices = overlap_indices
+                    current_size = sum(len(s) for s in current_chunk_sentences)
+                    if len(current_chunk_sentences) > 1:
+                        current_size += len(current_chunk_sentences) - 1
+                else:
+                    current_chunk_sentences = []
+                    current_group_indices = []
+                    current_size = 0
+
         # Handle sentences that are too long for any chunk
         if sentence_len > chunk_size:
             # Save current chunk if exists
@@ -291,7 +349,7 @@ def format_oie_triples_to_string(triples_list: List[Dict[str, str]], max_triples
 
     return " ".join(formatted_sentences).strip()
 
-def extract_oie_for_chunk(chunk_text: str, max_triples: int = 5, silent: bool = True) -> Optional[str]:
+def extract_oie_for_chunk(chunk_text: str, max_triples: Optional[int] = None, silent: bool = True) -> Optional[str]:
     """Extract OIE relations for a chunk and format them"""
     if not chunk_text or not chunk_text.strip():
         return None
@@ -377,7 +435,7 @@ def validate_and_adjust_chunks(
     
     for chunk_id, chunk_text, oie_string in chunks:
         # Count tokens in the main text (excluding OIE for validation)
-        base_token_count = count_tokens_accurate(chunk_text) - count_tokens_accurate(oie_string)
+        base_token_count = count_tokens_accurate(chunk_text) - count_tokens_accurate(oie_string or "")
         
         if min_tokens <= base_token_count <= max_tokens:
             # Perfect size - add any buffered chunks first
@@ -484,6 +542,8 @@ def chunk_passage_text_splitter(
     target_tokens: int = 120,
     tolerance: float = 0.25,
     enable_adaptive: bool = True,
+    semantic_threshold: float = 0.30,
+    embedding_model: str = "all-MiniLM-L6-v2",
     silent: bool = False,
     **kwargs 
 ) -> List[Tuple[str, str, Optional[str]]]:
@@ -516,7 +576,7 @@ def chunk_passage_text_splitter(
                 final_text = passage_text
                 
                 if include_oie:
-                    oie_string = extract_oie_for_chunk(passage_text, max_triples=5, silent=silent)
+                    oie_string = extract_oie_for_chunk(passage_text, silent=silent)
                     if oie_string:
                         final_text = f"{passage_text} {oie_string}"
                 
@@ -532,7 +592,10 @@ def chunk_passage_text_splitter(
             chunk_overlap=chunk_overlap,
             target_tokens=target_tokens,
             tolerance=tolerance,
-            enable_adaptive=enable_adaptive
+            enable_adaptive=enable_adaptive,
+            semantic_threshold=semantic_threshold,
+            embedding_model=embedding_model,
+            device=device,
         )
         
         if not chunk_texts:
@@ -542,7 +605,7 @@ def chunk_passage_text_splitter(
             oie_string = None
             final_text = passage_text
             if include_oie:
-                oie_string = extract_oie_for_chunk(passage_text, max_triples=5, silent=silent)
+                oie_string = extract_oie_for_chunk(passage_text, silent=silent)
                 if oie_string:
                     final_text = f"{passage_text} {oie_string}"
             
@@ -585,7 +648,7 @@ def chunk_passage_text_splitter(
                     #     pass
                     
                     if raw_oie_relations:
-                        oie_string = format_oie_triples_to_string(raw_oie_relations, max_triples=5)
+                        oie_string = format_oie_triples_to_string(raw_oie_relations)
                         
                         if oie_string:
                             final_chunk_text = f"{chunk_text_content} {oie_string}"
@@ -644,7 +707,7 @@ def chunk_passage_text_splitter(
             oie_string = None
             final_text = passage_text
             if include_oie:
-                oie_string = extract_oie_for_chunk(passage_text, max_triples=5, silent=silent)
+                oie_string = extract_oie_for_chunk(passage_text, silent=silent)
                 if oie_string:
                     final_text = f"{passage_text} {oie_string}"
             
@@ -675,7 +738,7 @@ def chunk_passage_text_splitter(
         final_text = passage_text
         if include_oie:
             try:
-                oie_string = extract_oie_for_chunk(passage_text, max_triples=5, silent=True)
+                oie_string = extract_oie_for_chunk(passage_text, silent=True)
                 if oie_string:
                     final_text = f"{passage_text} {oie_string}"
             except:
@@ -686,5 +749,5 @@ def chunk_passage_text_splitter(
 # Legacy compatibility function
 def format_oie_triples_to_string_for_text_splitter(triples_list: List[Dict[str, str]]) -> str:
     """Legacy compatibility function for OIE formatting"""
-    result = format_oie_triples_to_string(triples_list, max_triples=5)
+    result = format_oie_triples_to_string(triples_list)
     return result if result else ""

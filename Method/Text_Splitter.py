@@ -291,7 +291,7 @@ def format_oie_triples_to_string(triples_list: List[Dict[str, str]], max_triples
 
     return " ".join(formatted_sentences).strip()
 
-def extract_oie_for_chunk(chunk_text: str, max_triples: int = 5, silent: bool = True) -> Optional[str]:
+def extract_oie_for_chunk(chunk_text: str, max_triples: Optional[int] = None, silent: bool = True) -> Optional[str]:
     """Extract OIE relations for a chunk and format them using the updated OIE tool."""
     if not chunk_text or not chunk_text.strip():
         return None
@@ -304,7 +304,7 @@ def extract_oie_for_chunk(chunk_text: str, max_triples: int = 5, silent: bool = 
         all_relations = extract_relations_from_paragraph(chunk_text, silent=True)
 
         if all_relations:
-            oie_string = format_oie_triples_to_string(all_relations, max_triples=max_triples)
+            oie_string = format_oie_triples_to_string(all_relations)
             if not silent and oie_string:
                 print(f"      Found {len(all_relations)} OIE relations in total")
             return oie_string
@@ -570,7 +570,7 @@ def chunk_passage_text_splitter(
                 final_text = passage_text
                 
                 if include_oie:
-                    oie_string = extract_oie_for_chunk(passage_text, max_triples=5, silent=silent)
+                    oie_string = extract_oie_for_chunk(passage_text, silent=silent)
                     if oie_string:
                         final_text = f"{passage_text} {oie_string}"
                 
@@ -596,7 +596,7 @@ def chunk_passage_text_splitter(
             oie_string = None
             final_text = passage_text
             if include_oie:
-                oie_string = extract_oie_for_chunk(passage_text, max_triples=5, silent=silent)
+                oie_string = extract_oie_for_chunk(passage_text, silent=silent)
                 if oie_string:
                     final_text = f"{passage_text} {oie_string}"
             
@@ -633,7 +633,7 @@ def chunk_passage_text_splitter(
                     )
                     
                     if raw_oie_relations:
-                        oie_string = format_oie_triples_to_string(raw_oie_relations, max_triples=5)
+                        oie_string = format_oie_triples_to_string(raw_oie_relations)
                         
                         if oie_string:
                             final_chunk_text = f"{chunk_text_content} {oie_string}"
@@ -692,7 +692,7 @@ def chunk_passage_text_splitter(
             oie_string = None
             final_text = passage_text
             if include_oie:
-                oie_string = extract_oie_for_chunk(passage_text, max_triples=5, silent=silent)
+                oie_string = extract_oie_for_chunk(passage_text, silent=silent)
                 if oie_string:
                     final_text = f"{passage_text} {oie_string}"
             
@@ -723,7 +723,7 @@ def chunk_passage_text_splitter(
         final_text = passage_text
         if include_oie:
             try:
-                oie_string = extract_oie_for_chunk(passage_text, max_triples=5, silent=True)
+                oie_string = extract_oie_for_chunk(passage_text, silent=True)
                 if oie_string:
                     final_text = f"{passage_text} {oie_string}"
             except:
@@ -734,5 +734,5 @@ def chunk_passage_text_splitter(
 # Legacy compatibility function
 def format_oie_triples_to_string_for_text_splitter(triples_list: List[Dict[str, str]]) -> str:
     """Legacy compatibility function for OIE formatting"""
-    result = format_oie_triples_to_string(triples_list, max_triples=5)
+    result = format_oie_triples_to_string(triples_list)
     return result if result else ""
