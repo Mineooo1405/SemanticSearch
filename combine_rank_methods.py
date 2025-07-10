@@ -1,4 +1,3 @@
-
 import argparse
 from pathlib import Path
 import pandas as pd
@@ -45,7 +44,7 @@ def hybrid_score(cos_df: pd.DataFrame, bm_df: pd.DataFrame, weight: float, out_d
     scaler = MinMaxScaler()
     merged[["cos_norm", "bm_norm"]] = scaler.fit_transform(merged[["cosine_score", "bm25_score"]])
     merged["hybrid_score"] = weight * merged["cos_norm"] + (1 - weight) * merged["bm_norm"]
-    merged = merged.sort_values("hybrid_score", ascending=False)
+    merged = merged.sort_values(by="hybrid_score", ascending=False)
     merged.to_csv(out_dir / "ranked_hybrid.tsv", sep="\t", index=False)
 
 
@@ -68,8 +67,80 @@ def logistic_rank(cos_df: pd.DataFrame, bm_df: pd.DataFrame, out_dir: Path):
     merged = cos_df.merge(bm_df[["chunk_id", "bm25_score"]], on="chunk_id", how="inner")
     X_all = merged[["cosine_score", "bm25_score"]].fillna(0.0).values
     merged["lr_score"] = model.predict_proba(X_all)[:, 1]
-    merged = merged.sort_values("lr_score", ascending=False)
+    merged = merged.sort_values(by="lr_score", ascending=False)
     merged.to_csv(out_dir / "ranked_lr.tsv", sep="\t", index=False)
+
+
+def reciprocal_rank_fusion(cos_df: pd.DataFrame, bm_df: pd.DataFrame, k: int, out_dir: Path):
+    """Tính Reciprocal Rank Fusion (RRF) giữa hai bộ xếp hạng cosine và BM25.
+
+    RRF_score(d) = Σ 1 / (k + rank_i(d))
+    Trong đó rank_i(d) là thứ hạng (bắt đầu từ 1) của document d trong hệ thống i.
+    """
+
+    # Xác định xem dữ liệu có nhiều truy vấn hay chỉ một truy vấn
+    has_query = "query_id" in cos_df.columns and "query_id" in bm_df.columns
+
+    results = []
+
+    if has_query:
+        # Xử lý từng truy vấn riêng biệt
+        query_ids = set(cos_df["query_id"].unique()).union(bm_df["query_id"].unique())
+        for qid in query_ids:
+            cos_q = cos_df[cos_df["query_id"] == qid].copy()
+            bm_q = bm_df[bm_df["query_id"] == qid].copy()
+
+            cos_q = cos_q.sort_values(by="cosine_score", ascending=False)  # type: ignore[arg-type]
+            bm_q = bm_q.sort_values(by="bm25_score", ascending=False)  # type: ignore[arg-type]
+
+            cos_q["rank_cos"] = range(1, len(cos_q) + 1)
+            bm_q["rank_bm"] = range(1, len(bm_q) + 1)
+
+            merged = cos_q[["chunk_id", "rank_cos"]].merge(
+                bm_q[["chunk_id", "rank_bm"]], on="chunk_id", how="outer"
+            )
+
+            # Gán hạng lớn (len + k) cho những document không xuất hiện ở hệ thống kia
+            merged["rank_cos"].fillna(len(cos_q) + k, inplace=True)
+            merged["rank_bm"].fillna(len(bm_q) + k, inplace=True)
+
+            merged["rrf_score"] = 1 / (k + merged["rank_cos"]) + 1 / (k + merged["rank_bm"])
+
+            # Thêm lại thông tin gốc (query_text, chunk_text, v.v.)
+            base_info = pd.concat([cos_q, bm_q]).drop_duplicates("chunk_id")
+            merged = merged.merge(base_info, on="chunk_id", how="left")
+            merged["query_id"] = qid
+
+            results.append(merged)
+
+        final_df = pd.concat(results, ignore_index=True)
+        final_df = final_df.sort_values(by=["query_id", "rrf_score"], ascending=[True, False])
+
+    else:
+        # Trường hợp chỉ một truy vấn
+        cos_ranked = cos_df.sort_values(by="cosine_score", ascending=False).copy()  # type: ignore[arg-type]
+        bm_ranked = bm_df.sort_values(by="bm25_score", ascending=False).copy()  # type: ignore[arg-type]
+
+        cos_ranked["rank_cos"] = range(1, len(cos_ranked) + 1)
+        bm_ranked["rank_bm"] = range(1, len(bm_ranked) + 1)
+
+        merged = cos_ranked[["chunk_id", "rank_cos"]].merge(
+            bm_ranked[["chunk_id", "rank_bm"]], on="chunk_id", how="outer"
+        )
+
+        merged["rank_cos"].fillna(len(cos_ranked) + k, inplace=True)
+        merged["rank_bm"].fillna(len(bm_ranked) + k, inplace=True)
+
+        merged["rrf_score"] = 1 / (k + merged["rank_cos"]) + 1 / (k + merged["rank_bm"])
+
+        base_info = pd.concat([cos_df, bm_df]).drop_duplicates("chunk_id")
+        final_df = merged.merge(base_info, on="chunk_id", how="left")
+        final_df = final_df.sort_values(by=["query_id", "rrf_score"], ascending=[True, False])
+
+    # Lưu kết quả
+    out_dir.mkdir(parents=True, exist_ok=True)
+    final_df.to_csv(out_dir / "ranked_rrf.tsv", sep="\t", index=False)
+    print(f"Đã lưu xếp hạng RRF vào {out_dir / 'ranked_rrf.tsv'}")
 
 
 def main():
@@ -77,7 +148,7 @@ def main():
     parser.add_argument("--cosine", help="Path to *_ranked_cosine.tsv", default=None)
     parser.add_argument("--bm25", help="Path to *_ranked_bm25.tsv", default=None)
     parser.add_argument("--output_dir", default="./combined_results")
-    parser.add_argument("--hybrid_weight", type=float, default=0.6, help="Weight for cosine in hybrid score (0-1)")
+    parser.add_argument("--rrf_k", type=int, default=60, help="k tham số cho Reciprocal Rank Fusion (số nguyên dương, mặc định 60)")
     args = parser.parse_args()
 
     # --- interactive fallback ---
@@ -96,14 +167,14 @@ def main():
             else:
                 print("File not found, try again.")
 
-        # Allow user to change output dir and weight
+        # Cho phép người dùng thay đổi output dir và tham số k của RRF
         od = input(f"Output dir (default {args.output_dir}): ").strip()
         if od:
             args.output_dir = od
-        wt = input(f"Hybrid weight for cosine (0-1, default {args.hybrid_weight}): ").strip()
-        if wt:
+        k_in = input(f"k cho RRF (mặc định {args.rrf_k}): ").strip()
+        if k_in:
             try:
-                args.hybrid_weight = float(wt)
+                args.rrf_k = int(k_in)
             except ValueError:
                 pass
 
@@ -113,15 +184,9 @@ def main():
     cos_df = load_df(Path(args.cosine))
     bm_df = load_df(Path(args.bm25))
 
-    # Method 1
-    build_union_intersection(cos_df, bm_df, out_dir)
-
-    # Method 2
-    hybrid_score(cos_df, bm_df, args.hybrid_weight, out_dir)
-
-    # Method 3
-    logistic_rank(cos_df, bm_df, out_dir)
-    print("Combination finished. Results in", out_dir)
+    # Reciprocal Rank Fusion
+    reciprocal_rank_fusion(cos_df, bm_df, args.rrf_k, out_dir)
+    print("Reciprocal Rank Fusion hoàn tất. Kết quả lưu tại", out_dir)
 
 
 if __name__ == "__main__":

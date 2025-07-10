@@ -15,7 +15,8 @@ env310/
 env379/
 env3124/
 .env3124/
-
+.env37/
+.env310/
 # Output và dữ liệu tạm
 *.log
 *.tmp
@@ -28,6 +29,10 @@ env3124/
 *.md
 *.csv
 *.env
+*.model
+*.preprocessor
+*.dam 
+
 # Dataset và output
 output_data/
 training_datasets/
@@ -41,6 +46,11 @@ robus_corpus/
 ranking_results/
 data/
 combined_results/
+maven-mvnd-1.0.2-windows-amd64/
+OpenIE-standalone/
+sbt-1.10.11/
+test_openIE5/
+apache-maven-3.9.10-bin/
 # Thư viện bên ngoài
 EmbeddingModel/
 CoreNLP_Lib/
