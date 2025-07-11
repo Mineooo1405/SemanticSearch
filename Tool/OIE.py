@@ -4,10 +4,50 @@ import logging
 import psutil
 from typing import List, Dict, Optional
 from stanfordnlp.server import CoreNLPClient
+import atexit
 
 # Suppress CoreNLP and Java startup logging
 logging.getLogger("stanford").setLevel(logging.WARNING)
 logging.getLogger("corenlp").setLevel(logging.WARNING)
+
+# -------------------- Singleton CoreNLPClient ----------------------------
+_GLOBAL_CLIENT: Optional[CoreNLPClient] = None
+
+
+def _get_global_client() -> CoreNLPClient:
+    """Return a singleton CoreNLPClient (starts once)."""
+    global _GLOBAL_CLIENT
+    if _GLOBAL_CLIENT is None:
+        # Khởi tạo CoreNLPClient với DEFAULT_PROPERTIES để áp dụng cấu hình OpenIE tuỳ chỉnh
+        _GLOBAL_CLIENT = CoreNLPClient(
+            annotators=[
+                "tokenize",
+                "ssplit",
+                "pos",
+                "lemma",
+                "depparse",
+                "openie",
+            ],
+            timeout=600000,
+            memory="8G",
+            threads=5,
+            max_char_length=100000,
+            properties=DEFAULT_PROPERTIES,
+        )
+        _GLOBAL_CLIENT.start()
+
+        # Ensure shutdown at exit
+        def _shutdown_client() -> None:
+            global _GLOBAL_CLIENT
+            if _GLOBAL_CLIENT is not None:
+                try:
+                    _GLOBAL_CLIENT.stop()
+                except Exception:
+                    pass
+        atexit.register(_shutdown_client)
+
+    return _GLOBAL_CLIENT
+
 
 def terminate_corenlp_processes(port: int = 9000, silent: bool = True):
     """
@@ -48,9 +88,11 @@ DEFAULT_PROPERTIES = {
     "annotators": "tokenize,ssplit,pos,lemma,depparse,openie",
     "outputFormat": "json",
     "timeout": "600000",
+    # Relax strict mode để CoreNLP sinh nhiều triple hơn
     "openie.triple.strict": "false",
-    "openie.max_entailments_per_clause": "800",  
-    "openie.affinity_probability_cap": "0.3"
+    "openie.max_entailments_per_clause": "1000",
+    # Giữ affinity cap thấp để không bỏ quan hệ tiềm năng
+    "openie.affinity_probability_cap": "0.1",
 }
 
 # Hàm chính: tách câu và trích xuất quan hệ
@@ -60,8 +102,9 @@ def extract_relations_from_paragraph(
     port: int = 9000,
     silent: bool = True
 ) -> List[Dict[str, str]]:
-    # --- NEW: Terminate stray processes before starting --- #
-    terminate_corenlp_processes(port=port, silent=silent)
+    # Nếu client toàn cục đã tạo, không nên terminate server
+    if _GLOBAL_CLIENT is None:
+        terminate_corenlp_processes(port=port, silent=silent)
 
     if not paragraph_text.strip():
         return []
@@ -87,28 +130,23 @@ def extract_relations_from_paragraph(
             logger.setLevel(logging.CRITICAL)
     
     try:
-        # Quay lại cách khởi tạo ổn định bằng properties
-        with CoreNLPClient(
-            properties=properties,
-            timeout=int(properties.get("timeout", "600000")),
-            memory='8G',
-            be_quiet=True,
-            start_server=True,
-            endpoint=f"http://localhost:{port}"
-        ) as client:
-            # Annotate toàn bộ đoạn văn bản một lần, CoreNLP sẽ tự tách câu
-            ann = client.annotate(paragraph_text)
-            # Lặp qua các câu đã annotate (ann là dictionary)
-            if 'sentences' in ann:
-                for sentence_ann in ann['sentences']:
-                    # Lặp qua các OpenIE triples
-                    if 'openie' in sentence_ann:
-                        for triple in sentence_ann['openie']:
-                            results.append({
-                                "subject": triple.get("subject", ""),
-                                "relation": triple.get("relation", ""),
-                                "object": triple.get("object", "")
-                            })
+        client = _get_global_client()
+
+        ann = client.annotate(  # type: ignore[no-untyped-call]
+            paragraph_text,
+            output_format="json",
+        )
+        # Lặp qua các câu đã annotate (ann là dictionary)
+        if 'sentences' in ann:  # type: ignore[arg-type]
+            for sentence_ann in ann['sentences']:  # type: ignore[index]
+                # Lặp qua các OpenIE triples
+                if 'openie' in sentence_ann:  # type: ignore[operator]
+                    for triple in sentence_ann['openie']:  # type: ignore[index]
+                        results.append({
+                            "subject": triple.get("subject", ""),  # type: ignore[attr-defined]
+                            "relation": triple.get("relation", ""),  # type: ignore[attr-defined]
+                            "object": triple.get("object", "")  # type: ignore[attr-defined]
+                        })
     except Exception as e:
         if not silent:
             print(f"Error in OIE extraction: {e}")
@@ -121,9 +159,10 @@ def extract_relations_from_paragraph(
     # Loại bỏ trùng lặp
     unique = []
     seen = set()
+    # Giữ lại tất cả triple (chỉ khử trùng lặp tuyệt đối), tránh loại bỏ các quan hệ ngắn
     for r in results:
         key = f"{r['subject'].strip().lower()}|{r['relation'].strip().lower()}|{r['object'].strip().lower()}"
-        if key not in seen and all(len(r[k].strip()) > 1 for k in r):
+        if key not in seen:
             seen.add(key)
             unique.append(r)
     return unique

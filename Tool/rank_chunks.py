@@ -93,6 +93,60 @@ def rank_by_cosine_similarity(query: str, chunks_df: pd.DataFrame, text_column: 
     
     return ranked_df
 
+# -------------------- NEW: Reciprocal Rank Fusion --------------------
+
+def rank_by_rrf(cosine_df: pd.DataFrame, bm25_df: pd.DataFrame, k: int = 60, id_column: str = 'chunk_id') -> pd.DataFrame:
+    """Combine Cosine and BM25 rankings using Reciprocal Rank Fusion (RRF).
+
+    The RRF score for a document d is:
+        score(d) = Σ_i 1 / (k + rank_i(d))
+    where rank_i(d) is the rank position of document d in the i-th ranking list.
+
+    Args:
+        cosine_df: DataFrame already ranked by cosine similarity (higher score first).
+        bm25_df:  DataFrame already ranked by BM25 (higher score first).
+        k:        Constant that dampens the impact of lower-ranked documents (default 60).
+        id_column:Column that uniquely identifies each chunk/document (default 'chunk_id').
+
+    Returns:
+        DataFrame with an added column `rrf_score`, sorted in descending order.
+    """
+
+    if id_column not in cosine_df.columns or id_column not in bm25_df.columns:
+        raise ValueError(f"Column '{id_column}' must exist in both ranking DataFrames for RRF.")
+
+    # Build rank lookup tables
+    cosine_ranks = cosine_df[[id_column]].copy()
+    cosine_ranks['rank_cosine'] = np.arange(1, len(cosine_ranks) + 1)
+
+    bm25_ranks = bm25_df[[id_column]].copy()
+    bm25_ranks['rank_bm25'] = np.arange(1, len(bm25_ranks) + 1)
+
+    # Merge ranks (outer join to include docs that appear in only one list)
+    merged_ranks = pd.merge(cosine_ranks, bm25_ranks, on=id_column, how='outer')
+
+    # Fill missing ranks with a large value to give them minimal influence
+    max_rank = max(len(cosine_ranks), len(bm25_ranks)) + k
+    merged_ranks['rank_cosine'] = merged_ranks['rank_cosine'].fillna(max_rank)
+    merged_ranks['rank_bm25'] = merged_ranks['rank_bm25'].fillna(max_rank)
+
+    # Calculate RRF score
+    merged_ranks['rrf_score'] = 1.0 / (k + merged_ranks['rank_cosine']) + 1.0 / (k + merged_ranks['rank_bm25'])
+
+    # Attach RRF score và giữ cả cosine_score, bm25_score
+    # Bắt đầu với outer-merge để bảo toàn mọi cột
+    rrf_df = pd.merge(bm25_df, cosine_df[[id_column, 'cosine_score']], on=id_column, how='outer')
+    rrf_df = pd.merge(rrf_df, merged_ranks[[id_column, 'rrf_score']], on=id_column, how='left')
+
+    # Sort by RRF score (higher is better)
+    rrf_df = rrf_df.sort_values(by='rrf_score', ascending=False).reset_index(drop=True)
+
+    print("\n--- Ranking with Reciprocal Rank Fusion (RRF) ---")
+    print("Ranking complete. Top 3 chunks:")
+    print(rrf_df.head(3))
+
+    return rrf_df
+
 def interactive_mode():
 
     print("\n--- Interactive Chunk Ranker ---")
@@ -231,6 +285,7 @@ def main():
     # --- Group by Query ID and Rank ---
     all_cosine_ranked = []
     all_bm25_ranked = []
+    all_rrf_ranked = []  # NEW: store RRF results
 
     # Lists to collect labeled data
     cosine_labeled_rows = []
@@ -284,6 +339,14 @@ def main():
                 bm25_labeled_rows.append(bm25_neg_rows)
         except Exception as e:
             print(f"  > Error during BM25 ranking for query '{query_id}': {e}")
+
+        # Method 3: Reciprocal Rank Fusion (requires both lists)
+        try:
+            print("Combining rankings with Reciprocal Rank Fusion (RRF)...")
+            rrf_ranked_group = rank_by_rrf(cosine_ranked_group, bm25_ranked_group, k=60)
+            all_rrf_ranked.append(rrf_ranked_group)
+        except Exception as e:
+            print(f"  > Error during RRF ranking for query '{query_id}': {e}")
             
     # --- Consolidate and Save Results ---
     if all_cosine_ranked:
@@ -321,6 +384,13 @@ def main():
             pos_df.to_csv(pos_path, sep='\t', index=False)
             neg_df.to_csv(neg_path, sep='\t', index=False)
             print(f"BM25 datasets saved to: {pos_path} (pos) & {neg_path} (neg)")
+
+    # --- Save RRF Results ---
+    if all_rrf_ranked:
+        final_rrf_df = pd.concat(all_rrf_ranked).reset_index(drop=True)
+        rrf_output_path = output_dir / f"{input_path.stem}_ranked_rrf.tsv"
+        final_rrf_df.to_csv(rrf_output_path, sep='\t', index=False)
+        print(f"All RRF results saved to: {rrf_output_path}")
 
 
 if __name__ == "__main__":

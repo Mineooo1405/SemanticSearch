@@ -401,7 +401,9 @@ def merge_chunks_from_group(
     if current_merge_base_text:
         merged_text = " ".join(current_merge_text_w_oie)
         merged_id = f"{current_merge_ids[0]}_merged_{context_id}_{len(merged)}"
-        merged.append((merged_id, merged_text, None))
+        merged_oie_parts = [c[2] for c in group if c[2]]
+        merged_oie = " ".join(merged_oie_parts) if merged_oie_parts else None
+        merged.append((merged_id, merged_text, merged_oie))
 
     return merged
 

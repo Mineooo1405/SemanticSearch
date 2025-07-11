@@ -20,6 +20,9 @@ import atexit
 from collections import defaultdict
 import traceback
 
+# Import ranking utilities
+from Tool.rank_chunks import rank_by_cosine_similarity, rank_by_bm25, rank_by_rrf
+
 # --- Integrated Imports from interactive_chunker.py ---
 from Method.Semantic_Grouping import semantic_chunk_passage_from_grouping_logic
 from Method.Semantic_Splitter import chunk_passage_text_splitter
@@ -67,7 +70,7 @@ ADAPTIVE_CHUNKING_CONFIG = {
     "max_tokens": 150,              # Maximum acceptable tokens (derived from target and tolerance)
     "strict_max": 200,              # Absolute maximum before forced split
     "merge_threshold": 80,          # Merge chunks smaller than this
-    "enable_adaptive": True,        # General flag, specific chunkers might have their own enable flag
+    "enable_adaptive": False,       # Disable adaptive validation/merging to keep original chunks
     "preserve_sentences": True,     # Try to preserve sentence boundaries
     "max_iterations": 3             # Maximum adaptive iterations
 }
@@ -185,7 +188,8 @@ class DatasetController:
         
         # Setup logger
         self.logger = logging.getLogger(__name__)
-        self.logger.setLevel(logging.INFO)
+        # Chỉ hiển thị WARNING trở lên để tránh spam log
+        self.logger.setLevel(logging.WARNING)
         self.logger.addHandler(file_handler)
         self.logger.addHandler(console_handler)
         
@@ -335,13 +339,87 @@ class DatasetController:
         if not batch_success or not os.path.exists(final_output_file):
             return False, "", None
 
-        # Post-processing
-        self._log_safe('info', f"Analyzing final output for {task_name}...")
-        self._analyze_chunk_distribution(str(final_output_file), task_name)
-        final_compliance = self._get_compliance_rate(str(final_output_file))
-        
+        # Bỏ các bước phân tích / thống kê để giảm log và tăng tốc
+        final_compliance = None
+
+        # --- NEW: Rank chunks and keep top/bottom quartile ---
+        try:
+            ranked_filtered_path = self._rank_and_filter_chunks(str(final_output_file), config_output_dir)
+            if ranked_filtered_path:
+                self._log_safe('warning', f"Ranked & filtered results saved to: {ranked_filtered_path}")
+        except Exception as e:
+            self._log_safe('error', f"Ranking/filtering failed for {task_name}: {e}")
+
         return True, str(final_output_file), final_compliance
     
+    # ------------------------------------------------------------------
+    # New helper: rank chunks with RRF and keep top & bottom 25%
+    # ------------------------------------------------------------------
+    def _rank_and_filter_chunks(self, chunks_tsv: str, output_dir: Path, filter_ratio: float = 0.25) -> str:
+        """Run ranking (Cosine, BM25, RRF) for each query group and keep top/bottom quartile.
+
+        Args:
+            chunks_tsv: Path to TSV file with generated chunks.
+            output_dir: Directory to save the filtered ranked file.
+            filter_ratio: Fraction to keep for highest & lowest scores.
+
+        Returns:
+            Path to the saved filtered TSV file (empty string if failed).
+        """
+        import pandas as pd
+        import numpy as np
+        from pathlib import Path as _Path
+
+        if not os.path.exists(chunks_tsv):
+            return ""
+
+        df = pd.read_csv(chunks_tsv, sep='\t', on_bad_lines='warn', engine='python')
+        df.columns = df.columns.str.strip()
+
+        required_cols = {'query_id', 'query_text', 'chunk_text', 'chunk_id'}
+        if not required_cols.issubset(set(df.columns)):
+            return ""
+
+        kept_rows = []
+
+        for query_id, group_df in df.groupby('query_id'):
+            try:
+                query_text = str(group_df['query_text'].iloc[0])
+
+                cosine_ranked = rank_by_cosine_similarity(query_text, group_df, text_column='chunk_text', model_name=COMMON_DEFAULTS["embedding_model"])
+                bm25_ranked   = rank_by_bm25(query_text, group_df, text_column='chunk_text')
+                rrf_ranked    = rank_by_rrf(cosine_ranked, bm25_ranked, k=60)
+
+                n = len(rrf_ranked)
+                if n == 0:
+                    continue
+                top_n = max(1, int(np.ceil(n * filter_ratio)))
+                bottom_n = max(1, int(np.floor(n * filter_ratio)))
+
+                selected = pd.concat([rrf_ranked.head(top_n), rrf_ranked.tail(bottom_n)])
+                kept_rows.append(selected)
+            except Exception:
+                # Skip problematic group silently to avoid interrupting entire process
+                continue
+
+        if not kept_rows:
+            return ""
+
+        final_df = pd.concat(kept_rows).reset_index(drop=True)
+        save_path = output_dir / f"{_Path(chunks_tsv).stem}_rrf_filtered.tsv"
+        final_df.to_csv(save_path, sep='\t', index=False)
+
+        # Tạo file chỉ gồm 3 cột query, passage, label
+        try:
+            simple_df = final_df[['query_text', 'chunk_text', 'label']].copy()
+            simple_df.columns = ['query', 'passage', 'label']
+            simple_path = output_dir / f"{_Path(chunks_tsv).stem}_rrf_filtered_3col.tsv"
+            simple_df.to_csv(simple_path, sep='\t', index=False)
+        except Exception:
+            simple_path = ""
+
+        return str(save_path)
+
     def _extract_output_path(self, stdout: str, task_name: str, config_output_dir: Path) -> str:
         """Extract output file path from stdout"""
         try:
@@ -605,6 +683,7 @@ def run_chunking_config_process(config: dict, input_tsv_path: str, output_base_d
         
 def main():
     """Main function to run the adaptive controller"""
+    global RUN_CONFIGURATIONS  # override inside main
     print("Integrated Adaptive Dataset Controller for Neural Ranking Models")
     print("="*60)
     
@@ -618,12 +697,26 @@ def main():
     
     parallel_choice = input("Use parallel processing? (y/n, default: n): ").strip().lower()
     use_parallel = parallel_choice == 'y'
-    
+
     max_workers = None
     if use_parallel:
         max_workers_input = input(f"Max parallel workers (default: auto, max: {multiprocessing.cpu_count()}): ").strip()
         if max_workers_input.isdigit():
             max_workers = min(int(max_workers_input), multiprocessing.cpu_count())
+
+    # --- NEW: allow user to pick specific configurations ---
+    print("\nAvailable configurations:")
+    for cfg in RUN_CONFIGURATIONS:
+        print(f"  - {cfg['name']}")
+
+    selected_cfgs = input("Enter configuration names to run (comma-separated) or press ENTER for ALL: ").strip()
+
+    if selected_cfgs:
+        chosen = {name.strip() for name in selected_cfgs.split(',') if name.strip()}
+        RUN_CONFIGURATIONS = [c for c in RUN_CONFIGURATIONS if c['name'] in chosen]
+        if not RUN_CONFIGURATIONS:
+            print("No matching configuration names found. Exiting.")
+            return
     
     print("\nConfiguration confirmed. Starting process...")
     

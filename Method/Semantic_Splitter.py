@@ -487,9 +487,11 @@ def merge_small_chunks(buffer: List[Tuple[str, str, Optional[str]]], context_id:
     # Merge texts
     merged_text = " ".join([chunk[1] for chunk in buffer])
     merged_id = f"{buffer[0][0]}_merged_{context_id}"
-    
-    # Don't merge OIE strings to avoid confusion
-    return (merged_id, merged_text, None)
+
+    # Merge available OIE strings (if any)
+    merged_oie_parts = [chunk[2] for chunk in buffer if chunk[2]]
+    merged_oie = " " .join(merged_oie_parts) if merged_oie_parts else None
+    return (merged_id, merged_text, merged_oie)
 
 def split_large_chunk_by_tokens(text: str, chunk_id: str, max_tokens: int) -> List[Tuple[str, str, Optional[str]]]:
     """Split large chunks by token count using sentence boundaries"""
