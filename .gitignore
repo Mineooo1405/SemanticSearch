@@ -32,6 +32,8 @@ env3124/
 *.model
 *.preprocessor
 *.dam 
+*_model
+*_preprocessor
 
 # Dataset và output
 output_data/

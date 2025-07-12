@@ -13,8 +13,12 @@ import csv
 import sys
 import os
 from pathlib import Path
+from typing import Optional
 
-def convert_tsv_format(input_file: str, output_file: str = None) -> str:
+# 👉 Tăng giới hạn kích thước trường để xử lý các passage rất dài
+csv.field_size_limit(min(sys.maxsize, 2147483647))
+
+def convert_tsv_format(input_file: str, output_file: Optional[str] = None) -> str:
     """
     Convert 6-column TSV to 3-column TSV
     

@@ -3,7 +3,7 @@ import pandas as pd
 import matchzoo as mz
 
 # 1) Đọc file TSV
-path = r'F:\SematicSearch\integrated_robust04_data_subset_100rows_3col.tsv'
+path = r'F:\SematicSearch\training_datasets\semantic_grouping_with_OIE\output_chunks_final_20250712_062321_rrf_filtered_3col.tsv'
 # Đọc TSV. Nếu file không có header, đặt header mặc định
 df_raw = cast(pd.DataFrame, pd.read_csv(path, sep='\t', header=None))  # type: ignore[arg-type]
 

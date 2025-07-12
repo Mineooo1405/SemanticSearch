@@ -448,46 +448,8 @@ def validate_and_adjust_chunks(
     silent: bool = True
 ) -> List[Tuple[str, str, Optional[str]]]:
     """Validate and adjust chunks to meet token requirements by merging and splitting."""
-    if not chunks:
-        return []
-    
-    min_tokens = int(target_tokens * (1 - tolerance))
-    max_tokens = int(target_tokens * (1 + tolerance))
-    
-    if not silent:
-        print(f"🔧 Validating chunks for {min_tokens}-{max_tokens} token range...")
-        
-    final_chunks = []
-    buffer = []
-
-    for chunk_id, chunk_text_w_oie, oie_string in chunks:
-        base_text = chunk_text_w_oie
-        if oie_string and base_text.endswith(oie_string):
-             base_text = base_text[:-len(oie_string)].strip()
-        
-        base_token_count = count_tokens_accurate(base_text)
-
-        if base_token_count > max_tokens:
-            if buffer:
-                final_chunks.extend(process_merge_buffer(buffer, min_tokens, max_tokens, "pre-split"))
-                buffer = []
-            
-            if not silent:
-                print(f"  Splitting large chunk {chunk_id} ({base_token_count} > {max_tokens})")
-            sub_chunks = split_large_chunk_by_tokens(base_text, chunk_id, max_tokens)
-            final_chunks.extend(sub_chunks)
-        else:
-            buffer.append((chunk_id, chunk_text_w_oie, oie_string, base_text))
-
-    if buffer:
-        final_chunks.extend(process_merge_buffer(buffer, min_tokens, max_tokens, "final"))
-
-    if not silent:
-        original_count = len(chunks)
-        final_count = len(final_chunks)
-        print(f"🔧 Chunk validation: {original_count} → {final_count} chunks")
-        
-    return final_chunks
+    # --- ĐÃ VÔ HIỆU HÓA: Trả ngay danh sách chunks, bỏ qua min/max token ---
+    return chunks
 
 def split_large_chunk_by_tokens(text: str, chunk_id: str, max_tokens: int) -> List[Tuple[str, str, Optional[str]]]:
     """Split large chunks by token count using sentence boundaries"""

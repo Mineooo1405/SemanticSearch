@@ -178,6 +178,9 @@ def semantic_spreading_grouping_optimized(sim_matrix, sentences, initial_thresho
     3. Apply decay to threshold for subsequent groups
     4. Validate groups meet token requirements
     """
+    # --- VÔ HIỆU HÓA RÀNG BUỘC MIN/MAX TOKEN ---
+    min_chunk_len = 0
+    max_chunk_len = float('inf')
     num_sentences = sim_matrix.shape[0]
     ungrouped_indices = set(range(num_sentences))  # Use set for faster operations
     groups = []
@@ -524,6 +527,9 @@ def semantic_chunk_passage_from_grouping_logic(
     Returns:
         List of tuples: (chunk_id, chunk_text_with_oie, oie_string_only)
     """
+
+    # --- VÔ HIỆU HÓA RÀNG BUỘC MIN TOKEN ---
+    min_chunk_len_tokens = 0
 
     if not silent:
         print(f"🔄 Processing passage {doc_id} with Enhanced Semantic Grouping")

@@ -421,60 +421,8 @@ def validate_and_adjust_chunks(
     silent: bool = True
 ) -> List[Tuple[str, str, Optional[str]]]:
     """Validate and adjust chunks to meet token requirements"""
-    if not chunks:
-        return chunks
-    
-    min_tokens = int(target_tokens * (1 - tolerance))  # 90
-    max_tokens = int(target_tokens * (1 + tolerance))  # 150
-    
-    if not silent:
-        print(f"🔧 Validating chunks for {min_tokens}-{max_tokens} token range...")
-    
-    validated_chunks = []
-    merge_buffer = []
-    
-    for chunk_id, chunk_text, oie_string in chunks:
-        # Count tokens in the main text (excluding OIE for validation)
-        base_token_count = count_tokens_accurate(chunk_text) - count_tokens_accurate(oie_string or "")
-        
-        if min_tokens <= base_token_count <= max_tokens:
-            # Perfect size - add any buffered chunks first
-            if merge_buffer:
-                merged_chunk = merge_small_chunks(merge_buffer, chunk_id)
-                if merged_chunk:
-                    validated_chunks.append(merged_chunk)
-                merge_buffer = []
-            
-            validated_chunks.append((chunk_id, chunk_text, oie_string))
-                
-        elif base_token_count < min_tokens:
-            # Too small - add to merge buffer
-            merge_buffer.append((chunk_id, chunk_text, oie_string))
-            
-        else:
-            # Too large - handle buffer first, then split
-            if merge_buffer:
-                merged_chunk = merge_small_chunks(merge_buffer, chunk_id)
-                if merged_chunk:
-                    validated_chunks.append(merged_chunk)
-                merge_buffer = []
-            
-            # Split large chunk
-            sub_chunks = split_large_chunk_by_tokens(chunk_text, chunk_id, max_tokens)
-            validated_chunks.extend(sub_chunks)
-    
-    # Handle remaining buffer
-    if merge_buffer:
-        merged_chunk = merge_small_chunks(merge_buffer, "final")
-        if merged_chunk:
-            validated_chunks.append(merged_chunk)
-    
-    if not silent:
-        original_count = len(chunks)
-        final_count = len(validated_chunks)
-        print(f"🔧 Chunk validation: {original_count} → {final_count} chunks")
-    
-    return validated_chunks
+    # --- ĐÃ VÔ HIỆU HÓA: Bỏ qua toàn bộ logic kiểm tra min/max token ---
+    return chunks
 
 def merge_small_chunks(buffer: List[Tuple[str, str, Optional[str]]], context_id: str) -> Optional[Tuple[str, str, Optional[str]]]:
     """Merge small chunks in buffer"""
