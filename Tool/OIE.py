@@ -52,12 +52,13 @@ def _start_openie_server(port: int) -> None:
 
     cmd = [
         "java",
-        "-Xmx12g",
-        "-XX:+UseConcMarkSweepGC",
-        "-jar",
-        str(jar_path),
-        "--httpPort",
-        str(port),
+        "-server",
+        "-Xms8g",          # heap khởi đầu 8 GB
+        "-Xmx12g",         # heap tối đa 12 GB  (đủ mà dư 8 GB cho Python)
+        "-XX:+UseG1GC",    # GC G1 – ổn định trên heap lớn
+        "-XX:MaxGCPauseMillis=200",
+        "-jar", str(jar_path),
+        "--httpPort", str(port),
     ]
 
     try:
