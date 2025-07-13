@@ -196,10 +196,17 @@ def interactive_mode():
         except ValueError:
             return default
 
-    cosine_pos_thr = _ask_float("Cosine POS threshold (default 0.75): ", 0.75)
-    cosine_neg_thr = _ask_float("Cosine NEG threshold (default 0.25): ", 0.25)
-    bm25_pos_thr   = _ask_float("BM25 POS threshold   (default 3.0): ", 3.0)
-    bm25_neg_thr   = _ask_float("BM25 NEG threshold   (default 1.0): ", 1.0)
+    def _ask_int(prompt: str, default: int):
+        try:
+            val = input(prompt) or str(default)
+            return int(val)
+        except ValueError:
+            return default
+
+    cosine_up_perc = _ask_int("Cosine upper percentile for POS (default 80): ", 80)
+    cosine_low_perc = _ask_int("Cosine lower percentile for NEG (default 20): ", 20)
+    bm25_up_perc   = _ask_int("BM25 upper percentile for POS (default 80): ", 80)
+    bm25_low_perc  = _ask_int("BM25 lower percentile for NEG (default 20): ", 20)
 
     # 5. Return a namespace object similar to argparse
     class Args:
@@ -210,10 +217,10 @@ def interactive_mode():
             self.text_column = ""
             self.output_dir = ""
             self.embedding_model = ""
-            self.cosine_pos_threshold = 0.75
-            self.cosine_neg_threshold = 0.25
-            self.bm25_pos_threshold = 3.0
-            self.bm25_neg_threshold = 1.0
+            self.cosine_upper_percentile = 0.75
+            self.cosine_lower_percentile = 0.25
+            self.bm25_upper_percentile = 3.0
+            self.bm25_lower_percentile = 1.0
 
     args = Args()
     args.input_file = input_file
@@ -222,10 +229,10 @@ def interactive_mode():
     args.text_column = text_column
     args.output_dir = output_dir
     args.embedding_model = embedding_model
-    args.cosine_pos_threshold = cosine_pos_thr
-    args.cosine_neg_threshold = cosine_neg_thr
-    args.bm25_pos_threshold = bm25_pos_thr
-    args.bm25_neg_threshold = bm25_neg_thr
+    args.cosine_upper_percentile = cosine_up_perc
+    args.cosine_lower_percentile = cosine_low_perc
+    args.bm25_upper_percentile = bm25_up_perc
+    args.bm25_lower_percentile = bm25_low_perc
     
     print("\nConfiguration complete. Starting ranking process...")
     return args
@@ -245,10 +252,11 @@ def main():
     parser.add_argument("--text_column", type=str, default="chunk_text", help="Name of the column with the chunk text to rank.")
     parser.add_argument("--output_dir", type=str, default="./ranking_results", help="Directory to save the ranked output files.")
     parser.add_argument("--embedding_model", type=str, default="all-MiniLM-L6-v2", help="Sentence transformer model for cosine similarity.")
-    parser.add_argument("--cosine_pos_threshold", type=float, default=0.75, help="Upper threshold: cosine_score >= value → positive")
-    parser.add_argument("--cosine_neg_threshold", type=float, default=0.25, help="Lower threshold: cosine_score <= value → negative")
-    parser.add_argument("--bm25_pos_threshold", type=float, default=3.0, help="Upper threshold: bm25_score >= value → positive")
-    parser.add_argument("--bm25_neg_threshold", type=float, default=1.0, help="Lower threshold: bm25_score <= value → negative")
+    # --- NEW: dynamic percentile thresholds ---
+    parser.add_argument("--cosine_upper_percentile", type=int, default=80, help="Percentile for positive cosine samples (default: 80)")
+    parser.add_argument("--cosine_lower_percentile", type=int, default=20, help="Percentile for negative cosine samples (default: 20)")
+    parser.add_argument("--bm25_upper_percentile", type=int, default=80, help="Percentile for positive BM25 samples (default: 80)")
+    parser.add_argument("--bm25_lower_percentile", type=int, default=20, help="Percentile for negative BM25 samples (default: 20)")
 
     args = parser.parse_args()
 
@@ -307,8 +315,12 @@ def main():
             all_cosine_ranked.append(cosine_ranked_group)
 
             # Filter pos / neg theo upper/lower threshold
-            pos_rows = cosine_ranked_group[cosine_ranked_group['cosine_score'] >= args.cosine_pos_threshold].copy()
-            neg_rows = cosine_ranked_group[cosine_ranked_group['cosine_score'] <= args.cosine_neg_threshold].copy()
+            scores = cosine_ranked_group['cosine_score'].to_numpy(dtype=float)
+            pos_thr = np.percentile(scores, args.cosine_upper_percentile)
+            neg_thr = np.percentile(scores, args.cosine_lower_percentile)
+
+            pos_rows = cosine_ranked_group[cosine_ranked_group['cosine_score'] >= pos_thr].copy()
+            neg_rows = cosine_ranked_group[cosine_ranked_group['cosine_score'] <= neg_thr].copy()
 
             pos_rows['label'] = 1
             neg_rows['label'] = 0
@@ -327,8 +339,12 @@ def main():
             all_bm25_ranked.append(bm25_ranked_group)
 
             # Filter pos / neg theo upper/lower threshold
-            bm25_pos_rows = bm25_ranked_group[bm25_ranked_group['bm25_score'] >= args.bm25_pos_threshold].copy()
-            bm25_neg_rows = bm25_ranked_group[bm25_ranked_group['bm25_score'] <= args.bm25_neg_threshold].copy()
+            bm25_scores = bm25_ranked_group['bm25_score'].to_numpy(dtype=float)
+            bm25_pos_thr = np.percentile(bm25_scores, args.bm25_upper_percentile)
+            bm25_neg_thr = np.percentile(bm25_scores, args.bm25_lower_percentile)
+
+            bm25_pos_rows = bm25_ranked_group[bm25_ranked_group['bm25_score'] >= bm25_pos_thr].copy()
+            bm25_neg_rows = bm25_ranked_group[bm25_ranked_group['bm25_score'] <= bm25_neg_thr].copy()
 
             bm25_pos_rows['label'] = 1
             bm25_neg_rows['label'] = 0

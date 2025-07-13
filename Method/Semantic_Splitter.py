@@ -68,8 +68,8 @@ def calculate_chunk_stats(chunks: List[str]) -> Dict[str, Union[int, float]]:
     return stats
 
 def split_by_sentence_optimized(
-    text: str,
-    chunk_size: int = 1000,
+    text: str, 
+    chunk_size: int = 1000, 
     chunk_overlap: int = 0,
     target_tokens: Optional[int] = None,
     tolerance: float = 0.25,
@@ -174,7 +174,7 @@ def split_by_sentence_optimized(
                     current_chunk_sentences = []
                     current_group_indices = []
                     current_size = 0
-
+        
         # Handle sentences that are too long for any chunk
         if sentence_len > chunk_size:
             # Save current chunk if exists
@@ -435,7 +435,7 @@ def merge_small_chunks(buffer: List[Tuple[str, str, Optional[str]]], context_id:
     # Merge texts
     merged_text = " ".join([chunk[1] for chunk in buffer])
     merged_id = f"{buffer[0][0]}_merged_{context_id}"
-
+    
     # Merge available OIE strings (if any)
     merged_oie_parts = [chunk[2] for chunk in buffer if chunk[2]]
     merged_oie = " " .join(merged_oie_parts) if merged_oie_parts else None

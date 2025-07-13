@@ -169,16 +169,7 @@ def analyze_similarity_distribution(sim_matrix):
 
 def semantic_spreading_grouping_optimized(sim_matrix, sentences, initial_threshold, decay_factor, min_threshold, 
                                         min_chunk_len, max_chunk_len, silent=True):
-    """
-    Optimized semantic grouping algorithm with token-aware clustering.
-    
-    Algorithm:
-    1. Find best sentence pairs that meet similarity and token constraints
-    2. Expand groups by adding similar sentences
-    3. Apply decay to threshold for subsequent groups
-    4. Validate groups meet token requirements
-    """
-    # --- VÔ HIỆU HÓA RÀNG BUỘC MIN/MAX TOKEN ---
+
     min_chunk_len = 0
     max_chunk_len = float('inf')
     num_sentences = sim_matrix.shape[0]
@@ -670,6 +661,7 @@ def semantic_chunk_passage_from_grouping_logic(
         print(f"   Creating {len(group_indices)} chunks with OIE processing...")
     
     final_chunks = []
+    all_raw_oie_data: List[Dict] = []  # Thu thập OIE thô để ghi ra file
     
     for i, group_sentence_indices in enumerate(group_indices):
         # Validate indices
@@ -688,14 +680,31 @@ def semantic_chunk_passage_from_grouping_logic(
         chunk_hash = hashlib.sha1(chunk_text.encode('utf-8', errors='ignore')).hexdigest()[:8]
         chunk_id = f"{doc_id}_group{i}_hash{chunk_hash}"
         
-        # Extract OIE if requested
+        # Extract OIE if requested (lưu cả raw)
         oie_string = None
         final_chunk_text = chunk_text
-        
-        if include_oie:
-            oie_string = extract_oie_for_chunk(chunk_text, silent=silent)
-            if oie_string:
-                final_chunk_text = f"{chunk_text} {oie_string}"
+        raw_oie_relations = None
+
+        if include_oie and chunk_text.strip():
+            try:
+                raw_oie_relations = extract_relations_from_paragraph(chunk_text, silent=True)  # type: ignore[arg-type]
+                if raw_oie_relations:
+                    oie_string = format_oie_triples_to_string(raw_oie_relations)
+                    if oie_string:
+                        final_chunk_text = f"{chunk_text} {oie_string}"
+
+                    # Thu thập để lưu nếu cần
+                    if save_raw_oie:
+                        all_raw_oie_data.append({
+                            "chunk_id": chunk_id,
+                            "relations": raw_oie_relations,
+                            "relation_count": len(raw_oie_relations),
+                            "chunk_text_preview": chunk_text[:100] + "..." if len(chunk_text) > 100 else chunk_text
+                        })
+            except Exception as e_oie:
+                if not silent:
+                    print(f"      Error during OIE extraction: {e_oie}")
+                oie_string = None
         
         # Validate final token count based on the original chunk text
         base_tokens = count_tokens_accurate(chunk_text)
@@ -760,6 +769,19 @@ def semantic_chunk_passage_from_grouping_logic(
 
     final_chunks = force_split_chunks
 
+    # 9. Lưu raw OIE nếu cần
+    if save_raw_oie and all_raw_oie_data:
+        try:
+            raw_oie_filepath = save_raw_oie_data(all_raw_oie_data, doc_id, output_dir, "semantic_grouping")
+            if raw_oie_filepath and not silent:
+                print(f"📄 Raw OIE data saved to: {raw_oie_filepath}")
+                total_relations = sum(entry['relation_count'] for entry in all_raw_oie_data)
+                print(f"   Total chunks with OIE: {len(all_raw_oie_data)}")
+                print(f"   Total relations extracted: {total_relations}")
+        except Exception as e:
+            if not silent:
+                print(f"Warning: Failed to save raw OIE data: {e}")
+
     if not silent:
         token_counts = [count_tokens_accurate(chunk[1]) for chunk in final_chunks]
         if token_counts:
@@ -772,3 +794,40 @@ def semantic_chunk_passage_from_grouping_logic(
 
 # Alias for backward compatibility
 semantic_spreading_grouping_with_token_control = semantic_spreading_grouping_optimized
+
+# -------------------------------------------------------------
+# Helper: Lưu raw OIE data (sao chép từ Text_Splitter)
+# -------------------------------------------------------------
+
+def save_raw_oie_data(oie_data: List[Dict], chunk_id: str, output_dir: str, method_name: str = "semantic_grouping") -> Optional[str]:
+    """Save raw OIE data to JSON file for analysis"""
+    try:
+        raw_oie_dir = Path(output_dir) / "raw_oie_data"
+        raw_oie_dir.mkdir(exist_ok=True)
+
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        filename = f"{method_name}_raw_oie_{timestamp}.json"
+        filepath = raw_oie_dir / filename
+
+        oie_entry = {
+            "timestamp": datetime.now().isoformat(),
+            "method": method_name,
+            "chunk_id": chunk_id,
+            "raw_oie_relations": oie_data,
+            "total_relations": sum(e['relation_count'] for e in oie_data)
+        }
+
+        if filepath.exists():
+            with open(filepath, 'r', encoding='utf-8') as f:
+                existing_data = json.load(f)
+            existing_data.append(oie_entry)
+        else:
+            existing_data = [oie_entry]
+
+        with open(filepath, 'w', encoding='utf-8') as f:
+            json.dump(existing_data, f, indent=2, ensure_ascii=False)
+
+        return str(filepath)
+    except Exception as e:
+        print(f"Warning: Could not save raw OIE data: {e}")
+        return None

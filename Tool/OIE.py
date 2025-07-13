@@ -1,52 +1,112 @@
-import os
-import sys
 import logging
 import psutil
+import subprocess
+import socket
+import time
+from pathlib import Path
 from typing import List, Dict, Optional
-from stanfordnlp.server import CoreNLPClient
-import atexit
+from pyopenie import OpenIE5  # type: ignore
 
 # Suppress CoreNLP and Java startup logging
 logging.getLogger("stanford").setLevel(logging.WARNING)
 logging.getLogger("corenlp").setLevel(logging.WARNING)
 
-# -------------------- Singleton CoreNLPClient ----------------------------
-_GLOBAL_CLIENT: Optional[CoreNLPClient] = None
+# -------------------- Singleton OpenIE5 client ---------------------------
+_GLOBAL_CLIENT: Optional[OpenIE5] = None
+# Track whether we already attempted to launch server in this process
+_SERVER_LAUNCHED = False
 
 
-def _get_global_client() -> CoreNLPClient:
-    """Return a singleton CoreNLPClient (starts once)."""
+# -------------------- Kiểm tra & khởi động server ------------------------
+
+
+def _is_port_open(port: int) -> bool:
+    """Trả về True nếu localhost:port đang lắng nghe."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.settimeout(1)
+        return sock.connect_ex(("localhost", port)) == 0
+
+
+# -----------------------------------------------------------------
+# Start OpenIE5 server once per process (idempotent)
+# -----------------------------------------------------------------
+def _start_openie_server(port: int) -> None:
+    """Thử khởi động OpenIE5 server (nền) nếu chưa chạy."""
+    global _SERVER_LAUNCHED
+
+    # Nếu đã launch trong process hoặc port đã mở → bỏ qua
+    if _SERVER_LAUNCHED or _is_port_open(port):
+        logging.warning("[OIE] Server đã chạy hoặc đã được khởi động trong tiến trình (cổng %d).", port)
+        return
+
+    # Mặc định thư mục jar nằm song song root dự án
+    project_root = Path(__file__).resolve().parent.parent
+    jar_dir = project_root / "OpenIE-standalone"
+    jar_path = jar_dir / "openie-assembly-5.0-SNAPSHOT.jar"
+
+    if not jar_path.exists():
+        logging.warning("[OIE] Không tìm thấy %s, bỏ qua việc tự khởi động OpenIE5.", jar_path)
+        return
+
+    logging.warning("[OIE] Đang khởi chạy OpenIE5 server (cổng %d)...", port)
+
+    cmd = [
+        "java",
+        "-Xmx12g",
+        "-XX:+UseConcMarkSweepGC",
+        "-jar",
+        str(jar_path),
+        "--httpPort",
+        str(port),
+    ]
+
+    try:
+        subprocess.Popen(cmd, cwd=str(jar_dir), stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT)
+        _SERVER_LAUNCHED = True  # Đánh dấu đã launch
+        # Đợi server lên tối đa 30 giây
+        for _ in range(30):
+            if _is_port_open(port):
+                logging.warning("[OIE] Đã khởi chạy OpenIE5 server (cổng %d).", port)
+                return
+            time.sleep(1)
+        logging.warning("[OIE] Khởi động OpenIE5 timeout – cổng %d vẫn chưa mở.", port)
+    except Exception as exc:
+        logging.warning("[OIE] Không thể khởi động OpenIE5: %s", exc)
+
+
+def _get_global_client(port: int = 9000) -> OpenIE5:
+    """Trả về một client OpenIE5 duy nhất (kết nối lại nếu đã có)."""
     global _GLOBAL_CLIENT
     if _GLOBAL_CLIENT is None:
-        # Khởi tạo CoreNLPClient với DEFAULT_PROPERTIES để áp dụng cấu hình OpenIE tuỳ chỉnh
-        _GLOBAL_CLIENT = CoreNLPClient(
-            annotators=[
-                "tokenize",
-                "ssplit",
-                "pos",
-                "lemma",
-                "depparse",
-                "openie",
-            ],
-            timeout=600000,
-            memory="8G",
-            threads=5,
-            max_char_length=100000,
-            properties=DEFAULT_PROPERTIES,
-        )
-        _GLOBAL_CLIENT.start()
+        # Nếu server chưa chạy, cố gắng tự khởi động
+        if not _is_port_open(port):
+            _start_openie_server(port)
 
-        # Ensure shutdown at exit
-        def _shutdown_client() -> None:
-            global _GLOBAL_CLIENT
-            if _GLOBAL_CLIENT is not None:
-                try:
-                    _GLOBAL_CLIENT.stop()
-                except Exception:
-                    pass
-        atexit.register(_shutdown_client)
-
+        # Khởi tạo kết nối tới server OpenIE5
+        _GLOBAL_CLIENT = OpenIE5(f"http://localhost:{port}")
     return _GLOBAL_CLIENT
+
+
+# -------------------- Helper to convert OpenIE5 kết quả ------------------
+
+def _convert_openie5(raw_results: List[Dict]) -> List[Dict[str, str]]:
+    """Chuyển đổi output gốc của pyopenie thành list các triple subject/relation/object."""
+    triples: List[Dict[str, str]] = []
+    for item in raw_results:
+        extraction = item.get("extraction", {})
+        arg1 = extraction.get("arg1", {}).get("text", "").strip()
+        rel = extraction.get("rel", {}).get("text", "").strip()
+        if not arg1 or not rel:
+            continue
+        for arg2 in extraction.get("arg2s", []):
+            obj = arg2.get("text", "").strip()
+            if obj:
+                triples.append({
+                    "subject": arg1,
+                    "relation": rel,
+                    "object": obj,
+                })
+    return triples
 
 
 def terminate_corenlp_processes(port: int = 9000, silent: bool = True):
@@ -83,6 +143,39 @@ def terminate_corenlp_processes(port: int = 9000, silent: bool = True):
     if found_processes and not silent:
         print("Cleanup complete.")
 
+# -------------------- Dừng OpenIE server ----------------------------------
+
+
+def terminate_openie_processes(port: int = 9000, silent: bool = True):
+    """Tìm và dừng các tiến trình OpenIE5 server đang chạy."""
+    if not silent:
+        print(f"Checking for existing OpenIE server processes on port {port}...")
+
+    found_processes = False
+    for proc in psutil.process_iter(['pid', 'name', 'cmdline']):
+        try:
+            if 'java' in (proc.info['name'] or '').lower():
+                cmdline = proc.info['cmdline']
+                if cmdline and any('openie-assembly' in arg for arg in cmdline):
+                    # Kiểm tra port
+                    port_arg = f'--httpPort {port}'
+                    if any(port_arg in arg for arg in cmdline) or (port_arg not in str(cmdline) and port == 9000):
+                        if not silent:
+                            print(f"  -> Found OpenIE process {proc.pid}. Terminating...")
+                        proc.terminate()
+                        proc.wait(timeout=3)
+                        found_processes = True
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            continue
+        except psutil.TimeoutExpired:
+            if not silent:
+                print(f"  -> Process {proc.pid} did not terminate gracefully. Forcing kill...")
+            proc.kill()
+            found_processes = True
+
+    if found_processes and not silent:
+        print("OpenIE cleanup complete.")
+
 # Cấu hình mặc định cho CoreNLP - IMPROVED VERSION (removed harmful anti-cache settings)
 DEFAULT_PROPERTIES = {
     "annotators": "tokenize,ssplit,pos,lemma,depparse,openie",
@@ -102,17 +195,10 @@ def extract_relations_from_paragraph(
     port: int = 9000,
     silent: bool = True
 ) -> List[Dict[str, str]]:
-    # Nếu client toàn cục đã tạo, không nên terminate server
-    if _GLOBAL_CLIENT is None:
-        terminate_corenlp_processes(port=port, silent=silent)
-
     if not paragraph_text.strip():
         return []
-    
-    # Luôn sử dụng ENHANCED_PROPERTIES
-    properties = DEFAULT_PROPERTIES
-    
-    results = []
+
+    results: List[Dict[str, str]] = []
     
     # Debug: In ra properties đang sử dụng (commented out for cleaner output)
     # print(f"Using properties: strict={properties.get('openie.triple.strict')}, "
@@ -130,23 +216,11 @@ def extract_relations_from_paragraph(
             logger.setLevel(logging.CRITICAL)
     
     try:
-        client = _get_global_client()
+        client = _get_global_client(port=port)
 
-        ann = client.annotate(  # type: ignore[no-untyped-call]
-            paragraph_text,
-            output_format="json",
-        )
-        # Lặp qua các câu đã annotate (ann là dictionary)
-        if 'sentences' in ann:  # type: ignore[arg-type]
-            for sentence_ann in ann['sentences']:  # type: ignore[index]
-                # Lặp qua các OpenIE triples
-                if 'openie' in sentence_ann:  # type: ignore[operator]
-                    for triple in sentence_ann['openie']:  # type: ignore[index]
-                        results.append({
-                            "subject": triple.get("subject", ""),  # type: ignore[attr-defined]
-                            "relation": triple.get("relation", ""),  # type: ignore[attr-defined]
-                            "object": triple.get("object", "")  # type: ignore[attr-defined]
-                        })
+        raw_results = client.extract(paragraph_text)
+        # Chuyển đổi sang định dạng subject / relation / object
+        results.extend(_convert_openie5(raw_results))
     except Exception as e:
         if not silent:
             print(f"Error in OIE extraction: {e}")

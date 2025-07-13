@@ -1,8 +1,3 @@
-"""
-Sentence Detector and Simplifier
-Splits text into paragraphs and sentences. Optionally simplifies complex sentences
-for downstream tasks like Open Information Extraction (OIE) and Semantic Grouping.
-"""
 
 import re
 from typing import List, Dict, Tuple, Optional, cast

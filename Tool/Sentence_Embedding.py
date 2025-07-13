@@ -3,6 +3,7 @@ from sentence_transformers import SentenceTransformer
 import numpy as np
 import logging
 import importlib # ADDED
+from typing import Optional
 
 # Attempt to import torch_directml and make it robust
 # This is primarily for Windows with DirectML. On other systems, it will gracefully fallback.
@@ -29,8 +30,10 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 # Global dictionary to cache models
 # Key: model_name, Value: loaded SentenceTransformer model
 loaded_models = {}
+# Cache for individual text embeddings per model: {(model_name, text): np.ndarray}
+_embedding_cache = {}
 
-def get_device(preferred_device_str: str = None):
+def get_device(preferred_device_str: Optional[str] = None):
     """
     Determines the appropriate torch device.
     Prioritizes DirectML if available and functional, then CUDA, then CPU.
@@ -76,7 +79,7 @@ def get_device(preferred_device_str: str = None):
     logging.info("Using CPU device.")
     return torch.device("cpu")
 
-def sentence_embedding(text_list: list, model_name: str, batch_size: int = 32, device_preference: str = None):
+def sentence_embedding(text_list: list, model_name: str, batch_size: int = 32, device_preference: Optional[str] = None):
     """
     Embeds a list of texts using a specified SentenceTransformer model.
     Uses a global cache for loaded models to avoid reloading.
@@ -129,16 +132,16 @@ def sentence_embedding(text_list: list, model_name: str, batch_size: int = 32, d
 
     model = loaded_models[model_name]
     
-    # logging.info(f"Encoding {len(text_list)} texts with model {model_name} using batch size {batch_size} on device {model.device} (target effective: {effective_device}).")
-    
+    # --- NOTE ---
+    # Đã loại bỏ cơ chế cache embeddings trong RAM. Luôn tính mới mỗi lần gọi.
+
     try:
         embeddings = model.encode(text_list, batch_size=batch_size, show_progress_bar=False)
-        # logging.info(f"Successfully encoded {len(text_list)} texts.")
-        return embeddings
     except Exception as e:
-        logging.error(f"Error during sentence encoding with model {model_name} on device {model.device}: {e}")
-        # Consider if a fallback to CPU encoding should happen here if not already on CPU
+        logging.error(f"Error during sentence encoding with model {model_name}: {e}")
         raise
+
+    return embeddings
 
 if __name__ == '__main__':
     # Example Usage:
