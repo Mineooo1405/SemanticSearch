@@ -20,14 +20,20 @@ csv.field_size_limit(min(sys.maxsize, 2147483647))
 
 def convert_tsv_format(input_file: str, output_file: Optional[str] = None) -> str:
     """
-    Convert 6-column TSV to 3-column TSV
-    
+    Convert TSV từ nhiều định dạng (6 hoặc 8 cột) về định dạng 3 cột
+
+    Hỗ trợ:
+        • 6 cột  (number | title | description | narrative | label | data)
+        • 8 cột  (query_id | query_text | passage_id | original_passage | label | chunk_id | chunk_text | raw_oie_data)
+
+    Kết quả luôn có dạng: query    passage    label
+
     Args:
-        input_file: Path to input TSV file (6 columns)
-        output_file: Path to output TSV file (3 columns). If None, auto-generate
-    
+        input_file: Đường dẫn file TSV gốc (6 hoặc 8 cột)
+        output_file: Đường dẫn file TSV đầu ra (3 cột). Nếu None sẽ tự sinh.
+
     Returns:
-        Path to output file
+        Đường dẫn file đầu ra
     """
     # Validate input file
     if not os.path.exists(input_file):
@@ -55,8 +61,14 @@ def convert_tsv_format(input_file: str, output_file: Optional[str] = None) -> st
             # Read and validate header
             try:
                 header = next(reader)
-                if len(header) < 6:
-                    raise ValueError(f"Expected 6 columns, got {len(header)}: {header}")
+                
+                # Xác định số cột và kiểu định dạng
+                if len(header) >= 8 and {'query_text', 'chunk_text'}.issubset(set([h.lower() for h in header])):
+                    input_format = '8col'
+                elif len(header) >= 6:
+                    input_format = '6col'
+                else:
+                    raise ValueError(f"Unsupported column count ({len(header)}) in header: {header}")
                 
                 print(f"📋 Input header ({len(header)} columns): {header}")
                 
@@ -73,36 +85,29 @@ def convert_tsv_format(input_file: str, output_file: Optional[str] = None) -> st
                 rows_processed += 1
                 
                 try:
-                    if len(row) < 6:
-                        print(f"⚠️  Skipping row {row_idx}: insufficient columns ({len(row)}/6)")
+                    required_cols = 8 if input_format == '8col' else 6
+
+                    if len(row) < required_cols:
+                        print(f"⚠️  Skipping row {row_idx}: insufficient columns ({len(row)}/{required_cols})")
                         continue
-                    
-                    # Extract columns: number, title, description, narrative, label, data
-                    number, title, description, narrative, label, data = row[0], row[1], row[2], row[3], row[4], row[5]
-                    
-                    # Clean and combine query components
-                    title = title.strip()
-                    description = description.strip()
-                    narrative = narrative.strip()
-                    
-                    # Create query by combining title, description, and narrative
-                    query_parts = []
-                    if title:
-                        query_parts.append(title)
-                    if description:
-                        query_parts.append(description)
-                    if narrative:
-                        query_parts.append(narrative)
-                    
-                    query = ". ".join(query_parts).strip()
-                    if query.endswith('.'):
-                        query = query[:-1]  # Remove trailing dot if it ends with one
-                    
-                    # Clean passage (data)
-                    passage = data.strip()
-                    
-                    # Clean label
-                    label = label.strip()
+
+                    if input_format == '6col':
+                        # number | title | description | narrative | label | data
+                        _, title, description, narrative, label, data = row[:6]
+
+                        # Ghép title + description + narrative
+                        query_parts = [part.strip() for part in (title, description, narrative) if part.strip()]
+                        query = '. '.join(query_parts)
+                        passage = data.strip()
+
+                    else:  # 8col
+                        # query_id | query_text | passage_id | original_passage | label | chunk_id | chunk_text | raw_oie_data
+                        query_text = row[1].strip()
+                        chunk_text = row[6].strip()
+                        label = row[4].strip()
+
+                        query = query_text
+                        passage = chunk_text
                     
                     # Validate data
                     if not query:

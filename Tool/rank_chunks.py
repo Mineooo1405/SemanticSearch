@@ -56,21 +56,21 @@ def rank_by_bm25(query: str, chunks_df: pd.DataFrame, text_column: str = 'chunk_
     
     return ranked_df
 
-def rank_by_cosine_similarity(query: str, chunks_df: pd.DataFrame, text_column: str = 'chunk_text', model_name: str = 'all-MiniLM-L6-v2', batch_size: int = 32) -> pd.DataFrame:
+def rank_by_cosine_similarity(query: str, chunks_df: pd.DataFrame, text_column: str = 'chunk_text', model_name: str = 'all-MiniLM-L6-v2', batch_size: int = 32, *, device_preference: str | None = None) -> pd.DataFrame:
     print("\n--- Ranking with Cosine Similarity ---")
     if text_column not in chunks_df.columns:
         raise ValueError(f"Text column '{text_column}' not found in the DataFrame. Available columns: {chunks_df.columns.tolist()}")
     
     corpus = chunks_df[text_column].fillna("").tolist()
     
-    print(f"Embedding query: '{query}' using model '{model_name}'...")
-    query_embedding = sentence_embedding(text_list=[query], model_name=model_name)
+    print(f"Embedding query: '{query}' using model '{model_name}' (device_preference={device_preference})...")
+    query_embedding = sentence_embedding(text_list=[query], model_name=model_name, device_preference=device_preference)
     
     if query_embedding is None or query_embedding.shape[0] == 0:
         raise RuntimeError("Failed to embed the query.")
         
-    print(f"Embedding {len(corpus)} documents in batches of {batch_size}...")
-    corpus_embeddings = sentence_embedding(text_list=corpus, model_name=model_name, batch_size=batch_size)
+    print(f"Embedding {len(corpus)} documents in batches of {batch_size} (device_preference={device_preference})...")
+    corpus_embeddings = sentence_embedding(text_list=corpus, model_name=model_name, batch_size=batch_size, device_preference=device_preference)
     
     if corpus_embeddings is None or corpus_embeddings.shape[0] == 0:
         raise RuntimeError("Failed to embed the corpus documents.")
