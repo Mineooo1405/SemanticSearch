@@ -33,7 +33,7 @@ test_pack_processed = preprocessor.transform(test_pack_raw)
 print("Tiền xử lý dữ liệu hoàn tất.")
 
 # --- 4. Chuẩn bị Embedding Matrix ---
-glove_embedding = mz.datasets.embeddings.load_glove_embedding(dimension=100)
+glove_embedding = mz.datasets.embeddings.load_glove_embedding(dimension=300)
 term_index = preprocessor.context['vocab_unit'].state['term_index']
 embedding_matrix = glove_embedding.build_matrix(term_index)
 l2_norm = np.sqrt((embedding_matrix * embedding_matrix).sum(axis=1))
@@ -50,7 +50,7 @@ trainset = mz.dataloader.Dataset(
     mode='pair',
     num_dup=5,
     num_neg=10,
-    batch_size=16, 
+    batch_size=20, 
     resample=True,
     sort=False,
     shuffle=True
@@ -58,7 +58,7 @@ trainset = mz.dataloader.Dataset(
 testset = mz.dataloader.Dataset(
     data_pack=test_pack_processed,
     mode='point', 
-    batch_size=16, 
+    batch_size=20, 
     shuffle=False
 )
 
@@ -81,6 +81,7 @@ print("Tạo DataLoader thành công.")
 # --- 6. Xây dựng và cấu hình Model ---
 model = mz.models.MatchLSTM()
 model.params['task'] = ranking_task
+model.params['mask_value'] = 0
 model.params['embedding'] = embedding_matrix
 model.build()
 model.to(device)

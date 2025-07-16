@@ -18,9 +18,7 @@ test_pack_raw = mz.load_data_pack(os.path.join(data_pack_dir, 'test_pack.dam'))
 print("Tải DataPacks thành công.")
 
 # --- 2. Thiết lập Task và Metrics ---
-# ESIM thường được dùng cho classification, nhưng có thể dùng cho ranking
-# Chúng ta sẽ dùng loss mặc định của Ranking task
-ranking_task = mz.tasks.Ranking()
+ranking_task = mz.tasks.Ranking(losses=mz.losses.RankCrossEntropyLoss(num_neg=10))
 ranking_task.metrics = [
     mz.metrics.NormalizedDiscountedCumulativeGain(k=3),
     mz.metrics.NormalizedDiscountedCumulativeGain(k=5),
@@ -35,7 +33,7 @@ test_pack_processed = preprocessor.transform(test_pack_raw)
 print("Tiền xử lý dữ liệu hoàn tất.")
 
 # --- 4. Chuẩn bị Embedding Matrix ---
-glove_embedding = mz.datasets.embeddings.load_glove_embedding(dimension=100)
+glove_embedding = mz.datasets.embeddings.load_glove_embedding(dimension=300)
 term_index = preprocessor.context['vocab_unit'].state['term_index']
 embedding_matrix = glove_embedding.build_matrix(term_index)
 l2_norm = np.sqrt((embedding_matrix * embedding_matrix).sum(axis=1))
@@ -51,8 +49,8 @@ trainset = mz.dataloader.Dataset(
     data_pack=train_pack_processed,
     mode='pair',
     num_dup=5,
-    num_neg=1,
-    batch_size=16, 
+    num_neg=10,
+    batch_size=20, 
     resample=True,
     sort=False,
     shuffle=True
@@ -60,7 +58,7 @@ trainset = mz.dataloader.Dataset(
 testset = mz.dataloader.Dataset(
     data_pack=test_pack_processed,
     mode='point', 
-    batch_size=16, 
+    batch_size=20, 
     shuffle=False
 )
 
@@ -84,13 +82,17 @@ print("Tạo DataLoader thành công.")
 model = mz.models.ESIM()
 model.params['task'] = ranking_task
 model.params['embedding'] = embedding_matrix
+model.params['mask_value'] = 0
+model.params['dropout'] = 0.2
+model.params['hidden_size'] = 200
+model.params['lstm_layer'] = 1
 model.build()
 model.to(device)
 print(model)
 print("Tổng số tham số cần huấn luyện:", sum(p.numel() for p in model.parameters() if p.requires_grad))
 
 # --- 7. Huấn luyện Model ---
-optimizer = torch.optim.Adam(model.parameters())
+optimizer = torch.optim.Adadelta(model.parameters())
 trainer = mz.trainers.Trainer(
     model=model,
     optimizer=optimizer,

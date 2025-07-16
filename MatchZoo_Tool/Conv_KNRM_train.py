@@ -46,7 +46,7 @@ print("Tiền xử lý dữ liệu hoàn tất.")
 
 # --- 4. Chuẩn bị Embedding Matrix ---
 # Tải GloVe embedding
-glove_embedding = mz.datasets.embeddings.load_glove_embedding(dimension=100)
+glove_embedding = mz.datasets.embeddings.load_glove_embedding(dimension=300)
 # Lấy từ điển từ preprocessor
 term_index = preprocessor.context['vocab_unit'].state['term_index']
 # Xây dựng ma trận embedding cho các từ trong bộ dữ liệu
@@ -70,8 +70,8 @@ trainset = mz.dataloader.Dataset(
     data_pack=train_pack_processed,
     mode='pair',
     num_dup=5,
-    num_neg=1, # ConvKNRM thường dùng 1 neg
-    batch_size=16, 
+    num_neg=1,
+    batch_size=20, 
     resample=True,
     sort=False,
     shuffle=True
@@ -79,7 +79,7 @@ trainset = mz.dataloader.Dataset(
 testset = mz.dataloader.Dataset(
     data_pack=test_pack_processed,
     mode='point', 
-    batch_size=16, 
+    batch_size=20, 
     shuffle=False
 )
 
@@ -108,6 +108,13 @@ model = mz.models.ConvKNRM()
 # Gán các tham số cho model
 model.params['task'] = ranking_task
 model.params['embedding'] = embedding_matrix
+model.params['filters'] = 128 
+model.params['conv_activation_func'] = 'tanh' 
+model.params['max_ngram'] = 3
+model.params['use_crossmatch'] = True 
+model.params['kernel_num'] = 11
+model.params['sigma'] = 0.1
+model.params['exact_sigma'] = 0.001
 
 # Xây dựng kiến trúc model
 model.build()
@@ -120,7 +127,8 @@ print("Tổng số tham số cần huấn luyện:", sum(p.numel() for p in mode
 
 # --- 7. Huấn luyện Model ---
 # Chọn optimizer
-optimizer = torch.optim.Adam(model.parameters())
+optimizer = torch.optim.Adadelta(model.parameters())
+scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=3)
 
 # Thiết lập Trainer
 trainer = mz.trainers.Trainer(
@@ -131,7 +139,9 @@ trainer = mz.trainers.Trainer(
     validate_interval=None,
     epochs=5,
     device=device,
-    save_dir='conv_knrm_model' # Chỉ định thư mục để lưu model
+    save_dir='conv_knrm_model',
+    scheduler=scheduler,
+    clip_norm=10
 )
 
 # Bắt đầu huấn luyện

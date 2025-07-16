@@ -36,7 +36,11 @@ ranking_task.metrics = [
 ]
 
 # --- 3. Tiền xử lý dữ liệu ---
-preprocessor = mz.models.KNRM.get_default_preprocessor()
+preprocessor = mz.preprocessors.BasicPreprocessor(
+    truncated_length_left = 10,
+    truncated_length_right = 40,
+    filter_low_freq = 2
+)
 
 train_pack_processed = preprocessor.fit_transform(train_pack_raw)
 dev_pack_processed = preprocessor.transform(dev_pack_raw)
@@ -70,8 +74,8 @@ trainset = mz.dataloader.Dataset(
     data_pack=train_pack_processed,
     mode='pair',
     num_dup=5,
-    num_neg=1, # KNRM thường dùng 1 neg
-    batch_size=16, 
+    num_neg=1,
+    batch_size=20, 
     resample=True,
     sort=False,
     shuffle=True
@@ -79,7 +83,7 @@ trainset = mz.dataloader.Dataset(
 testset = mz.dataloader.Dataset(
     data_pack=test_pack_processed,
     mode='point', 
-    batch_size=16, 
+    batch_size=20, 
     shuffle=False
 )
 
@@ -108,6 +112,9 @@ model = mz.models.KNRM()
 # Gán các tham số cho model
 model.params['task'] = ranking_task
 model.params['embedding'] = embedding_matrix
+model.params['kernel_num'] = 21
+model.params['sigma'] = 0.1
+model.params['exact_sigma'] = 0.001
 
 # Xây dựng kiến trúc model
 model.build()
@@ -120,7 +127,7 @@ print("Tổng số tham số cần huấn luyện:", sum(p.numel() for p in mode
 
 # --- 7. Huấn luyện Model ---
 # Chọn optimizer
-optimizer = torch.optim.Adam(model.parameters())
+optimizer = torch.optim.Adadelta(model.parameters())
 
 # Thiết lập Trainer
 trainer = mz.trainers.Trainer(

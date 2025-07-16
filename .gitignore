@@ -53,6 +53,7 @@ OpenIE-standalone/
 sbt-1.10.11/
 test_openIE5/
 apache-maven-3.9.10-bin/
+tut/
 # Thư viện bên ngoài
 EmbeddingModel/
 CoreNLP_Lib/
