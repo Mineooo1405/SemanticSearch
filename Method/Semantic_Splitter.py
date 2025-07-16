@@ -414,16 +414,6 @@ def save_raw_oie_data(oie_data: List[Dict], chunk_id: str, output_dir: str, meth
         print(f"Warning: Could not save raw OIE data: {e}")
         return None
 
-def validate_and_adjust_chunks(
-    chunks: List[Tuple[str, str, Optional[str]]],
-    target_tokens: int = 120,
-    tolerance: float = 0.25,
-    silent: bool = True
-) -> List[Tuple[str, str, Optional[str]]]:
-    """Validate and adjust chunks to meet token requirements"""
-    # --- ĐÃ VÔ HIỆU HÓA: Bỏ qua toàn bộ logic kiểm tra min/max token ---
-    return chunks
-
 def merge_small_chunks(buffer: List[Tuple[str, str, Optional[str]]], context_id: str) -> Optional[Tuple[str, str, Optional[str]]]:
     """Merge small chunks in buffer"""
     if not buffer:
@@ -622,19 +612,7 @@ def chunk_passage_text_splitter(
                         print(f"       Error during OIE extraction: {e_oie}")
                     oie_string = None
             
-            chunks_with_oie.append((chunk_id, final_chunk_text, oie_string))
-        
-        # 4. Apply adaptive validation if enabled
-        if enable_adaptive and target_tokens:
-            if not silent:
-                print(f"   Applying adaptive validation...")
-            
-            chunks_with_oie = validate_and_adjust_chunks(
-                chunks_with_oie,
-                target_tokens=target_tokens,
-                tolerance=tolerance,
-                silent=silent
-            )
+            chunks_with_oie.append((chunk_id, final_chunk_text, oie_string))        
         
         # 5. Save raw OIE data if requested
         if save_raw_oie and all_raw_oie_data:

@@ -46,7 +46,7 @@ print("Tiền xử lý dữ liệu hoàn tất.")
 
 # --- 4. Chuẩn bị Embedding Matrix ---
 # Tải GloVe embedding
-glove_embedding = mz.datasets.embeddings.load_glove_embedding(dimension=300)
+glove_embedding = mz.datasets.embeddings.load_glove_embedding(dimension=100)
 # Lấy từ điển từ preprocessor
 term_index = preprocessor.context['vocab_unit'].state['term_index']
 # Xây dựng ma trận embedding cho các từ trong bộ dữ liệu

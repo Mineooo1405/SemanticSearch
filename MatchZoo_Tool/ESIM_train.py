@@ -33,7 +33,7 @@ test_pack_processed = preprocessor.transform(test_pack_raw)
 print("Tiền xử lý dữ liệu hoàn tất.")
 
 # --- 4. Chuẩn bị Embedding Matrix ---
-glove_embedding = mz.datasets.embeddings.load_glove_embedding(dimension=300)
+glove_embedding = mz.datasets.embeddings.load_glove_embedding(dimension=100)
 term_index = preprocessor.context['vocab_unit'].state['term_index']
 embedding_matrix = glove_embedding.build_matrix(term_index)
 l2_norm = np.sqrt((embedding_matrix * embedding_matrix).sum(axis=1))

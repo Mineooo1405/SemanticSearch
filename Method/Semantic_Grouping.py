@@ -795,10 +795,6 @@ def semantic_chunk_passage_from_grouping_logic(
 # Alias for backward compatibility
 semantic_spreading_grouping_with_token_control = semantic_spreading_grouping_optimized
 
-# -------------------------------------------------------------
-# Helper: Lưu raw OIE data (sao chép từ Text_Splitter)
-# -------------------------------------------------------------
-
 def save_raw_oie_data(oie_data: List[Dict], chunk_id: str, output_dir: str, method_name: str = "semantic_grouping") -> Optional[str]:
     """Save raw OIE data to JSON file for analysis"""
     try:
