@@ -4,7 +4,7 @@ import torch
 import os
 import gc
 
-print("--- Bắt đầu huấn luyện model KNRM ---")
+print("--- Bắt đầu huấn luyện model MVLSTM ---")
 
 # --- A. Cấu hình Device ---
 # Cố gắng sử dụng DirectML
@@ -28,7 +28,7 @@ test_pack_raw = mz.load_data_pack(os.path.join(data_pack_dir, 'test_pack.dam'))
 print("Tải DataPacks thành công.")
 
 # --- 2. Thiết lập Task và Metrics ---
-ranking_task = mz.tasks.Ranking() # KNRM dùng loss mặc định
+ranking_task = mz.tasks.Ranking(losses=mz.losses.RankCrossEntropyLoss(num_neg=10))
 ranking_task.metrics = [
     mz.metrics.NormalizedDiscountedCumulativeGain(k=3),
     mz.metrics.NormalizedDiscountedCumulativeGain(k=5),
@@ -36,11 +36,7 @@ ranking_task.metrics = [
 ]
 
 # --- 3. Tiền xử lý dữ liệu ---
-preprocessor = mz.preprocessors.BasicPreprocessor(
-    truncated_length_left = 10,
-    truncated_length_right = 40,
-    filter_low_freq = 2
-)
+preprocessor = mz.models.MVLSTM.get_default_preprocessor()
 
 train_pack_processed = preprocessor.fit_transform(train_pack_raw)
 dev_pack_processed = preprocessor.transform(dev_pack_raw)
@@ -74,8 +70,8 @@ trainset = mz.dataloader.Dataset(
     data_pack=train_pack_processed,
     mode='pair',
     num_dup=5,
-    num_neg=1,
-    batch_size=20, 
+    num_neg=10,
+    batch_size=16, 
     resample=True,
     sort=False,
     shuffle=True
@@ -83,12 +79,12 @@ trainset = mz.dataloader.Dataset(
 testset = mz.dataloader.Dataset(
     data_pack=test_pack_processed,
     mode='point', 
-    batch_size=20, 
+    batch_size=16, 
     shuffle=False
 )
 
 # Lấy callback để padding
-padding_callback = mz.models.KNRM.get_default_padding_callback()
+padding_callback = mz.models.MVLSTM.get_default_padding_callback()
 
 # Tạo DataLoader
 trainloader = mz.dataloader.DataLoader(
@@ -107,14 +103,11 @@ testloader = mz.dataloader.DataLoader(
 print("Tạo DataLoader thành công.")
 
 # --- 6. Xây dựng và cấu hình Model ---
-model = mz.models.KNRM()
+model = mz.models.MVLSTM()
 
 # Gán các tham số cho model
 model.params['task'] = ranking_task
 model.params['embedding'] = embedding_matrix
-model.params['kernel_num'] = 21
-model.params['sigma'] = 0.1
-model.params['exact_sigma'] = 0.001
 
 # Xây dựng kiến trúc model
 model.build()
@@ -138,7 +131,7 @@ trainer = mz.trainers.Trainer(
     validate_interval=None,
     epochs=5,
     device=device,
-    save_dir='knrm_model' # Chỉ định thư mục để lưu model
+    save_dir='Trained_model/mvlstm_model' # Chỉ định thư mục để lưu model
 )
 
 # Bắt đầu huấn luyện
@@ -147,5 +140,5 @@ trainer.run()
 # --- 8. Lưu model và preprocessor ---
 print("Bắt đầu lưu model và preprocessor...")
 trainer.save_model() # Sử dụng trainer để lưu model
-preprocessor.save('knrm_model/preprocessor') # Lưu preprocessor vào cùng thư mục
-print("Đã lưu model và preprocessor vào thư mục 'knrm_model'.")
+preprocessor.save('Trained_model/mvlstm_model/preprocessor') # Lưu preprocessor vào cùng thư mục
+print("Đã lưu model và preprocessor vào thư mục 'mvlstm_model'.")

@@ -4,7 +4,7 @@ import torch
 import os
 import gc
 
-print("--- Bắt đầu huấn luyện model MatchLSTM ---")
+print("--- Bắt đầu huấn luyện model Arc-II ---")
 
 # --- A. Cấu hình Device ---
 device = torch.device("cpu")
@@ -18,7 +18,7 @@ test_pack_raw = mz.load_data_pack(os.path.join(data_pack_dir, 'test_pack.dam'))
 print("Tải DataPacks thành công.")
 
 # --- 2. Thiết lập Task và Metrics ---
-ranking_task = mz.tasks.Ranking(losses=mz.losses.RankCrossEntropyLoss(num_neg=10))
+ranking_task = mz.tasks.Ranking()
 ranking_task.metrics = [
     mz.metrics.NormalizedDiscountedCumulativeGain(k=3),
     mz.metrics.NormalizedDiscountedCumulativeGain(k=5),
@@ -26,7 +26,10 @@ ranking_task.metrics = [
 ]
 
 # --- 3. Tiền xử lý dữ liệu ---
-preprocessor = mz.models.MatchLSTM.get_default_preprocessor()
+preprocessor = mz.models.ArcII.get_default_preprocessor(
+    filter_mode='df',
+    filter_low_freq=2,
+)
 train_pack_processed = preprocessor.fit_transform(train_pack_raw)
 dev_pack_processed = preprocessor.transform(dev_pack_raw)
 test_pack_processed = preprocessor.transform(test_pack_raw)
@@ -48,8 +51,8 @@ print("Đã giải phóng bộ nhớ từ GloVe embedding.")
 trainset = mz.dataloader.Dataset(
     data_pack=train_pack_processed,
     mode='pair',
-    num_dup=5,
-    num_neg=10,
+    num_dup=2,
+    num_neg=1,
     batch_size=20, 
     resample=True,
     sort=False,
@@ -62,7 +65,12 @@ testset = mz.dataloader.Dataset(
     shuffle=False
 )
 
-padding_callback = mz.models.MatchLSTM.get_default_padding_callback()
+padding_callback = mz.models.ArcII.get_default_padding_callback(
+    fixed_length_left=10,
+    fixed_length_right=100,
+    pad_word_value=0,
+    pad_word_mode='pre'
+)
 
 trainloader = mz.dataloader.DataLoader(
     dataset=trainset,
@@ -79,17 +87,24 @@ testloader = mz.dataloader.DataLoader(
 print("Tạo DataLoader thành công.")
 
 # --- 6. Xây dựng và cấu hình Model ---
-model = mz.models.MatchLSTM()
+model = mz.models.ArcII()
 model.params['task'] = ranking_task
-model.params['mask_value'] = 0
 model.params['embedding'] = embedding_matrix
+model.params['left_length'] = 10
+model.params['right_length'] = 100
+model.params['kernel_1d_count'] = 32
+model.params['kernel_1d_size'] = 3
+model.params['kernel_2d_count'] = [64, 64]
+model.params['kernel_2d_size'] = [(3, 3), (3, 3)]
+model.params['pool_2d_size'] = [(3, 3), (3, 3)]
+model.params['dropout_rate'] = 0.3
 model.build()
 model.to(device)
 print(model)
 print("Tổng số tham số cần huấn luyện:", sum(p.numel() for p in model.parameters() if p.requires_grad))
 
 # --- 7. Huấn luyện Model ---
-optimizer = torch.optim.Adadelta(model.parameters())
+optimizer = torch.optim.Adam(model.parameters())
 trainer = mz.trainers.Trainer(
     model=model,
     optimizer=optimizer,
@@ -98,12 +113,12 @@ trainer = mz.trainers.Trainer(
     validate_interval=None,
     epochs=5,
     device=device,
-    save_dir='matchlstm_model'
+    save_dir='Trained_model/arcii_model'
 )
 trainer.run()
 
 # --- 8. Lưu model và preprocessor ---
 print("Bắt đầu lưu model và preprocessor...")
 trainer.save_model()
-preprocessor.save('matchlstm_model/preprocessor')
-print("Đã lưu model và preprocessor vào thư mục 'matchlstm_model'.")
+preprocessor.save('Trained_model/arcii_model/preprocessor')
+print("Đã lưu model và preprocessor vào thư mục 'arcii_model'.")

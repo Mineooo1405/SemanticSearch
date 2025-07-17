@@ -4,7 +4,7 @@ import torch
 import os
 import gc
 
-print("--- Bắt đầu huấn luyện model ESIM ---")
+print("--- Bắt đầu huấn luyện model MatchPyramid ---")
 
 # --- A. Cấu hình Device ---
 device = torch.device("cpu")
@@ -18,7 +18,7 @@ test_pack_raw = mz.load_data_pack(os.path.join(data_pack_dir, 'test_pack.dam'))
 print("Tải DataPacks thành công.")
 
 # --- 2. Thiết lập Task và Metrics ---
-ranking_task = mz.tasks.Ranking(losses=mz.losses.RankCrossEntropyLoss(num_neg=10))
+ranking_task = mz.tasks.Ranking()
 ranking_task.metrics = [
     mz.metrics.NormalizedDiscountedCumulativeGain(k=3),
     mz.metrics.NormalizedDiscountedCumulativeGain(k=5),
@@ -26,7 +26,7 @@ ranking_task.metrics = [
 ]
 
 # --- 3. Tiền xử lý dữ liệu ---
-preprocessor = mz.models.ESIM.get_default_preprocessor()
+preprocessor = mz.models.MatchPyramid.get_default_preprocessor()
 train_pack_processed = preprocessor.fit_transform(train_pack_raw)
 dev_pack_processed = preprocessor.transform(dev_pack_raw)
 test_pack_processed = preprocessor.transform(test_pack_raw)
@@ -49,8 +49,8 @@ trainset = mz.dataloader.Dataset(
     data_pack=train_pack_processed,
     mode='pair',
     num_dup=5,
-    num_neg=10,
-    batch_size=20, 
+    num_neg=1,
+    batch_size=16, 
     resample=True,
     sort=False,
     shuffle=True
@@ -58,11 +58,11 @@ trainset = mz.dataloader.Dataset(
 testset = mz.dataloader.Dataset(
     data_pack=test_pack_processed,
     mode='point', 
-    batch_size=20, 
+    batch_size=16, 
     shuffle=False
 )
 
-padding_callback = mz.models.ESIM.get_default_padding_callback()
+padding_callback = mz.models.MatchPyramid.get_default_padding_callback()
 
 trainloader = mz.dataloader.DataLoader(
     dataset=trainset,
@@ -79,20 +79,16 @@ testloader = mz.dataloader.DataLoader(
 print("Tạo DataLoader thành công.")
 
 # --- 6. Xây dựng và cấu hình Model ---
-model = mz.models.ESIM()
+model = mz.models.MatchPyramid()
 model.params['task'] = ranking_task
 model.params['embedding'] = embedding_matrix
-model.params['mask_value'] = 0
-model.params['dropout'] = 0.2
-model.params['hidden_size'] = 200
-model.params['lstm_layer'] = 1
 model.build()
 model.to(device)
 print(model)
 print("Tổng số tham số cần huấn luyện:", sum(p.numel() for p in model.parameters() if p.requires_grad))
 
 # --- 7. Huấn luyện Model ---
-optimizer = torch.optim.Adadelta(model.parameters())
+optimizer = torch.optim.Adam(model.parameters())
 trainer = mz.trainers.Trainer(
     model=model,
     optimizer=optimizer,
@@ -101,12 +97,12 @@ trainer = mz.trainers.Trainer(
     validate_interval=None,
     epochs=5,
     device=device,
-    save_dir='esim_model'
+    save_dir='Trained_model/match_pyramid_model'
 )
 trainer.run()
 
 # --- 8. Lưu model và preprocessor ---
 print("Bắt đầu lưu model và preprocessor...")
 trainer.save_model()
-preprocessor.save('esim_model/preprocessor')
-print("Đã lưu model và preprocessor vào thư mục 'esim_model'.")
+preprocessor.save('Trained_model/match_pyramid_model/preprocessor')
+print("Đã lưu model và preprocessor vào thư mục 'match_pyramid_model'.")

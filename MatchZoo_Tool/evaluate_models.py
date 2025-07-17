@@ -273,7 +273,7 @@ class ModelEvaluator:
         
         for config in model_configs:
             name = config['name']
-            path ="F:/SematicSearch/trained_models/" + config['path']
+            path ="F:/SematicSearch/Trained_model/" + config['path']
             
             if os.path.exists(path):
                 result = self.evaluate_model(path, name)
