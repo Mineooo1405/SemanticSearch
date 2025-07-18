@@ -15,7 +15,7 @@ import os
 from pathlib import Path
 from typing import Optional
 
-# 👉 Tăng giới hạn kích thước trường để xử lý các passage rất dài
+# Tăng giới hạn kích thước trường để xử lý các passage rất dài
 csv.field_size_limit(min(sys.maxsize, 2147483647))
 
 def convert_tsv_format(input_file: str, output_file: Optional[str] = None) -> str:
@@ -44,9 +44,9 @@ def convert_tsv_format(input_file: str, output_file: Optional[str] = None) -> st
         input_path = Path(input_file)
         output_file = str(input_path.parent / f"{input_path.stem}_3col{input_path.suffix}")
     
-    print(f"🔄 Converting TSV format...")
-    print(f"📂 Input:  {input_file}")
-    print(f"📁 Output: {output_file}")
+    print(f"Converting TSV format...")
+    print(f"Input:  {input_file}")
+    print(f"Output: {output_file}")
     
     rows_processed = 0
     rows_written = 0
@@ -70,12 +70,12 @@ def convert_tsv_format(input_file: str, output_file: Optional[str] = None) -> st
                 else:
                     raise ValueError(f"Unsupported column count ({len(header)}) in header: {header}")
                 
-                print(f"📋 Input header ({len(header)} columns): {header}")
+                print(f"Input header ({len(header)} columns): {header}")
                 
                 # Write new header
                 new_header = ['query', 'passage', 'label']
                 writer.writerow(new_header)
-                print(f"📝 Output header ({len(new_header)} columns): {new_header}")
+                print(f"Output header ({len(new_header)} columns): {new_header}")
                 
             except StopIteration:
                 raise ValueError("Input file is empty or has no header")
@@ -88,7 +88,7 @@ def convert_tsv_format(input_file: str, output_file: Optional[str] = None) -> st
                     required_cols = 8 if input_format == '8col' else 6
 
                     if len(row) < required_cols:
-                        print(f"⚠️  Skipping row {row_idx}: insufficient columns ({len(row)}/{required_cols})")
+                        print(f"Skipping row {row_idx}: insufficient columns ({len(row)}/{required_cols})")
                         continue
 
                     if input_format == '6col':
@@ -111,15 +111,15 @@ def convert_tsv_format(input_file: str, output_file: Optional[str] = None) -> st
                     
                     # Validate data
                     if not query:
-                        print(f"⚠️  Skipping row {row_idx}: empty query")
+                        print(f"Skipping row {row_idx}: empty query")
                         continue
                     
                     if not passage:
-                        print(f"⚠️  Skipping row {row_idx}: empty passage")
+                        print(f"Skipping row {row_idx}: empty passage")
                         continue
                     
                     if not label:
-                        print(f"⚠️  Skipping row {row_idx}: empty label")
+                        print(f"Skipping row {row_idx}: empty label")
                         continue
                     
                     # Write converted row
@@ -128,31 +128,31 @@ def convert_tsv_format(input_file: str, output_file: Optional[str] = None) -> st
                     
                     # Progress indicator
                     if rows_processed % 100 == 0:
-                        print(f"📊 Processed {rows_processed} rows, written {rows_written} rows...")
+                        print(f"Processed {rows_processed} rows, written {rows_written} rows...")
                 
                 except Exception as e:
-                    print(f"❌ Error processing row {row_idx}: {e}")
+                    print(f"Error processing row {row_idx}: {e}")
                     continue
     
     except Exception as e:
-        print(f"❌ Error during conversion: {e}")
+        print(f"Error during conversion: {e}")
         raise
     
-    print(f"\n✅ Conversion completed!")
-    print(f"📊 Rows processed: {rows_processed}")
-    print(f"📝 Rows written: {rows_written}")
-    print(f"📁 Output file: {output_file}")
+    print(f"\nConversion completed!")
+    print(f"Rows processed: {rows_processed}")
+    print(f"Rows written: {rows_written}")
+    print(f"Output file: {output_file}")
     
     # Show file size
     if os.path.exists(output_file):
         file_size = os.path.getsize(output_file)
-        print(f"📦 File size: {file_size:,} bytes")
+        print(f"File size: {file_size:,} bytes")
     
     return output_file
 
 def preview_file(file_path: str, num_rows: int = 3):
     """Preview first few rows of the file"""
-    print(f"\n🔍 Preview of {os.path.basename(file_path)} (first {num_rows} rows):")
+    print(f"\nPreview of {os.path.basename(file_path)} (first {num_rows} rows):")
     print("=" * 80)
     
     try:
@@ -173,11 +173,11 @@ def preview_file(file_path: str, num_rows: int = 3):
                     print()
     
     except Exception as e:
-        print(f"❌ Error previewing file: {e}")
+        print(f"Error previewing file: {e}")
 
 def main():
     """Main interactive function"""
-    print("🔄 TSV FORMAT CONVERTER")
+    print("TSV FORMAT CONVERTER")
     print("=" * 50)
     print("Converts 6-column TSV to 3-column TSV for chunking")
     print("Input:  number | title | Description | Narrative | Label | Data")
@@ -188,10 +188,10 @@ def main():
     if len(sys.argv) > 1:
         input_file = sys.argv[1]
     else:
-        input_file = input("📂 Enter path to input TSV file: ").strip()
+        input_file = input("Enter path to input TSV file: ").strip()
     
     if not input_file:
-        print("❌ No input file specified!")
+        print("No input file specified!")
         return
     
     # Get output file
@@ -199,24 +199,24 @@ def main():
     if len(sys.argv) > 2:
         output_file = sys.argv[2]
     else:
-        output_choice = input("\n📁 Specify output file? (y/n, default=auto): ").lower()
+        output_choice = input("\nSpecify output file? (y/n, default=auto): ").lower()
         if output_choice == 'y':
-            output_file = input("📁 Enter output file path: ").strip()
+            output_file = input("Enter output file path: ").strip()
     
     try:
         # Convert file
         result_file = convert_tsv_format(input_file, output_file)
         
         # Ask for preview
-        preview_choice = input(f"\n🔍 Preview output file? (y/n, default=y): ").lower()
+        preview_choice = input(f"\nPreview output file? (y/n, default=y): ").lower()
         if preview_choice != 'n':
             preview_file(result_file)
         
-        print(f"\n🎉 SUCCESS! 3-column TSV ready for chunking:")
-        print(f"📁 {result_file}")
+        print(f"\nSUCCESS! 3-column TSV ready for chunking:")
+        print(f"{result_file}")
         
     except Exception as e:
-        print(f"\n❌ FAILED: {e}")
+        print(f"\nFAILED: {e}")
         return
 
 if __name__ == "__main__":

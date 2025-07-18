@@ -523,7 +523,7 @@ def semantic_chunk_passage_from_grouping_logic(
     min_chunk_len_tokens = 0
 
     if not silent:
-        print(f"🔄 Processing passage {doc_id} with Enhanced Semantic Grouping")
+        print(f"    Processing passage {doc_id} with Enhanced Semantic Grouping")
         print(f"   Model: {embedding_model}")
         print(f"   Token range: {min_chunk_len_tokens}-{max_chunk_len_tokens}")
         print(f"   OIE enabled: {include_oie}")
@@ -538,7 +538,7 @@ def semantic_chunk_passage_from_grouping_logic(
         oie_string = None
         final_text = passage_text
         if include_oie:
-            print(f"🔧 DEBUG: OIE enabled for semantic_grouping")
+            print(f"    DEBUG: OIE enabled for semantic_grouping")
             oie_string = extract_oie_for_chunk(passage_text, silent=silent)
             if oie_string:
                 final_text = f"{passage_text} {oie_string}"
@@ -785,8 +785,8 @@ def semantic_chunk_passage_from_grouping_logic(
     if not silent:
         token_counts = [count_tokens_accurate(chunk[1]) for chunk in final_chunks]
         if token_counts:
-            print(f"   ✅ Created {len(final_chunks)} final chunks after force-splitting.")
-            print(f"   📊 Final token distribution: {min(token_counts)}-{max(token_counts)} (avg: {sum(token_counts)/len(token_counts):.1f})")
+            print(f"  Created {len(final_chunks)} final chunks after force-splitting.")
+            print(f"  Final token distribution: {min(token_counts)}-{max(token_counts)} (avg: {sum(token_counts)/len(token_counts):.1f})")
         else:
             print("   No chunks were created after processing.")
 

@@ -495,7 +495,7 @@ def chunk_passage_text_splitter(
     """
     
     if not silent:
-        print(f"🔄 Processing passage {doc_id} with Enhanced Text Splitter")
+        print(f"    Processing passage {doc_id} with Enhanced Text Splitter")
         print(f"   Chunk size: {chunk_size} chars, Overlap: {chunk_overlap} chars")
         print(f"   Target tokens: {target_tokens} ±{tolerance*100:.0f}%")
         print(f"   OIE enabled: {include_oie}")
@@ -619,7 +619,7 @@ def chunk_passage_text_splitter(
             try:
                 raw_oie_filepath = save_raw_oie_data(all_raw_oie_data, doc_id, output_dir, "text_splitter")
                 if raw_oie_filepath and not silent:
-                    print(f"📄 Raw OIE data saved to: {raw_oie_filepath}")
+                    print(f" Raw OIE data saved to: {raw_oie_filepath}")
                     total_relations = sum(entry['relation_count'] for entry in all_raw_oie_data)
                     print(f"   Total chunks with OIE: {len(all_raw_oie_data)}")
                     print(f"   Total relations extracted: {total_relations}")
@@ -644,15 +644,15 @@ def chunk_passage_text_splitter(
         # Log final statistics
         if not silent:
             token_counts = [count_tokens_accurate(chunk[1]) for chunk in chunks_with_oie]
-            print(f"   ✅ Created {len(chunks_with_oie)} chunks")
-            print(f"   📊 Token distribution: {min(token_counts)}-{max(token_counts)} (avg: {sum(token_counts)/len(token_counts):.1f})")
+            print(f"   Created {len(chunks_with_oie)} chunks")
+            print(f"   Token distribution: {min(token_counts)}-{max(token_counts)} (avg: {sum(token_counts)/len(token_counts):.1f})")
             
             if enable_adaptive and target_tokens:
                 min_target = int(target_tokens * (1 - tolerance))
                 max_target = int(target_tokens * (1 + tolerance))
                 in_range = sum(1 for t in token_counts if min_target <= t <= max_target)
                 compliance = in_range / len(token_counts) * 100
-                print(f"   🎯 Target compliance: {in_range}/{len(token_counts)} ({compliance:.1f}%)")
+                print(f"   Target compliance: {in_range}/{len(token_counts)} ({compliance:.1f}%)")
         
         return chunks_with_oie
 

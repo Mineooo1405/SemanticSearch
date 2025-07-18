@@ -33,51 +33,44 @@ from Method.Semantic_Grouping import semantic_chunk_passage_from_grouping_logic
 from Method.Semantic_Splitter import chunk_passage_text_splitter
 from Method.Text_Splitter import chunk_passage_text_splitter
 
-# Attempt to import OIE and Sentence Embedding tools
 try:
     from Tool.OIE import extract_relations_from_paragraph
     OIE_AVAILABLE_GLOBALLY = True
-    print("[DEBUG] OIE tool imported successfully")
-except (ImportError, Exception) as e:
-    print(f"[DEBUG] OIE import failed: {e}")
+except (ImportError, Exception):
     extract_relations_from_paragraph = None
     OIE_AVAILABLE_GLOBALLY = False
 
 try:
-    from Tool.Sentence_Embedding import sentence_embedding  # noqa: F401  # type: ignore
+    from Tool.Sentence_Embedding import sentence_embedding
 except ImportError:
-    # Define a placeholder if it fails
     def sentence_embedding(*args, **kwargs):
         raise ImportError("Sentence_Embedding tool is not available and is required for semantic chunking.")
 
-# Set CSV field size limit
 try:
     csv.field_size_limit(sys.maxsize)
 except OverflowError:
     csv.field_size_limit(int(2**30))
 
-# --- Configuration for the controller ---
 PYTHON_EXECUTABLE = sys.executable
-PROCESSING_BATCH_SIZE = 1000  # Process 1000 rows at a time to manage memory
+PROCESSING_BATCH_SIZE = 1000
 
-# Default parameters that will be used for all runs
+# Default parameters
 COMMON_DEFAULTS = {
     "base_output_dir": "./training_datasets",
     "embedding_model": "thenlper/gte-large",
-    "device_preference": ""  # Empty for auto-detection
+    "device_preference": ""
 }
 
-# ⬆️ NEW: Adaptive chunking configuration with tolerance
 ADAPTIVE_CHUNKING_CONFIG = {
-    "target_tokens": 120,           # Target chunk size
-    "tolerance": 0.25,              # 25% tolerance (90-150 tokens)
-    "min_tokens": 90,               # Minimum acceptable tokens (derived from target and tolerance)
-    "max_tokens": 150,              # Maximum acceptable tokens (derived from target and tolerance)
-    "strict_max": 200,              # Absolute maximum before forced split
-    "merge_threshold": 80,          # Merge chunks smaller than this
-    "enable_adaptive": False,       # Disable adaptive validation/merging to keep original chunks
-    "preserve_sentences": True,     # Try to preserve sentence boundaries
-    "max_iterations": 3             # Maximum adaptive iterations
+    "target_tokens": 120,
+    "tolerance": 0.25,
+    "min_tokens": 90,
+    "max_tokens": 150,
+    "strict_max": 200,
+    "merge_threshold": 80,
+    "enable_adaptive": False,
+    "preserve_sentences": True,
+    "max_iterations": 3
 }
 
 # Optimized parameters
@@ -90,7 +83,6 @@ SEMANTIC_GROUPING_DEFAULTS = {
     "embedding_batch_size": 16,
     "min_chunk_len_tokens": ADAPTIVE_CHUNKING_CONFIG["min_tokens"],
     "max_chunk_len_tokens": ADAPTIVE_CHUNKING_CONFIG["max_tokens"],
-    "oie_max_triples_per_chunk": 5,
     "oie_token_budget": 40
 }
 
@@ -118,125 +110,98 @@ TEXT_SPLITTER_DEFAULTS = {
 }
 
 
-# Define the sequence of runs - 6 configurations for 6 datasets
+# Define the sequence of runs - 6 configurations
 RUN_CONFIGURATIONS = [
     {
         "name": "text_splitter_without_OIE",
         "method_choice": "3", 
         "include_oie": False, 
         "params": TEXT_SPLITTER_DEFAULTS,
-        "description": "Adaptive rule-based chunking optimized for 90-150 tokens (without OIE)"
-    },    {
+        "description": "Rule-based chunking (90-150 tokens, without OIE)"
+    },
+    {
         "name": "text_splitter_with_OIE",
         "method_choice": "3", 
         "include_oie": True,
         "save_raw_oie": True,
         "params": TEXT_SPLITTER_DEFAULTS,
-        "description": "Adaptive rule-based chunking with OIE enhancement (90-150 tokens)"
+        "description": "Rule-based chunking with OIE (90-150 tokens)"
     },
     {
         "name": "semantic_grouping_without_OIE",
         "method_choice": "1", 
         "include_oie": False, 
         "params": SEMANTIC_GROUPING_DEFAULTS,
-        "description": "Adaptive semantic clustering without order constraint (90-150 tokens, without OIE)"
-    },    {
+        "description": "Semantic clustering (90-150 tokens, without OIE)"
+    },
+    {
         "name": "semantic_grouping_with_OIE",
         "method_choice": "1", 
         "include_oie": True,
         "save_raw_oie": True,
         "params": SEMANTIC_GROUPING_DEFAULTS,
-        "description": "Adaptive semantic clustering with OIE enhancement (90-150 tokens)"
+        "description": "Semantic clustering with OIE (90-150 tokens)"
     },
     {
         "name": "semantic_splitter_without_OIE",
         "method_choice": "2", 
         "include_oie": False, 
         "params": SEMANTIC_SPLITTER_DEFAULTS,
-        "description": "Adaptive sequential semantic chunking with order preservation (90-150 tokens, without OIE)"
-    },    {
+        "description": "Sequential semantic chunking (90-150 tokens, without OIE)"
+    },
+    {
         "name": "semantic_splitter_with_OIE",
         "method_choice": "2", 
         "include_oie": True,
         "save_raw_oie": True,
         "params": SEMANTIC_SPLITTER_DEFAULTS,
-        "description": "Adaptive sequential semantic chunking with OIE enhancement (90-150 tokens)"
+        "description": "Sequential semantic chunking with OIE (90-150 tokens)"
     }
 ]
 
 class DatasetController:
-    """Controller for generating adaptive training datasets using integrated chunking logic.
-    
-    Attributes
-    ----------
-    auto_start_oie : bool
-        Nếu True (mặc định) controller sẽ tự động khởi động server OpenIE5 khi phát hiện khả dụng.
-        Đặt False để trì hoãn việc khởi động – giúp thực hiện giai đoạn *without_OIE* trước khi bật server.
-    """
+    """Controller for generating training datasets using integrated chunking logic."""
 
     def __init__(self, input_tsv_path: str, output_base_dir: str = "training_datasets", *, auto_start_oie: bool = True):
         self.input_tsv_path = input_tsv_path
         self.output_base_dir = Path(output_base_dir)
         self.output_base_dir.mkdir(exist_ok=True)
-        self._auto_start_oie = auto_start_oie  # lưu lại tuỳ chọn
+        self._auto_start_oie = auto_start_oie
         
-        # Setup logging - FIX Unicode issues
         self.timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-        log_file = self.output_base_dir / f"adaptive_controller_run_{self.timestamp}.log"
+        log_file = self.output_base_dir / f"controller_run_{self.timestamp}.log"
         
-        # Configure logging for Windows compatibility
-        import sys
-        
-        # Create formatters
         file_formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
         console_formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
         
-        # File handler (supports UTF-8)
         file_handler = logging.FileHandler(log_file, encoding='utf-8')
         file_handler.setFormatter(file_formatter)
         
-        # Console handler (ASCII only to avoid emoji issues)
         console_handler = logging.StreamHandler(sys.stdout)
         console_handler.setFormatter(console_formatter)
         
-        # Setup logger
         self.logger = logging.getLogger(__name__)
-        # Chỉ hiển thị WARNING trở lên để tránh spam log
         self.logger.setLevel(logging.WARNING)
         self.logger.addHandler(file_handler)
         self.logger.addHandler(console_handler)
         
-        # Target models that work best with 90-150 tokens (adaptive range)
         self.target_models = ["knrm", "drmm", "anmm", "dssm", "cdssm", "conv_knrm"]
         
-        self._log_safe('info', f"Adaptive Controller initialized for dataset: {input_tsv_path}")
-        self._log_safe('info', f"Target models: {', '.join(self.target_models)}")
-        self._log_safe('info', f"Adaptive chunk range: {ADAPTIVE_CHUNKING_CONFIG['min_tokens']}-{ADAPTIVE_CHUNKING_CONFIG['max_tokens']} tokens")
-        self._log_safe('info', f"Target: {ADAPTIVE_CHUNKING_CONFIG['target_tokens']} tokens ±{ADAPTIVE_CHUNKING_CONFIG['tolerance']*100:.0f}%")
-        
-        # Validate OIE availability
         self.oie_available = OIE_AVAILABLE_GLOBALLY
         if not self.oie_available:
-            self._log_safe('warning', "OIE tool is not available. Configurations set to use OIE will run without it.")
-        else:
-            self._log_safe('info', "OIE tool appears to be available.")
-
-        # Thử khởi động server nếu chưa chạy (tuỳ theo auto_start_oie)
+            self._log_safe('warning', "OIE tool is not available.")
+        
         if self.oie_available and self._auto_start_oie:
             try:
                 from Tool.OIE import _is_port_open
                 if not _is_port_open(9000):
-                    self._log_safe('warning', "Đang khởi chạy server OpenIE5 (cổng 9000)...")
-                    # Gọi OIE để kích hoạt cơ chế auto-start
-                    if extract_relations_from_paragraph is not None:  # type: ignore
-                        extract_relations_from_paragraph("Ping", port=9000, silent=True)  # type: ignore[arg-type]
-                if _is_port_open(9000):
-                    self._log_safe('warning', "Đã khởi chạy server OpenIE5 (cổng 9000).")
+                    if extract_relations_from_paragraph is not None:
+                        extract_relations_from_paragraph("Ping", port=9000, silent=True)
             except Exception:
                 pass
 
     def _log_safe(self, level: str, message: str):
-        """Helper to log messages without emoji processing"""
+        """Helper to log messages"""
         getattr(self.logger, level.lower(), self.logger.info)(message)
     
     def validate_input_file(self) -> bool:
@@ -250,25 +215,19 @@ class DatasetController:
                 reader = csv.reader(f, delimiter='\t')
                 header = next(reader, None)
                 if not header or len(header) < 3:
-                    self._log_safe('error', f"Invalid TSV format. Expected at least 3 columns (query, passage, label), got: {header}")
+                    self._log_safe('error', f"Invalid TSV format. Expected at least 3 columns, got: {header}")
                     return False
-            self._log_safe('info', f"Input TSV file validated successfully with header: {header}")
             return True
-            
         except Exception as e:
             self._log_safe('error', f"Error validating input file: {e}")
             return False
     
     def _execute_chunking_logic(self, df: pd.DataFrame, config: dict) -> List[List[Any]]:
-        """
-        Integrated chunking logic, replacing interactive_chunker.py.
-        Takes a DataFrame (batch) and a configuration, returns chunked rows.
-        """
+        """Execute chunking logic on DataFrame batch"""
         output_rows = []
         method_choice = config["method_choice"]
-        method_params = config["params"].copy() # Use a copy
+        method_params = config["params"].copy()
 
-        # Determine if OIE should be used for this run
         use_oie = config.get("include_oie", False) and self.oie_available
         method_params['include_oie'] = use_oie
         method_params['save_raw_oie'] = use_oie and config.get("save_raw_oie", False)
@@ -281,7 +240,6 @@ class DatasetController:
         chunking_function = chunking_function_map.get(method_choice)
 
         if not chunking_function:
-            self._log_safe('warning', f"No valid chunking function for method_choice '{method_choice}'. Skipping.")
             return []
 
         for row_idx, row_data in df.iterrows():
@@ -291,49 +249,62 @@ class DatasetController:
                 passage_id = f"P{row_idx}"
 
                 if not isinstance(passage_text, str) or not passage_text.strip():
-                    self.logger.warning(f"Skipping row {row_idx} due to empty passage text.")
                     continue
 
-                # Prepare parameters for the chunking function
                 common_params = {
                     'passage_text': passage_text,
                     'doc_id': f"{query_id}_{passage_id}",
+                    'embedding_model': COMMON_DEFAULTS["embedding_model"],
                     'output_dir': str(self.output_base_dir / config["name"]),
                     'silent': True,
                     **method_params
                 }
-                if method_choice in ["1", "2"]: # Semantic methods
-                    common_params['embedding_model'] = COMMON_DEFAULTS["embedding_model"]
-                    common_params['device'] = COMMON_DEFAULTS["device_preference"]
 
-                # Call the selected chunking function
-                chunked_tuples: List[Tuple[str, str, Optional[str]]] = chunking_function(**common_params)
-
-                if not chunked_tuples:
-                    self.logger.warning(f"No chunks generated for row {row_idx}. Original passage: {passage_text[:100]}...")
-                    continue
+                # Call the chunking function
+                chunk_result = chunking_function(**common_params)
                 
-                # Format output rows
-                for gen_chunk_id, chunk_text, oie_string in chunked_tuples:
+                if chunk_result and len(chunk_result) > 0:
+                    for chunk_id, chunk_text, oie_string in chunk_result:
+                        # Integrate OIE data into chunk text if available
+                        if use_oie and oie_string:
+                            chunk_text_with_oie = f"{chunk_text}\n\nOIE Relations: {oie_string}"
+                        else:
+                            chunk_text_with_oie = chunk_text
+                        
+                        output_rows.append([
+                            query_id,
+                            query_text,
+                            chunk_id,
+                            chunk_text_with_oie,
+                            passage_id,
+                            label,
+                            oie_string or ""
+                        ])
+                else:
+                    # Fallback if no chunks generated
                     output_rows.append([
-                        query_id, query_text, passage_id, passage_text, label,
-                        gen_chunk_id, chunk_text, oie_string if oie_string else ""
+                        query_id,
+                        query_text,
+                        f"{query_id}_chunk_0",
+                        passage_text,
+                        passage_id,
+                        label,
+                        ""
                     ])
+
             except Exception as e:
-                self.logger.error(f"Error processing row {row_idx} in config '{config['name']}': {e}", exc_info=False)
+                self._log_safe('error', f"Error processing row {row_idx}: {e}")
+                continue
         
         return output_rows
 
     def _run_single_config(self, config: dict) -> Tuple[bool, str, Optional[float]]:
         """Runs a single data creation configuration, processing in batches."""
         task_name = config["name"]
-        self._log_safe('info', f"Starting task: {task_name} | {config['description']}")
         
         config_output_dir = self.output_base_dir / task_name
         config_output_dir.mkdir(exist_ok=True)
         final_output_file = config_output_dir / f"output_chunks_final_{self.timestamp}.tsv"
-        
-        self._log_safe('info', f"Processing in batches of {PROCESSING_BATCH_SIZE}. Final output: {final_output_file}")
         
         is_first_batch = True
         batch_success = True
@@ -342,36 +313,28 @@ class DatasetController:
         try:
             with pd.read_csv(self.input_tsv_path, sep='\t', engine='python', chunksize=PROCESSING_BATCH_SIZE, header=0, on_bad_lines='warn') as reader:
                 for i, batch_df in enumerate(reader, 1):
-                    self._log_safe('info', f"--- Processing Batch {i} for {task_name} ---")
-                    
                     chunked_rows = self._execute_chunking_logic(batch_df, config)
                     total_chunks += len(chunked_rows)
 
-                    # Write to file
                     write_mode = 'w' if is_first_batch else 'a'
                     with open(final_output_file, write_mode, encoding='utf-8', newline='') as f:
                         writer = csv.writer(f, delimiter='\t')
                         if is_first_batch:
-                            writer.writerow(['query_id', 'query_text', 'passage_id', 'original_passage', 'label', 'chunk_id', 'chunk_text', 'raw_oie_data'])
+                            writer.writerow(['query_id', 'query_text', 'chunk_id', 'chunk_text', 'passage_id', 'label', 'raw_oie_data'])
                             is_first_batch = False
                         if chunked_rows:
                             writer.writerows(chunked_rows)
-            
-            self._log_safe('info', f"Total chunks generated for {task_name}: {total_chunks}")
 
         except Exception as e:
-            self._log_safe('error', f"A critical error occurred during batch processing for {task_name}: {e}")
+            self._log_safe('error', f"Error during batch processing for {task_name}: {e}")
             batch_success = False
 
         if not batch_success or not os.path.exists(final_output_file):
             return False, "", None
 
-        # Bỏ các bước phân tích / thống kê để giảm log và tăng tốc
         final_compliance = None
 
-        # --- NEW: Rank chunks and keep top/bottom quartile ---
         try:
-            # Lấy ngưỡng phân vị từ biến môi trường nếu có
             try:
                 up_perc = int(os.getenv("UPPER_PERCENTILE", "80"))
                 low_perc = int(os.getenv("LOWER_PERCENTILE", "20"))
@@ -380,8 +343,6 @@ class DatasetController:
 
             ranked_filtered_path = self._rank_and_filter_chunks(str(final_output_file), config_output_dir,
                                                                upper_percentile=up_perc, lower_percentile=low_perc)
-            if ranked_filtered_path:
-                self._log_safe('warning', f"Ranked & filtered results saved to: {ranked_filtered_path}")
         except Exception as e:
             self._log_safe('error', f"Ranking/filtering failed for {task_name}: {e}")
         
@@ -522,12 +483,6 @@ class DatasetController:
         except Exception as e:
             self.logger.warning(f"Error analyzing chunk distribution for {task_name}: {e}")
 
-    def _count_tokens(self, text: str) -> int:
-        """Simple token counting for analysis"""
-        if not isinstance(text, str):
-            return 0
-        return len(re.findall(r'\b\w+\b|[^\w\s]', text))
-
     def _create_summary(self, results: List[dict], successful_tasks: int) -> Dict[str, Any]:
         """Create summary of all tasks"""
         return {
@@ -535,7 +490,6 @@ class DatasetController:
             "input_tsv_file": str(self.input_tsv_path),
             "output_base_directory": str(self.output_base_dir),
             "target_models": self.target_models,
-            "adaptive_chunking_config": ADAPTIVE_CHUNKING_CONFIG,
             "total_configurations": len(RUN_CONFIGURATIONS),
             "successful_tasks": successful_tasks,
             "failed_tasks": len(RUN_CONFIGURATIONS) - successful_tasks,
@@ -548,17 +502,14 @@ class DatasetController:
         try:
             with open(results_file, 'w', encoding='utf-8') as f:
                 json.dump(summary, f, indent=2, ensure_ascii=False)
-            self.logger.info(f"Detailed results saved to: {results_file}")
         except Exception as e:
             self.logger.error(f"Failed to save results file: {e}")
         
         self._print_final_summary(summary)
 
-        # Tắt server OpenIE sau khi hoàn tất
         try:
             from Tool.OIE import terminate_openie_processes
             terminate_openie_processes(port=9000, silent=True)
-            self._log_safe('warning', "Đã tắt server OpenIE5 (cổng 9000).")
         except Exception:
             pass
 
@@ -687,57 +638,45 @@ class DatasetController:
 
     def _print_final_summary(self, summary: Dict[str, Any]) -> None:
         """Print final summary to console"""
-        self.logger.info("\n" + "="*80)
-        self.logger.info("ADAPTIVE DATASET CREATION SUMMARY")
+        self.logger.info("="*80)
+        self.logger.info("DATASET CREATION SUMMARY")
         self.logger.info("="*80)
         
         for result in summary["task_results"]:
-            status = "SUCCESS" if result.get("success") else "FAILED"
-            compliance_str = ""
-            if result.get("success"):
-                compliance = result.get("final_compliance_rate")
-                compliance_str = f"| Compliance: {compliance:.1f}%" if compliance is not None else ""
-            self.logger.info(f"{status} - {result.get('config_name', 'Unknown Task')} {compliance_str}")
+            status = "✓" if result.get("success") else "✗"
+            compliance = result.get("final_compliance_rate")
+            compliance_str = f" | {compliance:.1f}%" if compliance is not None else ""
+            self.logger.info(f"{status} {result.get('config_name', 'Unknown')}{compliance_str}")
         
         self.logger.info("-" * 80)
-        successful_tasks = summary.get("successful_tasks", 0)
-        total_tasks = summary.get("total_configurations", len(summary.get("task_results", [])))
-        success_rate = (successful_tasks / total_tasks * 100) if total_tasks > 0 else 0
-        self.logger.info(f"Total configurations run: {total_tasks}")
-        self.logger.info(f"Success rate: {success_rate:.1f}% ({successful_tasks}/{total_tasks})")
+        successful = summary.get("successful_tasks", 0)
+        total = summary.get("total_configurations", len(summary.get("task_results", [])))
+        success_rate = (successful / total * 100) if total > 0 else 0
+        self.logger.info(f"Success rate: {success_rate:.1f}% ({successful}/{total})")
         
-        if successful_tasks > 0:
-            self.logger.info(f"\nAll outputs saved to: {summary['output_base_directory']}")
+        if successful > 0:
+            self.logger.info(f"Output: {summary['output_base_directory']}")
             self.logger.info("="*80)
 
     # ============================================================
     # New helper: Augment existing TSV bằng OIE song song
     # ============================================================
     def augment_with_oie(self, source_tsv: str, threads: int = 8, chunk_rows: int = 1000) -> str:
-        """Bổ sung trường raw_oie_data vào file TSV đã sinh từ bước *without_OIE*.
-
-        Args:
-            source_tsv:  Đường dẫn tới file TSV gốc.
-            threads:     Số luồng song song gửi request tới server OpenIE5.
-
-        Returns:
-            Đường dẫn tới file TSV mới ("*_with_OIE.tsv"). Chuỗi rỗng nếu lỗi.
-        """
+        """Augment TSV file with OIE data"""
         try:
             if not self.oie_available:
-                self._log_safe('error', 'OIE tool không khả dụng.')
+                self._log_safe('error', 'OIE tool not available')
                 return ""
 
             import pandas as _pd
             from concurrent.futures import ThreadPoolExecutor, as_completed
             from pathlib import Path as _Path
-            from Method.Text_Splitter import format_oie_triples_to_string  # dùng hàm format chung
+            from Method.Text_Splitter import format_oie_triples_to_string
 
             if not os.path.exists(source_tsv):
-                self._log_safe('error', f'Không tìm thấy file để augment: {source_tsv}')
+                self._log_safe('error', f'Source file not found: {source_tsv}')
                 return ""
 
-            # Xác định thư mục đích dựa vào cấu hình gốc (sibling _with_OIE)
             src_path_obj = _Path(source_tsv)
             orig_dir = src_path_obj.parent
             if orig_dir.name.endswith("_without_OIE"):
@@ -747,35 +686,24 @@ class DatasetController:
             target_dir.mkdir(exist_ok=True)
 
             out_path = target_dir / f"{src_path_obj.stem}_with_OIE.tsv"
-
             reader_iter = _pd.read_csv(source_tsv, sep='\t', on_bad_lines='warn', engine='python', chunksize=chunk_rows)
-
             first_chunk = True
 
             def enrich_chunk(chunk_df: _pd.DataFrame):
-                # đảm bảo cột raw_oie_data
                 if 'raw_oie_data' not in chunk_df.columns:
                     chunk_df['raw_oie_data'] = ''
                 if chunk_df['raw_oie_data'].dtype != 'O':
                     chunk_df['raw_oie_data'] = chunk_df['raw_oie_data'].astype(object)
 
-                # chọn hàng cần OIE
                 todo_idx_local = chunk_df.index[chunk_df['raw_oie_data'].isna() | (chunk_df['raw_oie_data'] == '')].tolist()
                 if not todo_idx_local:
-                    return chunk_df  # nothing to do
+                    return chunk_df
 
-                self._log_safe('info', f"[augment_with_oie] Chunk size={len(chunk_df)} | need OIE for {len(todo_idx_local)} rows")
+                self._log_safe('info', f"Processing chunk: {len(chunk_df)} rows, {len(todo_idx_local)} need OIE")
 
                 def _process_local(local_idx):
-                    try:
-                        qid = str(chunk_df.at[local_idx, 'query_id']) if 'query_id' in chunk_df.columns else 'N/A'
-                        cid = str(chunk_df.at[local_idx, 'chunk_id']) if 'chunk_id' in chunk_df.columns else f'row{local_idx}'
-                        self._log_safe('debug', f"[augment_with_oie] Đang xử lý query_id={qid} | chunk_id={cid}")
-                    except Exception:
-                        pass
-
                     txt = str(chunk_df.at[local_idx, 'chunk_text'])
-                    triples = extract_relations_from_paragraph(txt, silent=True)  # type: ignore[arg-type]
+                    triples = extract_relations_from_paragraph(txt, silent=True)
                     return local_idx, (format_oie_triples_to_string(triples) if triples else '')
 
                 with ThreadPoolExecutor(max_workers=threads) as executor:
@@ -786,56 +714,50 @@ class DatasetController:
 
                 return chunk_df
 
-            # Process each chunk and write to output incrementally
             for chunk_df in reader_iter:
                 if 'chunk_text' not in chunk_df.columns:
-                    self._log_safe('error', f"'chunk_text' column missing in chunk; abort.")
+                    self._log_safe('error', "Missing 'chunk_text' column")
                     return ""
 
                 processed_chunk = enrich_chunk(chunk_df)
                 processed_chunk.to_csv(out_path, sep='\t', index=False, mode='w' if first_chunk else 'a', header=first_chunk)
                 first_chunk = False
 
-            # Tạo bản 3 cột (đọc lại file mới, chỉ lấy 3 cột cần thiết)
+            # Create 3-column version
             try:
-                simple_df = _pd.read_csv(out_path, sep='\t', usecols=['query_text', 'chunk_text', 'label'], on_bad_lines='skip', engine='python')  # type: ignore[arg-type]
+                simple_df = _pd.read_csv(out_path, sep='\t', usecols=['query_text', 'chunk_text', 'label'], on_bad_lines='skip', engine='python')
                 simple_df.columns = ['query', 'passage', 'label']
                 simple_df.to_csv(out_path.with_name(out_path.stem + '_3col.tsv'), sep='\t', index=False)
             except Exception:
                 pass
 
-            # --- NEW: áp dụng RRF filter cho file augmented ---
+            # Apply RRF filter
             try:
-                try:
-                    up_perc = int(os.getenv("UPPER_PERCENTILE", "80"))
-                    low_perc = int(os.getenv("LOWER_PERCENTILE", "20"))
-                except ValueError:
-                    up_perc, low_perc = 80, 20
-
+                up_perc = int(os.getenv("UPPER_PERCENTILE", "80"))
+                low_perc = int(os.getenv("LOWER_PERCENTILE", "20"))
                 filtered_path = self._rank_and_filter_chunks(str(out_path), out_path.parent, upper_percentile=up_perc, lower_percentile=low_perc)
                 if filtered_path:
-                    self._log_safe('warning', f"RRF filtered file saved to: {filtered_path}")
+                    self._log_safe('info', f"RRF filtered file saved: {filtered_path}")
             except Exception as e:
-                self._log_safe('error', f"RRF filtering failed for augmented file {out_path}: {e}")
+                self._log_safe('error', f"RRF filtering failed: {e}")
 
-            self._log_safe('info', f'Đã lưu file augment: {out_path}')
+            self._log_safe('info', f'Augmented file saved: {out_path}')
             return str(out_path)
         except Exception as e:
-            self._log_safe('error', f'Lỗi augment OIE: {e}')
+            self._log_safe('error', f'OIE augmentation failed: {e}')
             return ""
 
     # ============================================================
     # New high-level: Hai pha – chunk trước, OIE sau
     # ============================================================
     def create_all_datasets_two_phase(self, *, non_oie_parallel: bool = True, max_workers: Optional[int] = None, oie_threads: int = 8):
-        """Thực hiện 2 giai đoạn: (1) sinh chunks không OIE, (2) augment OIE."""
-
-        # ---------------- PHA 1: without_OIE ----------------
-        phase1_controller = self  # dùng ngay instance hiện tại (đã tắt auto_start nếu cần) 
-
+        """Two-phase execution: (1) generate chunks without OIE, (2) augment with OIE"""
+        
+        # Phase 1: Process without OIE
+        phase1_controller = self
         configs_phase1 = [c for c in RUN_CONFIGURATIONS if not c.get('include_oie')]
         if not configs_phase1:
-            self._log_safe('error', 'Không tìm thấy cấu hình without_OIE.')
+            self._log_safe('error', 'No without_OIE configurations found')
             return
 
         results_phase1 = []
@@ -844,7 +766,7 @@ class DatasetController:
         if non_oie_parallel:
             if max_workers is None:
                 max_workers = min(multiprocessing.cpu_count(), 4)
-            self._log_safe('info', f'Pha 1: chạy song song (max_workers={max_workers})')
+            self._log_safe('info', f'Phase 1: parallel processing (max_workers={max_workers})')
 
             with ProcessPoolExecutor(max_workers=max_workers) as executor:
                 fut_to_cfg = {executor.submit(run_chunking_config_process, cfg, phase1_controller.input_tsv_path, str(phase1_controller.output_base_dir), auto_start_oie=False): cfg for cfg in configs_phase1}
@@ -854,35 +776,33 @@ class DatasetController:
                     if result.get('success'):
                         succ1 += 1
         else:
-            self._log_safe('info', 'Pha 1: chạy tuần tự.')
+            self._log_safe('info', 'Phase 1: sequential processing')
             for cfg in configs_phase1:
                 success, out_file, _ = phase1_controller._run_single_config(cfg)
                 results_phase1.append({'config_name': cfg['name'], 'success': success, 'output_file': out_file})
                 if success:
                     succ1 += 1
 
-        # ---------------- PHA 2: augment OIE ----------------
+        # Phase 2: Augment with OIE
         try:
             from Tool.OIE import _is_port_open, _start_openie_server
             if not _is_port_open(9000):
-                self._log_safe('warning', 'Chưa có server OpenIE5 – đang khởi động…')
+                self._log_safe('info', 'Starting OpenIE5 server...')
                 _start_openie_server(9000)
-                # Chờ tối đa 30s
                 for _ in range(30):
                     if _is_port_open(9000):
                         break
                     time.sleep(1)
         except Exception:
-            self._log_safe('error', 'Không thể khởi động server OpenIE5. Bỏ qua pha 2.')
+            self._log_safe('error', 'Cannot start OpenIE5 server. Skipping phase 2')
             return
 
         augmented_files = []
-        # ------ Song song cấp FILE: augment OIE dùng ProcessPoolExecutor ------
         succ_file_paths = [res.get('output_file', '') for res in results_phase1 if res.get('success') and res.get('output_file')]
 
         if succ_file_paths:
             max_aug_workers = min(len(succ_file_paths), max(1, multiprocessing.cpu_count() // 2))
-            self._log_safe('info', f'Pha 2: augment {len(succ_file_paths)} file song song (workers={max_aug_workers})')
+            self._log_safe('info', f'Phase 2: augmenting {len(succ_file_paths)} files (workers={max_aug_workers})')
 
             with ProcessPoolExecutor(max_workers=max_aug_workers) as executor:
                 fut_to_src = {executor.submit(run_augment_process, path, str(self.output_base_dir), oie_threads): path for path in succ_file_paths}
@@ -890,50 +810,41 @@ class DatasetController:
                     try:
                         result_path = fut.result()
                     except Exception as e:
-                        self._log_safe('error', f'Augment process for {fut_to_src[fut]} failed: {e}')
+                        self._log_safe('error', f'Augment process failed: {e}')
                         result_path = ''
                     augmented_files.append(result_path)
         else:
-            self._log_safe('warning', 'Không có file thành công ở pha 1 để augment.')
+            self._log_safe('warning', 'No successful files from phase 1 to augment')
 
-        self._log_safe('warning', f'Đã hoàn tất hai pha. File augment: {augmented_files}')
+        self._log_safe('info', f'Two-phase completion. Augmented files: {len([f for f in augmented_files if f])}')
 
-        # Tắt OpenIE server sau khi hoàn thành pha 2
+        # Cleanup OpenIE server
         try:
             from Tool.OIE import terminate_openie_processes
             terminate_openie_processes(port=9000, silent=True)
-            self._log_safe('warning', 'Đã tắt server OpenIE5 (cổng 9000).')
+            self._log_safe('info', 'OpenIE5 server terminated')
         except Exception:
-            self._log_safe('error', 'Không thể tắt server OpenIE5.')
+            self._log_safe('error', 'Failed to terminate OpenIE5 server')
 
 # Process-based worker function for parallel execution
 def run_chunking_config_process(config: dict, input_tsv_path: str, output_base_dir: str, *, auto_start_oie: bool = True) -> dict:
-    """Process-based worker function to run a single chunking configuration.
-
-    auto_start_oie:
-        Quyết định có tự khởi động server OIE5 trong tiến trình con hay không.
-        Đối với giai đoạn without_OIE nên đặt False để tránh khởi động thừa.
-    """
+    """Process-based worker function for chunking configuration"""
     controller = DatasetController(input_tsv_path, output_base_dir, auto_start_oie=auto_start_oie)
     start_time = time.time()
-        
     success, output_file, final_compliance = controller._run_single_config(config)
-        
     end_time = time.time()
-        
+    
     return {
-        "config_name": config["name"], "description": config["description"],
-        "success": success, "output_file": output_file or "",
-            "execution_time_seconds": end_time - start_time,
-            "final_compliance_rate": final_compliance
-        }
-
-# -------------------------------------------------------------------
-# Worker cho pha 2 – augment OIE song song
-# -------------------------------------------------------------------
+        "config_name": config["name"], 
+        "description": config["description"],
+        "success": success, 
+        "output_file": output_file or "",
+        "execution_time_seconds": end_time - start_time,
+        "final_compliance_rate": final_compliance
+    }
 
 def run_augment_process(source_tsv: str, output_base_dir: str, oie_threads: int) -> str:
-    """Process-based worker: augment single TSV with OIE and RRF filter."""
+    """Process-based worker for OIE augmentation"""
     controller = DatasetController(source_tsv, output_base_dir, auto_start_oie=False)
     return controller.augment_with_oie(source_tsv, threads=oie_threads)
 
@@ -942,67 +853,63 @@ def run_augment_process(source_tsv: str, output_base_dir: str, oie_threads: int)
 # -------------------------------------------------------------------
 def main():
     """Main function to run the adaptive controller"""
-    global RUN_CONFIGURATIONS  # override inside main
+    global RUN_CONFIGURATIONS
     print("Integrated Adaptive Dataset Controller for Neural Ranking Models")
     print("="*60)
     
     # Get input parameters
-    input_tsv_path = input("Enter path to input TSV file (query<tab>passage<tab>label): ").strip()
+    input_tsv_path = input("Enter path to input TSV file: ").strip()
     if not input_tsv_path:
         print("ERROR: Input file path is required!")
         return
     
-    output_base_dir = input("Enter output base directory (default: ./training_datasets): ").strip() or "./training_datasets"
+    output_base_dir = input("Enter output directory (default: ./training_datasets): ").strip() or "./training_datasets"
     
-    mode_choice = input("Chạy hai pha Without→With OIE? (y/n, default: n): ").strip().lower()
-    two_phase = mode_choice == 'y'
-
-    parallel_choice = input("Use parallel processing cho pha chunk? (y/n, default: n): ").strip().lower()
-    use_parallel = parallel_choice == 'y'
+    two_phase = input("Run two-phase (without→with OIE)? (y/n): ").strip().lower() == 'y'
+    use_parallel = input("Use parallel processing? (y/n): ").strip().lower() == 'y'
     
     max_workers = None
     if use_parallel:
-        max_workers_input = input(f"Max parallel workers (default: auto, max: {multiprocessing.cpu_count()}): ").strip()
+        max_workers_input = input(f"Max workers (default: auto, max: {multiprocessing.cpu_count()}): ").strip()
         if max_workers_input.isdigit():
             max_workers = min(int(max_workers_input), multiprocessing.cpu_count())
 
-    # --- NEW: allow user to pick specific configurations ---
+    # Configuration selection
     print("\nAvailable configurations:")
     for cfg in RUN_CONFIGURATIONS:
         print(f"  - {cfg['name']}")
 
-    selected_cfgs = input("Enter configuration names to run (comma-separated) or press ENTER for ALL: ").strip()
-
+    selected_cfgs = input("Select configurations (comma-separated) or ENTER for all: ").strip()
     if selected_cfgs:
         chosen = {name.strip() for name in selected_cfgs.split(',') if name.strip()}
         RUN_CONFIGURATIONS = [c for c in RUN_CONFIGURATIONS if c['name'] in chosen]
         if not RUN_CONFIGURATIONS:
-            print("No matching configuration names found. Exiting.")
+            print("No matching configurations found")
             return
     
-    # --- NEW: ask dynamic percentiles for RRF filtering ---
-    up_perc_input = input("Upper percentile for POS (default 80): ").strip()
-    low_perc_input = input("Lower percentile for NEG (default 20): ").strip()
+    # RRF filtering percentiles
+    up_perc = input("Upper percentile for POS (default 80): ").strip()
+    low_perc = input("Lower percentile for NEG (default 20): ").strip()
+    
+    if up_perc.isdigit():
+        os.environ["UPPER_PERCENTILE"] = up_perc
+    if low_perc.isdigit():
+        os.environ["LOWER_PERCENTILE"] = low_perc
 
-    if up_perc_input.isdigit():
-        os.environ["UPPER_PERCENTILE"] = up_perc_input
-    if low_perc_input.isdigit():
-        os.environ["LOWER_PERCENTILE"] = low_perc_input
-
-    print("\nConfiguration confirmed. Starting process...")
+    print("\nStarting process...")
     
     try:
         controller = DatasetController(input_tsv_path, output_base_dir, auto_start_oie=not two_phase)
-
+        
         if two_phase:
             controller.create_all_datasets_two_phase(non_oie_parallel=use_parallel, max_workers=max_workers)
         else:
             controller.create_all_datasets(use_parallel=use_parallel, max_workers=max_workers)
             
     except KeyboardInterrupt:
-        print("\nInterrupted by user.")
+        print("\nInterrupted by user")
     except Exception as e:
-        print(f"A critical error occurred in main: {e}")
+        print(f"Critical error: {e}")
         traceback.print_exc()
 
 if __name__ == "__main__":
