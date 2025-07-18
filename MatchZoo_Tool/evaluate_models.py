@@ -5,7 +5,6 @@ import pandas as pd
 from typing import Dict, List, Optional
 import numpy as np
 
-print("=== Công cụ đánh giá mô hình MatchZoo ===")
 
 class ModelEvaluator:
     """Lớp để đánh giá và so sánh các mô hình MatchZoo"""
