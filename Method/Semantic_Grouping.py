@@ -1,6 +1,6 @@
 import pandas as pd
 from dotenv import load_dotenv
-from Tool.Sentence_Detector import extract_and_simplify_sentences
+from Tool.Sentence_Segmenter import extract_sentences_spacy, count_tokens_spacy, extract_and_simplify_sentences
 from Tool.Sentence_Embedding import sentence_embedding as embed_text_list 
 from Tool.OIE import extract_relations_from_paragraph 
 import os 
@@ -30,13 +30,8 @@ def count_tokens_simple(text: str) -> int:
     return len(tokens)
 
 def count_tokens_accurate(text: str) -> int:
-    """More accurate token counting using regex patterns"""
-    if not text or not isinstance(text, str):
-        return 0
-    import re
-    # Split on word boundaries and punctuation
-    tokens = re.findall(r'\b\w+\b|[^\w\s]', text.strip())
-    return len(tokens)
+    """More accurate token counting using spaCy tokenizer"""
+    return count_tokens_spacy(text)
 
 # --- Helper function for batched embedding ---
 def embed_sentences_in_batches(sentences, model_name, batch_size=32, device=None, silent=True):
@@ -427,7 +422,7 @@ def _force_split_too_large_chunk(text: str, max_tokens: int) -> List[str]:
     Splits a chunk of text that is over max_tokens into smaller chunks,
     respecting sentence boundaries.
     """
-    sentences = extract_and_simplify_sentences(text, simplify=False)
+    sentences = extract_sentences_spacy(text)
     if not sentences:
         # Fallback for text without clear sentences
         words = text.split()
@@ -529,7 +524,7 @@ def semantic_chunk_passage_from_grouping_logic(
         print(f"   OIE enabled: {include_oie}")
 
     # 1. Extract sentences
-    sentences = extract_and_simplify_sentences(passage_text, simplify=False)
+    sentences = extract_sentences_spacy(passage_text)
     if not sentences:
         if not silent:
             print(f"   No sentences found in passage {doc_id}")

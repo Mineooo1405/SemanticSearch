@@ -6,7 +6,7 @@ import json
 import pandas as pd
 from typing import List, Dict, Union, Optional, Callable, Tuple
 from dotenv import load_dotenv
-from Tool.Sentence_Detector import extract_and_simplify_sentences, split_text_into_sentences
+from Tool.Sentence_Segmenter import extract_sentences_spacy, count_tokens_spacy, to_sentences, extract_and_simplify_sentences
 from Tool.OIE import extract_relations_from_paragraph
 import hashlib
 import traceback
@@ -26,6 +26,22 @@ def count_tokens_simple(text: str) -> int:
         return 0
     tokens = text.strip().split()
     return len(tokens)
+
+def count_tokens_accurate(text: str) -> int:
+    """More accurate token counting using spaCy tokenizer"""
+    return count_tokens_spacy(text)
+
+def to_sentences(passage: str) -> List[str]:
+    """Extract sentences from passage text using spaCy"""
+    if not passage or not isinstance(passage, str):
+        return []
+    try:
+        return extract_sentences_spacy(passage.strip())
+    except Exception as e:
+        print(f"Warning: spaCy sentence extraction failed: {e}")
+        # Fallback to simple splitting
+        sentences = [s.strip() for s in passage.split('.') if s.strip()]
+        return [s + '.' if not s.endswith('.') else s for s in sentences]
 
 def count_tokens_accurate(text: str) -> int:
     """More accurate token counting using regex patterns"""
