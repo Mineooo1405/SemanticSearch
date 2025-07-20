@@ -58,122 +58,16 @@ except OverflowError:
 
 # --- Configuration for the controller ---
 PYTHON_EXECUTABLE = sys.executable
-
-# Dynamic batch sizing based on available memory
-def _utility_calculate_optimal_batch_size():
-    """Calculate optimal batch size based on available RAM"""
-    try:
-        import psutil
-        available_gb = psutil.virtual_memory().available / (1024**3)
-        
-        if available_gb > 16:
-            return 1000  # High memory system
-        elif available_gb > 8:
-            return 500   # Medium memory system
-        elif available_gb > 4:
-            return 200   # Low memory system
-        else:
-            return 100   # Very low memory system
-    except ImportError:
-        print("psutil not available. Using conservative batch size of 200.")
-        return 200  # Conservative default
-
-def _utility_recommend_embedding_model():
-    """Recommend embedding model based on available GPU/RAM"""
-    try:
-        # Check GPU memory first
-        try:
-            import torch
-            if torch.cuda.is_available():
-                gpu_memory_gb = torch.cuda.get_device_properties(0).total_memory / (1024**3)
-                
-                if gpu_memory_gb >= 6:
-                    return "gte-large"
-                elif gpu_memory_gb >= 3:
-                    return "gte-base" 
-                elif gpu_memory_gb >= 2:
-                    return "mpnet-base"
-                else:
-                    return "minilm-l12"
-        except ImportError:
-            pass
-        
-        # Fallback to RAM-based recommendation
-        import psutil
-        available_gb = psutil.virtual_memory().available / (1024**3)
-        
-        if available_gb >= 8:
-            return "gte-base"
-        elif available_gb >= 4:
-            return "minilm-l12"
-        else:
-            return "minilm-l6"
-            
-    except ImportError:
-        return "minilm-l6"  # Most conservative option
-
-def _utility_set_embedding_model(model_key: str) -> bool:
-    """Set the embedding model in COMMON_DEFAULTS"""
-    if model_key in AVAILABLE_EMBEDDING_MODELS:
-        COMMON_DEFAULTS["embedding_model"] = AVAILABLE_EMBEDDING_MODELS[model_key]["model_name"]
-        return True
-    return False
-
-PROCESSING_BATCH_SIZE = _utility_calculate_optimal_batch_size()  # Dynamic batch size
+PROCESSING_BATCH_SIZE = 1000  # Process 1000 rows at a time to manage memory
 
 # Default parameters that will be used for all runs
 COMMON_DEFAULTS = {
     "base_output_dir": "./training_datasets",
-    "embedding_model": "thenlper/gte-base",  # Default balanced model
+    "embedding_model": "thenlper/gte-large",
     "device_preference": ""  # Empty for auto-detection
 }
 
-# Available embedding models with memory requirements
-AVAILABLE_EMBEDDING_MODELS = {
-    "gte-large": {
-        "model_name": "thenlper/gte-large",
-        "description": "High quality, large model (1.3B params)",
-        "vram_gb": 4.5,
-        "dimensions": 1024,
-        "recommended_for": "High accuracy tasks, sufficient VRAM"
-    },
-    "gte-base": {
-        "model_name": "thenlper/gte-base", 
-        "description": "Good balance of quality and size (220M params)",
-        "vram_gb": 2.0,
-        "dimensions": 768,
-        "recommended_for": "Balanced performance and memory usage"
-    },
-    "gte-small": {
-        "model_name": "thenlper/gte-small",
-        "description": "Lightweight model (33M params)",
-        "vram_gb": 0.8,
-        "dimensions": 384,
-        "recommended_for": "Low memory systems"
-    },
-    "minilm-l6": {
-        "model_name": "sentence-transformers/all-MiniLM-L6-v2",
-        "description": "Very fast and lightweight (22M params)",
-        "vram_gb": 0.5,
-        "dimensions": 384,
-        "recommended_for": "CPU processing, very low memory"
-    },
-    "minilm-l12": {
-        "model_name": "sentence-transformers/all-MiniLM-L12-v2", 
-        "description": "Better quality than L6, still lightweight (33M params)",
-        "vram_gb": 0.7,
-        "dimensions": 384,
-        "recommended_for": "Good compromise for medium systems"
-    },
-    "mpnet-base": {
-        "model_name": "sentence-transformers/all-mpnet-base-v2",
-        "description": "High quality general purpose model (110M params)",
-        "vram_gb": 1.8,
-        "dimensions": 768,
-        "recommended_for": "High quality with moderate memory usage"
-    }
-}
-
+# ⬆️ NEW: Adaptive chunking configuration with tolerance
 ADAPTIVE_CHUNKING_CONFIG = {
     "target_tokens": 120,           # Target chunk size
     "tolerance": 0.25,              # 25% tolerance (90-150 tokens)
@@ -186,13 +80,14 @@ ADAPTIVE_CHUNKING_CONFIG = {
     "max_iterations": 3             # Maximum adaptive iterations
 }
 
+# Optimized parameters
 SEMANTIC_GROUPING_DEFAULTS = {
     "initial_threshold": 0.75,
     "decay_factor": 0.85,
     "min_threshold": 0.50,
     "initial_percentile": "80",
     "min_percentile": "20",
-    "embedding_batch_size": 8,  
+    "embedding_batch_size": 16,
     "min_chunk_len_tokens": ADAPTIVE_CHUNKING_CONFIG["min_tokens"],
     "max_chunk_len_tokens": ADAPTIVE_CHUNKING_CONFIG["max_tokens"],
     "oie_max_triples_per_chunk": 5,
@@ -206,7 +101,7 @@ SEMANTIC_SPLITTER_DEFAULTS = {
     "min_chunk_len": 2,
     "max_chunk_len": 4,
     "window_size": 3,
-    "embedding_batch_size": 16,  
+    "embedding_batch_size": 32,
     "enable_adaptive": ADAPTIVE_CHUNKING_CONFIG["enable_adaptive"],
     "target_tokens": ADAPTIVE_CHUNKING_CONFIG["target_tokens"],
     "tolerance": ADAPTIVE_CHUNKING_CONFIG["tolerance"],
@@ -222,6 +117,7 @@ TEXT_SPLITTER_DEFAULTS = {
     "oie_token_budget": 40
 }
 
+
 # Define the sequence of runs - 6 configurations for 6 datasets
 RUN_CONFIGURATIONS = [
     {
@@ -230,8 +126,7 @@ RUN_CONFIGURATIONS = [
         "include_oie": False, 
         "params": TEXT_SPLITTER_DEFAULTS,
         "description": "Adaptive rule-based chunking optimized for 90-150 tokens (without OIE)"
-    },    
-    {
+    },    {
         "name": "text_splitter_with_OIE",
         "method_choice": "3", 
         "include_oie": True,
@@ -245,8 +140,7 @@ RUN_CONFIGURATIONS = [
         "include_oie": False, 
         "params": SEMANTIC_GROUPING_DEFAULTS,
         "description": "Adaptive semantic clustering without order constraint (90-150 tokens, without OIE)"
-    },    
-    {
+    },    {
         "name": "semantic_grouping_with_OIE",
         "method_choice": "1", 
         "include_oie": True,
@@ -260,8 +154,7 @@ RUN_CONFIGURATIONS = [
         "include_oie": False, 
         "params": SEMANTIC_SPLITTER_DEFAULTS,
         "description": "Adaptive sequential semantic chunking with order preservation (90-150 tokens, without OIE)"
-    },    
-    {
+    },    {
         "name": "semantic_splitter_with_OIE",
         "method_choice": "2", 
         "include_oie": True,
@@ -272,30 +165,20 @@ RUN_CONFIGURATIONS = [
 ]
 
 class DatasetController:
+    """Controller for generating adaptive training datasets using integrated chunking logic.
+    
+    Attributes
+    ----------
+    auto_start_oie : bool
+        Nếu True (mặc định) controller sẽ tự động khởi động server OpenIE5 khi phát hiện khả dụng.
+        Đặt False để trì hoãn việc khởi động – giúp thực hiện giai đoạn *without_OIE* trước khi bật server.
+    """
 
     def __init__(self, input_tsv_path: str, output_base_dir: str = "training_datasets", *, auto_start_oie: bool = True):
         self.input_tsv_path = input_tsv_path
         self.output_base_dir = Path(output_base_dir)
         self.output_base_dir.mkdir(exist_ok=True)
         self._auto_start_oie = auto_start_oie  # lưu lại tuỳ chọn
-        
-        # Memory safety check
-        import psutil
-        available_gb = psutil.virtual_memory().available / (1024**3)
-        if available_gb < 2:
-            print(f"WARNING: Only {available_gb:.1f}GB RAM available. Consider freeing memory before processing large datasets.")
-        
-        # GPU memory check (if available)
-        try:
-            import torch
-            if torch.cuda.is_available():
-                gpu_memory = torch.cuda.get_device_properties(0).total_memory / (1024**3)
-                gpu_free = torch.cuda.memory_reserved(0) / (1024**3)
-                print(f"GPU: {gpu_memory:.1f}GB total, {gpu_free:.1f}GB reserved")
-                if gpu_memory < 4:
-                    print("WARNING: Low GPU memory. Consider using CPU for embeddings or reducing batch sizes.")
-        except ImportError:
-            pass
         
         # Setup logging - FIX Unicode issues
         self.timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
@@ -331,23 +214,6 @@ class DatasetController:
         self._log_safe('info', f"Adaptive chunk range: {ADAPTIVE_CHUNKING_CONFIG['min_tokens']}-{ADAPTIVE_CHUNKING_CONFIG['max_tokens']} tokens")
         self._log_safe('info', f"Target: {ADAPTIVE_CHUNKING_CONFIG['target_tokens']} tokens ±{ADAPTIVE_CHUNKING_CONFIG['tolerance']*100:.0f}%")
         
-        # Log current embedding model
-        current_model = COMMON_DEFAULTS["embedding_model"]
-        model_info = None
-        for key, info in AVAILABLE_EMBEDDING_MODELS.items():
-            if info["model_name"] == current_model:
-                model_info = info
-                break
-        
-        if model_info:
-            self._log_safe('info', f"Embedding Model: {current_model}")
-            self._log_safe('info', f"VRAM Required: ~{model_info['vram_gb']}GB | Dimensions: {model_info['dimensions']}")
-            # Also print to console for immediate visibility
-            print(f"[PROCESS] Using embedding model: {current_model}")
-        else:
-            self._log_safe('info', f"Embedding Model: {current_model} (custom model)")
-            print(f"[PROCESS] Using embedding model: {current_model} (custom model)")
-        
         # Validate OIE availability
         self.oie_available = OIE_AVAILABLE_GLOBALLY
         if not self.oie_available:
@@ -373,153 +239,7 @@ class DatasetController:
         """Helper to log messages without emoji processing"""
         getattr(self.logger, level.lower(), self.logger.info)(message)
     
-    def _utility_memory_status(self) -> dict:
-        """Get current memory status for monitoring"""
-        try:
-            import psutil
-            memory = psutil.virtual_memory()
-            process = psutil.Process()
-            
-            status = {
-                "total_ram_gb": memory.total / (1024**3),
-                "available_ram_gb": memory.available / (1024**3),
-                "ram_usage_percent": memory.percent,
-                "process_memory_mb": process.memory_info().rss / (1024**2)
-            }
-            
-            # GPU memory if available
-            try:
-                import torch
-                if torch.cuda.is_available():
-                    status["gpu_memory_gb"] = torch.cuda.get_device_properties(0).total_memory / (1024**3)
-                    status["gpu_allocated_gb"] = torch.cuda.memory_allocated(0) / (1024**3)
-                    status["gpu_reserved_gb"] = torch.cuda.memory_reserved(0) / (1024**3)
-            except ImportError:
-                pass
-                
-            return status
-        except ImportError:
-            return {"error": "psutil not available"}
-    
-    def _utility_check_memory_safety(self, warn_threshold: float = 85.0) -> bool:
-        """Check if memory usage is safe to continue processing"""
-        status = self._utility_memory_status()
-        if "error" in status:
-            return True  # Can't check, assume safe
-            
-        ram_usage = status.get("ram_usage_percent", 0)
-        if ram_usage > warn_threshold:
-            self._log_safe('warning', f"High RAM usage: {ram_usage:.1f}%. Consider reducing batch size or freeing memory.")
-            if ram_usage > 95:
-                self._log_safe('error', f"Critical RAM usage: {ram_usage:.1f}%. Processing may fail!")
-                return False
-        
-        return True
-    
-    def _utility_display_embedding_models(self) -> None:
-        """Display available embedding models with recommendations"""
-        print("\n" + "="*70)
-        print("🤖 AVAILABLE EMBEDDING MODELS")
-        print("="*70)
-        
-        recommended = _utility_recommend_embedding_model()
-        current_model = COMMON_DEFAULTS["embedding_model"]
-        
-        for key, info in AVAILABLE_EMBEDDING_MODELS.items():
-            status_flags = []
-            if info["model_name"] == current_model:
-                status_flags.append("CURRENT")
-            if key == recommended:
-                status_flags.append("RECOMMENDED")
-            
-            status_str = f" [{', '.join(status_flags)}]" if status_flags else ""
-            
-            print(f"\n{key.upper()}{status_str}")
-            print(f"   Model: {info['model_name']}")
-            print(f"   Description: {info['description']}")
-            print(f"   VRAM Required: ~{info['vram_gb']}GB")
-            print(f"   Dimensions: {info['dimensions']}")
-            print(f"   Best For: {info['recommended_for']}")
-    
-    def _utility_change_embedding_model(self, model_key: str = None) -> bool:
-        """Change the embedding model with validation"""
-        if model_key is None:
-            self._utility_display_embedding_models()
-            return True
-            
-        if model_key not in AVAILABLE_EMBEDDING_MODELS:
-            available_keys = list(AVAILABLE_EMBEDDING_MODELS.keys())
-            print(f"Invalid model key '{model_key}'. Available: {available_keys}")
-            return False
-        
-        # Check memory requirements
-        model_info = AVAILABLE_EMBEDDING_MODELS[model_key]
-        required_vram = model_info["vram_gb"]
-        
-        try:
-            import torch
-            if torch.cuda.is_available():
-                gpu_memory_gb = torch.cuda.get_device_properties(0).total_memory / (1024**3)
-                if required_vram > gpu_memory_gb * 0.8:  # Leave 20% buffer
-                    print(f"WARNING: Model requires ~{required_vram}GB VRAM but only {gpu_memory_gb:.1f}GB available!")
-                    print("Consider using CPU processing or a smaller model.")
-                    
-                    confirm = input("Continue anyway? (y/n): ").strip().lower()
-                    if confirm != 'y':
-                        return False
-        except ImportError:
-            print("GPU not available, will use CPU processing.")
-        
-        # Update the model
-        old_model = COMMON_DEFAULTS["embedding_model"]
-        COMMON_DEFAULTS["embedding_model"] = model_info["model_name"]
-        
-        print(f"Embedding model changed:")
-        print(f"   From: {old_model}")
-        print(f"   To: {model_info['model_name']}")
-        print(f"   VRAM: ~{required_vram}GB | Dimensions: {model_info['dimensions']}")
-        
-        return True
-    
-    def _utility_quick_model_switch(self) -> None:
-        """Quick model switching with common presets"""
-        print("\nQUICK MODEL PRESETS:")
-        print("1.High Quality (gte-large) - Best accuracy, needs 4.5GB+ VRAM")
-        print("2.Balanced (gte-base) - Good quality, moderate memory (2GB VRAM)")
-        print("3.Fast (minilm-l12) - Quick processing, low memory (0.7GB VRAM)")
-        print("4.Ultra-Fast (minilm-l6) - Fastest, minimal memory (0.5GB VRAM)")
-        print("5.Auto-select based on system")
-        
-        choice = input("\nSelect preset (1-5) or press ENTER to skip: ").strip()
-        
-        model_map = {
-            "1": "gte-large",
-            "2": "gte-base", 
-            "3": "minilm-l12",
-            "4": "minilm-l6",
-            "5": _utility_recommend_embedding_model()
-        }
-        
-        if choice in model_map:
-            model_key = model_map[choice]
-            if self._utility_change_embedding_model(model_key):
-                print("Model preset applied successfully!")
-            else:
-                print("Failed to apply preset.")
-        elif choice:
-            print("Invalid choice.")
-    
-    def helper_runtime_model_change(self, model_key: str = None) -> bool:
-        """Runtime method to change embedding model during processing"""
-        if model_key is None:
-            print("Available models:")
-            for key in AVAILABLE_EMBEDDING_MODELS.keys():
-                print(f"   - {key}")
-            return False
-        
-        return self._utility_change_embedding_model(model_key)
-    
-    def _utility_validate_input_file(self) -> bool:
+    def validate_input_file(self) -> bool:
         """Validate that input TSV file exists and has correct format"""
         if not os.path.exists(self.input_tsv_path):
             self._log_safe('error', f"Input file not found: {self.input_tsv_path}")
@@ -539,9 +259,9 @@ class DatasetController:
             self._log_safe('error', f"Error validating input file: {e}")
             return False
     
-    def process_execute_chunking_logic(self, df: pd.DataFrame, config: dict) -> List[List[Any]]:
+    def _execute_chunking_logic(self, df: pd.DataFrame, config: dict) -> List[List[Any]]:
         """
-        Memory-efficient chunking logic with garbage collection.
+        Integrated chunking logic, replacing interactive_chunker.py.
         Takes a DataFrame (batch) and a configuration, returns chunked rows.
         """
         output_rows = []
@@ -564,11 +284,6 @@ class DatasetController:
             self._log_safe('warning', f"No valid chunking function for method_choice '{method_choice}'. Skipping.")
             return []
 
-        # Memory monitoring
-        import psutil
-        process = psutil.Process()
-        initial_memory = process.memory_info().rss / (1024**2)  # MB
-
         for row_idx, row_data in df.iterrows():
             try:
                 query_text, passage_text, label = row_data.iloc[0], row_data.iloc[1], row_data.iloc[2]
@@ -578,14 +293,6 @@ class DatasetController:
                 if not isinstance(passage_text, str) or not passage_text.strip():
                     self.logger.warning(f"Skipping row {row_idx} due to empty passage text.")
                     continue
-
-                # Memory check every 100 rows
-                if row_idx % 100 == 0:
-                    current_memory = process.memory_info().rss / (1024**2)  # MB
-                    memory_growth = current_memory - initial_memory
-                    if memory_growth > 1000:  # If memory grew by more than 1GB
-                        self._log_safe('warning', f"High memory usage detected: {memory_growth:.1f}MB growth. Running GC...")
-                        gc.collect()  # Force garbage collection
 
                 # Prepare parameters for the chunking function
                 common_params = {
@@ -612,17 +319,8 @@ class DatasetController:
                         query_id, query_text, passage_id, passage_text, label,
                         gen_chunk_id, chunk_text, oie_string if oie_string else ""
                     ])
-                    
-                # Clear chunked_tuples to free memory immediately
-                del chunked_tuples
-                
             except Exception as e:
                 self.logger.error(f"Error processing row {row_idx} in config '{config['name']}': {e}", exc_info=False)
-        
-        # Final garbage collection
-        gc.collect()
-        final_memory = process.memory_info().rss / (1024**2)  # MB
-        self._log_safe('info', f"Batch processed. Memory: {initial_memory:.1f}MB → {final_memory:.1f}MB ({len(output_rows)} chunks)")
         
         return output_rows
 
@@ -646,13 +344,10 @@ class DatasetController:
                 for i, batch_df in enumerate(reader, 1):
                     self._log_safe('info', f"--- Processing Batch {i} for {task_name} ---")
                     
-                    # Clear any cached data before processing
-                    gc.collect()
-                    
-                    chunked_rows = self.process_execute_chunking_logic(batch_df, config)
+                    chunked_rows = self._execute_chunking_logic(batch_df, config)
                     total_chunks += len(chunked_rows)
 
-                    # Write to file immediately and clear from memory
+                    # Write to file
                     write_mode = 'w' if is_first_batch else 'a'
                     with open(final_output_file, write_mode, encoding='utf-8', newline='') as f:
                         writer = csv.writer(f, delimiter='\t')
@@ -661,16 +356,6 @@ class DatasetController:
                             is_first_batch = False
                         if chunked_rows:
                             writer.writerows(chunked_rows)
-                    
-                    # Clear batch data from memory immediately
-                    del chunked_rows, batch_df
-                    gc.collect()
-                    
-                    # Memory usage warning
-                    import psutil
-                    memory_usage = psutil.virtual_memory().percent
-                    if memory_usage > 85:
-                        self._log_safe('warning', f"High RAM usage: {memory_usage:.1f}%. Consider reducing batch size.")
             
             self._log_safe('info', f"Total chunks generated for {task_name}: {total_chunks}")
 
@@ -693,7 +378,7 @@ class DatasetController:
             except ValueError:
                 up_perc, low_perc = 80, 20
 
-            ranked_filtered_path = self.helper_rank_and_filter_chunks(str(final_output_file), config_output_dir,
+            ranked_filtered_path = self._rank_and_filter_chunks(str(final_output_file), config_output_dir,
                                                                upper_percentile=up_perc, lower_percentile=low_perc)
             if ranked_filtered_path:
                 self._log_safe('warning', f"Ranked & filtered results saved to: {ranked_filtered_path}")
@@ -702,7 +387,10 @@ class DatasetController:
         
         return True, str(final_output_file), final_compliance
     
-    def helper_rank_and_filter_chunks(self, chunks_tsv: str, output_dir: Path,
+    # ------------------------------------------------------------------
+    # New helper: rank chunks with RRF and keep top & bottom 25%
+    # ------------------------------------------------------------------
+    def _rank_and_filter_chunks(self, chunks_tsv: str, output_dir: Path,
                                 upper_percentile: int = 80, lower_percentile: int = 20) -> str:
         """Rank chunks và giữ lại theo ngưỡng phân vị RRF.
 
@@ -770,7 +458,7 @@ class DatasetController:
 
         return str(save_path)
     
-    def helper_extract_output_path(self, stdout: str, task_name: str, config_output_dir: Path) -> str:
+    def _extract_output_path(self, stdout: str, task_name: str, config_output_dir: Path) -> str:
         """Extract output file path from stdout"""
         try:
             # Look for output file patterns in stdout
@@ -797,7 +485,7 @@ class DatasetController:
             self.logger.warning(f"Error extracting output path for {task_name}: {e}")
             return str(config_output_dir / "output_chunks.tsv")
 
-    def helper_analyze_chunk_distribution(self, output_file: str, task_name: str) -> None:
+    def _analyze_chunk_distribution(self, output_file: str, task_name: str) -> None:
         """Analyze token distribution of generated chunks"""
         try:
             if not os.path.exists(output_file):
@@ -809,7 +497,7 @@ class DatasetController:
                 self.logger.warning(f"Column 'chunk_text' not found in {output_file}. Cannot analyze.")
                 return
             df.dropna(subset=['chunk_text'], inplace=True)
-            chunk_token_counts = df['chunk_text'].apply(self._utility_count_tokens).tolist()
+            chunk_token_counts = df['chunk_text'].apply(self._count_tokens).tolist()
         
             if not chunk_token_counts:
                 self.logger.warning(f"No valid chunks found in {output_file} for analysis.")
@@ -834,13 +522,13 @@ class DatasetController:
         except Exception as e:
             self.logger.warning(f"Error analyzing chunk distribution for {task_name}: {e}")
 
-    def _utility_count_tokens(self, text: str) -> int:
+    def _count_tokens(self, text: str) -> int:
         """Simple token counting for analysis"""
         if not isinstance(text, str):
             return 0
         return len(re.findall(r'\b\w+\b|[^\w\s]', text))
 
-    def helper_create_summary(self, results: List[dict], successful_tasks: int) -> Dict[str, Any]:
+    def _create_summary(self, results: List[dict], successful_tasks: int) -> Dict[str, Any]:
         """Create summary of all tasks"""
         return {
             "controller_run_timestamp": self.timestamp,
@@ -854,7 +542,7 @@ class DatasetController:
             "task_results": results
         }
 
-    def helper_save_and_print_summary(self, summary: Dict[str, Any]) -> None:
+    def _save_and_print_summary(self, summary: Dict[str, Any]) -> None:
         """Save and print final summary"""
         results_file = self.output_base_dir / f"controller_results_{self.timestamp}.json"
         try:
@@ -864,7 +552,7 @@ class DatasetController:
         except Exception as e:
             self.logger.error(f"Failed to save results file: {e}")
         
-        self.helper_print_final_summary(summary)
+        self._print_final_summary(summary)
 
         # Tắt server OpenIE sau khi hoàn tất
         try:
@@ -875,26 +563,25 @@ class DatasetController:
             pass
 
     # Simplified approach: Replace create_all_datasets method
-    def data_create_controller_main(self, use_parallel: bool = False, max_workers: Optional[int] = None) -> Dict[str, Any]:
+    def create_all_datasets(self, use_parallel: bool = False, max_workers: Optional[int] = None) -> Dict[str, Any]:
         """Create all 6 adaptive datasets with simple re-chunking loop"""
         
         if use_parallel:
-            return self.process_create_all_datasets_parallel(max_workers)
+            return self._create_all_datasets_parallel(max_workers)
         else:
-            return self.process_create_all_datasets_sequential()
+            return self._create_all_datasets_sequential()
 
-    def process_create_all_datasets_sequential(self) -> Dict[str, Any]:
+    def _create_all_datasets_sequential(self) -> Dict[str, Any]:
         """Sequential dataset creation."""
         self._log_safe('info', "="*80)
         self._log_safe('info', "STARTING SEQUENTIAL ADAPTIVE DATASET CREATION")
         self._log_safe('info', "="*80)
         
-        if not self._utility_validate_input_file():
+        if not self.validate_input_file():
             self._log_safe('error', "Input file validation failed. Aborting.")
             return {"success": False, "results": []}
         
-        # Only run without_OIE configurations in normal mode
-        configs_to_run = [c for c in RUN_CONFIGURATIONS if not c.get("include_oie", False)]
+        configs_to_run = [c for c in RUN_CONFIGURATIONS if c["include_oie"] is False or self.oie_available]
         
         results = []
         successful_tasks = 0
@@ -921,11 +608,11 @@ class DatasetController:
             else:
                 self._log_safe('error', f"Failed {config['name']} after {task_result['execution_time_seconds']:.1f}s")
         
-        summary = self.helper_create_summary(results, successful_tasks)
-        self.helper_save_and_print_summary(summary)
+        summary = self._create_summary(results, successful_tasks)
+        self._save_and_print_summary(summary)
         return summary
 
-    def process_create_all_datasets_parallel(self, max_workers: Optional[int] = None) -> Dict[str, Any]:
+    def _create_all_datasets_parallel(self, max_workers: Optional[int] = None) -> Dict[str, Any]:
         """Parallel dataset creation using ProcessPoolExecutor"""
         self.logger.info("="*80)
         self.logger.info("STARTING PARALLEL ADAPTIVE DATASET CREATION")
@@ -935,11 +622,12 @@ class DatasetController:
             max_workers = min(multiprocessing.cpu_count(), 4)
         self.logger.info(f"Using up to {max_workers} parallel workers")
         
-        if not self._utility_validate_input_file():
+        if not self.validate_input_file():
             self.logger.error("Input file validation failed. Aborting.")
             return {"success": False, "results": []}
         
-        # In normal mode, only run non-OIE configurations
+        # OIE tasks must run sequentially. Non-OIE can run in parallel.
+        oie_configs = [c for c in RUN_CONFIGURATIONS if c.get("include_oie") and self.oie_available]
         non_oie_configs = [c for c in RUN_CONFIGURATIONS if not c.get("include_oie")]
         
         results = []
@@ -950,7 +638,7 @@ class DatasetController:
             self.logger.info(f"Running {len(non_oie_configs)} non-OIE configurations in parallel...")
             with ProcessPoolExecutor(max_workers=max_workers) as executor:
                 future_to_config = {
-                    executor.submit(helper_run_chunking_config_process, config, self.input_tsv_path, str(self.output_base_dir), auto_start_oie=False, embedding_model=COMMON_DEFAULTS["embedding_model"]): config
+                    executor.submit(run_chunking_config_process, config, self.input_tsv_path, str(self.output_base_dir), auto_start_oie=False): config
                     for config in non_oie_configs
                 }
                 for future in as_completed(future_to_config):
@@ -963,13 +651,18 @@ class DatasetController:
                         self.logger.error(f"Process for {config_name} generated an exception: {e}")
                         results.append({"config_name": config_name, "success": False, "error": str(e)})
 
-        # Note: OIE configurations are not run in normal mode
+        # Run OIE configurations sequentially
+        if oie_configs:
+            self.logger.info(f"Running {len(oie_configs)} OIE configurations sequentially...")
+            for config in oie_configs:
+                results.append(run_chunking_config_process(config, self.input_tsv_path, str(self.output_base_dir)))
+                if results[-1]["success"]: successful_tasks += 1
 
-        summary = self.helper_create_summary(results, successful_tasks)
-        self.helper_save_and_print_summary(summary)
+        summary = self._create_summary(results, successful_tasks)
+        self._save_and_print_summary(summary)
         return summary
 
-    def helper_get_compliance_rate(self, output_file: str) -> Optional[float]:
+    def _get_compliance_rate(self, output_file: str) -> Optional[float]:
         """Get compliance rate from output file."""
         try:
             if not os.path.exists(output_file): return None
@@ -979,7 +672,7 @@ class DatasetController:
                 self.logger.warning(f"Column 'chunk_text' not found in {output_file}. Cannot calculate compliance.")
                 return None
             df.dropna(subset=['chunk_text'], inplace=True)
-            chunk_token_counts = df['chunk_text'].apply(self._utility_count_tokens).tolist()
+            chunk_token_counts = df['chunk_text'].apply(self._count_tokens).tolist()
 
             if not chunk_token_counts: return 0.0
             
@@ -992,7 +685,7 @@ class DatasetController:
             self.logger.error(f"Error calculating compliance for {output_file}: {e}")
             return None
 
-    def helper_print_final_summary(self, summary: Dict[str, Any]) -> None:
+    def _print_final_summary(self, summary: Dict[str, Any]) -> None:
         """Print final summary to console"""
         self.logger.info("\n" + "="*80)
         self.logger.info("ADAPTIVE DATASET CREATION SUMMARY")
@@ -1020,7 +713,16 @@ class DatasetController:
     # ============================================================
     # New helper: Augment existing TSV bằng OIE song song
     # ============================================================
-    def process_augment_with_oie(self, source_tsv: str, threads: int = 8, chunk_rows: int = 1000) -> str:
+    def augment_with_oie(self, source_tsv: str, threads: int = 8, chunk_rows: int = 1000) -> str:
+        """Bổ sung trường raw_oie_data vào file TSV đã sinh từ bước *without_OIE*.
+
+        Args:
+            source_tsv:  Đường dẫn tới file TSV gốc.
+            threads:     Số luồng song song gửi request tới server OpenIE5.
+
+        Returns:
+            Đường dẫn tới file TSV mới ("*_with_OIE.tsv"). Chuỗi rỗng nếu lỗi.
+        """
         try:
             if not self.oie_available:
                 self._log_safe('error', 'OIE tool không khả dụng.')
@@ -1110,7 +812,7 @@ class DatasetController:
                 except ValueError:
                     up_perc, low_perc = 80, 20
 
-                filtered_path = self.helper_rank_and_filter_chunks(str(out_path), out_path.parent, upper_percentile=up_perc, lower_percentile=low_perc)
+                filtered_path = self._rank_and_filter_chunks(str(out_path), out_path.parent, upper_percentile=up_perc, lower_percentile=low_perc)
                 if filtered_path:
                     self._log_safe('warning', f"RRF filtered file saved to: {filtered_path}")
             except Exception as e:
@@ -1125,11 +827,11 @@ class DatasetController:
     # ============================================================
     # New high-level: Hai pha – chunk trước, OIE sau
     # ============================================================
-    def process_create_all_datasets_two_phase(self, *, non_oie_parallel: bool = True, max_workers: Optional[int] = None, oie_threads: int = 8):
+    def create_all_datasets_two_phase(self, *, non_oie_parallel: bool = True, max_workers: Optional[int] = None, oie_threads: int = 8):
         """Thực hiện 2 giai đoạn: (1) sinh chunks không OIE, (2) augment OIE."""
 
         # ---------------- PHA 1: without_OIE ----------------
-        phase1_controller = self  
+        phase1_controller = self  # dùng ngay instance hiện tại (đã tắt auto_start nếu cần) 
 
         configs_phase1 = [c for c in RUN_CONFIGURATIONS if not c.get('include_oie')]
         if not configs_phase1:
@@ -1145,7 +847,7 @@ class DatasetController:
             self._log_safe('info', f'Pha 1: chạy song song (max_workers={max_workers})')
 
             with ProcessPoolExecutor(max_workers=max_workers) as executor:
-                fut_to_cfg = {executor.submit(helper_run_chunking_config_process, cfg, phase1_controller.input_tsv_path, str(phase1_controller.output_base_dir), auto_start_oie=False, embedding_model=COMMON_DEFAULTS["embedding_model"]): cfg for cfg in configs_phase1}
+                fut_to_cfg = {executor.submit(run_chunking_config_process, cfg, phase1_controller.input_tsv_path, str(phase1_controller.output_base_dir), auto_start_oie=False): cfg for cfg in configs_phase1}
                 for fut in as_completed(fut_to_cfg):
                     result = fut.result()
                     results_phase1.append(result)
@@ -1183,7 +885,7 @@ class DatasetController:
             self._log_safe('info', f'Pha 2: augment {len(succ_file_paths)} file song song (workers={max_aug_workers})')
 
             with ProcessPoolExecutor(max_workers=max_aug_workers) as executor:
-                fut_to_src = {executor.submit(helper_run_augment_process, path, str(self.output_base_dir), oie_threads, COMMON_DEFAULTS["embedding_model"]): path for path in succ_file_paths}
+                fut_to_src = {executor.submit(run_augment_process, path, str(self.output_base_dir), oie_threads): path for path in succ_file_paths}
                 for fut in as_completed(fut_to_src):
                     try:
                         result_path = fut.result()
@@ -1205,19 +907,13 @@ class DatasetController:
             self._log_safe('error', 'Không thể tắt server OpenIE5.')
 
 # Process-based worker function for parallel execution
-def helper_run_chunking_config_process(config: dict, input_tsv_path: str, output_base_dir: str, *, auto_start_oie: bool = True, embedding_model: str = None) -> dict:
+def run_chunking_config_process(config: dict, input_tsv_path: str, output_base_dir: str, *, auto_start_oie: bool = True) -> dict:
     """Process-based worker function to run a single chunking configuration.
 
     auto_start_oie:
         Quyết định có tự khởi động server OIE5 trong tiến trình con hay không.
         Đối với giai đoạn without_OIE nên đặt False để tránh khởi động thừa.
-    embedding_model:
-        Model embedding để sử dụng, ghi đè COMMON_DEFAULTS nếu được cung cấp.
     """
-    # Update embedding model in subprocess if provided
-    if embedding_model:
-        COMMON_DEFAULTS["embedding_model"] = embedding_model
-    
     controller = DatasetController(input_tsv_path, output_base_dir, auto_start_oie=auto_start_oie)
     start_time = time.time()
         
@@ -1236,19 +932,15 @@ def helper_run_chunking_config_process(config: dict, input_tsv_path: str, output
 # Worker cho pha 2 – augment OIE song song
 # -------------------------------------------------------------------
 
-def helper_run_augment_process(source_tsv: str, output_base_dir: str, oie_threads: int, embedding_model: str = None) -> str:
+def run_augment_process(source_tsv: str, output_base_dir: str, oie_threads: int) -> str:
     """Process-based worker: augment single TSV with OIE and RRF filter."""
-    # Update embedding model in subprocess if provided
-    if embedding_model:
-        COMMON_DEFAULTS["embedding_model"] = embedding_model
-    
     controller = DatasetController(source_tsv, output_base_dir, auto_start_oie=False)
-    return controller.process_augment_with_oie(source_tsv, threads=oie_threads)
+    return controller.augment_with_oie(source_tsv, threads=oie_threads)
 
 # -------------------------------------------------------------------
 # MAIN ENTRY
 # -------------------------------------------------------------------
-def data_create_controller_main():
+def main():
     """Main function to run the adaptive controller"""
     global RUN_CONFIGURATIONS  # override inside main
     print("Integrated Adaptive Dataset Controller for Neural Ranking Models")
@@ -1262,42 +954,7 @@ def data_create_controller_main():
     
     output_base_dir = input("Enter output base directory (default: ./training_datasets): ").strip() or "./training_datasets"
     
-    # --- NEW: Embedding model selection ---
-    print(f"\nCurrent embedding model: {COMMON_DEFAULTS['embedding_model']}")
-    change_model = input("Do you want to change the embedding model? (y/n, default: n): ").strip().lower()
-    
-    if change_model == 'y':
-        # Create temporary controller to access utility methods
-        temp_controller = DatasetController.__new__(DatasetController)
-        
-        # Show quick presets first
-        temp_controller._utility_quick_model_switch()
-        
-        # If user wants more detailed selection
-        advanced = input("\nWant to see all models with details? (y/n): ").strip().lower()
-        if advanced == 'y':
-            temp_controller._utility_display_embedding_models()
-            model_choice = input("\nEnter model key manually: ").strip().lower()
-            if model_choice and model_choice in AVAILABLE_EMBEDDING_MODELS:
-                _utility_set_embedding_model(model_choice)
-                model_info = AVAILABLE_EMBEDDING_MODELS[model_choice]
-                print(f"Selected: {model_info['model_name']}")
-    
-    # Display final selected model
-    final_model = COMMON_DEFAULTS['embedding_model']
-    model_info = None
-    for info in AVAILABLE_EMBEDDING_MODELS.values():
-        if info["model_name"] == final_model:
-            model_info = info
-            break
-    
-    if model_info:
-        print(f"\nFinal embedding model: {final_model}")
-        print(f"   VRAM: ~{model_info['vram_gb']}GB | Dimensions: {model_info['dimensions']}")
-    else:
-        print(f"\nFinal embedding model: {final_model} (custom)")
-    
-    mode_choice = input("\nChạy hai pha Without→With OIE? (y/n, default: n): ").strip().lower()
+    mode_choice = input("Chạy hai pha Without→With OIE? (y/n, default: n): ").strip().lower()
     two_phase = mode_choice == 'y'
 
     parallel_choice = input("Use parallel processing cho pha chunk? (y/n, default: n): ").strip().lower()
@@ -1332,23 +989,15 @@ def data_create_controller_main():
     if low_perc_input.isdigit():
         os.environ["LOWER_PERCENTILE"] = low_perc_input
 
-    print(f"\nConfiguration confirmed. Using embedding model: {COMMON_DEFAULTS['embedding_model']}")
-    
-    if two_phase:
-        print("Mode: Two-phase processing (Without OIE → With OIE)")
-    else:
-        print("Mode: Single-phase processing (Without OIE only)")
-    
-    print("Starting process...")
+    print("\nConfiguration confirmed. Starting process...")
     
     try:
-        # In two-phase mode, don't start OIE server initially - it will be started in phase 2
-        controller = DatasetController(input_tsv_path, output_base_dir, auto_start_oie=False)
+        controller = DatasetController(input_tsv_path, output_base_dir, auto_start_oie=not two_phase)
 
         if two_phase:
-            controller.process_create_all_datasets_two_phase(non_oie_parallel=use_parallel, max_workers=max_workers)
+            controller.create_all_datasets_two_phase(non_oie_parallel=use_parallel, max_workers=max_workers)
         else:
-            controller.data_create_controller_main(use_parallel=use_parallel, max_workers=max_workers)
+            controller.create_all_datasets(use_parallel=use_parallel, max_workers=max_workers)
             
     except KeyboardInterrupt:
         print("\nInterrupted by user.")
@@ -1357,4 +1006,4 @@ def data_create_controller_main():
         traceback.print_exc()
 
 if __name__ == "__main__":
-    data_create_controller_main()
+    main()
