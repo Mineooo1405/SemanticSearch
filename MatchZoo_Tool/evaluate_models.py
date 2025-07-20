@@ -34,16 +34,7 @@ class ModelEvaluator:
         print(f"Đã tải test data: {len(self.test_pack_raw)} samples")
     
     def evaluate_model(self, model_dir: str, model_name: str) -> Dict:
-        """
-        Đánh giá một mô hình cụ thể với cải tiến xử lý embedding dimension
-        
-        Args:
-            model_dir: Đường dẫn đến thư mục chứa model và preprocessor
-            model_name: Tên mô hình để hiển thị
-            
-        Returns:
-            Dict chứa kết quả đánh giá
-        """
+
         print(f"\n--- Đánh giá mô hình: {model_name} ---")
         
         # Kiểm tra file tồn tại
@@ -309,10 +300,6 @@ class ModelEvaluator:
             print("Không có dữ liệu để hiển thị!")
             return
         
-        print("\n" + "="*80)
-        print("BẢNG SO SÁNH KẾT QUẢ CÁC MÔ HÌNH")
-        print("="*80)
-        
         # Chọn các metrics quan trọng nhất để hiển thị
         important_metrics = [
             'MeanAveragePrecision',
@@ -333,16 +320,15 @@ class ModelEvaluator:
             print(display_df.round(4))
         else:
             print(df.round(4))
+
         
-        print("\n" + "="*80)
         
         # Tìm mô hình tốt nhất
         if 'MeanAveragePrecision' in df.columns:
             best_model = df['MeanAveragePrecision'].idxmax()
             best_score = df.loc[best_model, 'MeanAveragePrecision']
-            print(f"MÔ HÌNH TỐT NHẤT: {best_model} (MAP: {best_score:.4f})")
-        
-        print("="*80)
+            print(f"MÔ HÌNH CÓ ĐIỂM CAO NHẤT: {best_model} (MAP: {best_score:.4f})")
+
     
     def save_results(self, df: pd.DataFrame, filename: str = 'evaluation_results.csv'):
         """Lưu kết quả vào file CSV"""
@@ -400,8 +386,6 @@ def main():
     
     # Lưu kết quả
     evaluator.save_results(results_df)
-    
-    print("\nHoàn thành đánh giá!")
 
 if __name__ == "__main__":
     main()
