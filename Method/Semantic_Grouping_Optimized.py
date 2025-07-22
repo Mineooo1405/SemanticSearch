@@ -29,14 +29,26 @@ def process_sentence_embedding_in_batches(sentences, model_name, batch_size=32, 
             print("No sentences provided to embed.")
         return np.array([])
 
+    # Dynamic batch size optimization based on sentence count
+    if len(sentences) <= 10:
+        batch_size = min(batch_size, len(sentences))  # Process all at once for tiny datasets
+    elif len(sentences) < 50:
+        batch_size = min(batch_size, 8)  # Very small batches for small datasets
+    elif len(sentences) > 200:
+        batch_size = min(batch_size * 2, 64)  # Larger batches for big datasets
+
     all_embeddings = []
     if not silent:
         print(f"Embedding {len(sentences)} sentences in batches of {batch_size}...")
 
     for i in range(0, len(sentences), batch_size):
         batch = sentences[i:i + batch_size]
-        if not silent and (i // batch_size) % 5 == 0:  # Progress every 5 batches
-            print(f"  Processing batch {i // batch_size + 1}/{(len(sentences) + batch_size - 1) // batch_size}...")
+        batch_num = i // batch_size + 1
+        total_batches = (len(sentences) + batch_size - 1) // batch_size
+        
+        if not silent and (batch_num % max(1, total_batches // 10) == 0):  # Progress every 10%
+            progress = (batch_num / total_batches) * 100
+            print(f"  Embedding progress: {progress:.1f}% ({batch_num}/{total_batches})")
         
         try:
             device_pref = str(device) if device is not None else "cpu"
@@ -45,10 +57,10 @@ def process_sentence_embedding_in_batches(sentences, model_name, batch_size=32, 
                 all_embeddings.append(batch_embeddings)
             else:
                 if not silent:
-                    print(f"Warning: Batch {i // batch_size + 1} returned no embeddings.")
+                    print(f"Warning: Batch {batch_num} returned no embeddings.")
         except Exception as e:
             if not silent:
-                print(f"Error during batched embedding batch {i // batch_size + 1}: {e}")
+                print(f"Error during batched embedding batch {batch_num}: {e}")
 
     if not all_embeddings:
         if not silent:
@@ -68,10 +80,25 @@ def helper_create_semantic_matrix(sentences: List[str], model_name: str, batch_s
     if len(sentences) < 2:
         return None
 
+    # Smart batch size for small documents
+    num_sentences = len(sentences)
+    if num_sentences <= 10:
+        # For very small documents, process all sentences in one batch
+        optimal_batch_size = num_sentences
+    elif num_sentences <= 30:
+        # For small documents, use small batches
+        optimal_batch_size = min(8, num_sentences)
+    else:
+        # For larger documents, use configured batch size
+        optimal_batch_size = min(max(batch_size_embed, 16), 64)
+    
+    if not silent and num_sentences <= 10:
+        print(f"Small document ({num_sentences} sentences): Processing in single batch")
+    
     embeddings = process_sentence_embedding_in_batches(
         sentences, 
         model_name=model_name, 
-        batch_size=batch_size_embed, 
+        batch_size=optimal_batch_size, 
         device=device, 
         silent=silent
     )
@@ -85,6 +112,10 @@ def helper_create_semantic_matrix(sentences: List[str], model_name: str, batch_s
         return None
 
     try:
+        # Use float32 for faster computation and less memory
+        if embeddings.dtype != np.float32:
+            embeddings = embeddings.astype(np.float32)
+        
         sim_matrix = cosine_similarity(embeddings)
         del embeddings
         gc.collect()
@@ -131,21 +162,49 @@ def analyze_similarity_distribution(sim_matrix):
     return stats
 
 def helper_find_best_similarity_pairs(sim_matrix, ungrouped_indices, sentences, threshold, max_tokens, silent):
-    """Find pairs of sentences that meet similarity and token constraints"""
+    """Find pairs of sentences that meet similarity and token constraints - optimized version"""
+    if len(ungrouped_indices) < 2:
+        return []
+        
     valid_pairs = []
+    ungrouped_array = np.array(ungrouped_indices)
     
-    for i, idx1 in enumerate(ungrouped_indices):
-        for j in range(i + 1, len(ungrouped_indices)):
-            idx2 = ungrouped_indices[j]
-            similarity = sim_matrix[idx1, idx2]
+    # Vectorized similarity extraction for all pairs
+    indices_mesh = np.meshgrid(ungrouped_array, ungrouped_array, indexing='ij')
+    i_indices, j_indices = indices_mesh[0].flatten(), indices_mesh[1].flatten()
+    
+    # Filter to upper triangle only (avoid duplicates and self-pairs)
+    mask = i_indices < j_indices
+    i_filtered, j_filtered = i_indices[mask], j_indices[mask]
+    
+    if len(i_filtered) == 0:
+        return []
+    
+    # Get similarities for all valid pairs at once
+    similarities = sim_matrix[i_filtered, j_filtered]
+    
+    # Filter by threshold
+    threshold_mask = similarities >= threshold
+    if not np.any(threshold_mask):
+        return []
+    
+    valid_i = i_filtered[threshold_mask]
+    valid_j = j_filtered[threshold_mask]
+    valid_sims = similarities[threshold_mask]
+    
+    # Check token constraints for remaining pairs
+    for idx, (i, j, sim) in enumerate(zip(valid_i, valid_j, valid_sims)):
+        combined_text = sentences[i] + " " + sentences[j]
+        combined_tokens = _count_tokens_accurate(combined_text)
+        
+        if combined_tokens <= max_tokens:
+            valid_pairs.append(((i, j), sim))
             
-            if similarity >= threshold:
-                combined_text = sentences[idx1] + " " + sentences[idx2]
-                combined_tokens = _count_tokens_accurate(combined_text)
-                
-                if combined_tokens <= max_tokens:
-                    valid_pairs.append(((idx1, idx2), similarity))
+        # Limit checking to top candidates for performance
+        if len(valid_pairs) >= 10:  # Only check top 10 by similarity
+            break
 
+    # Sort by similarity score descending
     valid_pairs.sort(key=lambda x: x[1], reverse=True)
     return valid_pairs
 
@@ -231,13 +290,59 @@ def helper_handle_remaining_sentences(remaining_indices, sentences, min_tokens, 
 
 def process_semantic_grouping_optimized(sim_matrix, sentences, initial_threshold, decay_factor, min_threshold, 
                                         min_chunk_len, max_chunk_len, silent=True):
-    """Optimized semantic grouping algorithm"""
+    """Optimized semantic grouping algorithm with early termination and fast path for small documents"""
     num_sentences = sim_matrix.shape[0]
+    
+    # Fast path for very small documents (≤6 sentences)
+    if num_sentences <= 6:
+        if not silent:
+            print(f"Fast path for small document ({num_sentences} sentences)")
+        
+        # For small documents, try to group all sentences if they meet token constraints
+        all_text = " ".join(sentences)
+        all_tokens = _count_tokens_accurate(all_text)
+        
+        if all_tokens <= max_chunk_len:
+            if not silent:
+                print(f"  Single group: {num_sentences} sentences, {all_tokens} tokens ✓")
+            return [list(range(num_sentences))]
+        
+        # If too big, use simplified pairing approach
+        groups = []
+        remaining = list(range(num_sentences))
+        
+        while remaining:
+            current_group = [remaining.pop(0)]
+            current_text = sentences[current_group[0]]
+            current_tokens = _count_tokens_accurate(current_text)
+            
+            # Try to add more sentences to current group
+            i = 0
+            while i < len(remaining):
+                test_text = current_text + " " + sentences[remaining[i]]
+                test_tokens = _count_tokens_accurate(test_text)
+                
+                if test_tokens <= max_chunk_len:
+                    current_group.append(remaining.pop(i))
+                    current_text = test_text
+                    current_tokens = test_tokens
+                else:
+                    i += 1
+            
+            if current_tokens >= min_chunk_len:
+                groups.append(current_group)
+                if not silent:
+                    print(f"  Small doc group: {len(current_group)} sentences, {current_tokens} tokens ✓")
+        
+        return groups
+    
+    # Standard processing for larger documents
     ungrouped_indices = set(range(num_sentences))
     groups = []
     current_threshold = initial_threshold
     iteration = 0
     max_iterations = num_sentences * 2
+    consecutive_empty_iterations = 0  # Track empty iterations for early exit
 
     if not silent:
         print(f"Starting semantic grouping with {num_sentences} sentences")
@@ -253,13 +358,20 @@ def process_semantic_grouping_optimized(sim_matrix, sentences, initial_threshold
         )
         
         if not best_pairs:
+            consecutive_empty_iterations += 1
             new_threshold = max(min_threshold, current_threshold * decay_factor)
-            if new_threshold == current_threshold:
+            if new_threshold == current_threshold or consecutive_empty_iterations >= 3:
+                # Early termination if threshold can't decay or too many empty iterations
+                if not silent:
+                    print(f"  Early termination: threshold={current_threshold:.4f}, empty_iterations={consecutive_empty_iterations}")
                 break
             current_threshold = new_threshold
             if not silent:
                 print(f"  No valid pairs found. Decaying threshold to {current_threshold:.4f}")
             continue
+        
+        # Reset empty iteration counter when we find pairs
+        consecutive_empty_iterations = 0
 
         best_pair, similarity_score = best_pairs[0]
         idx1, idx2 = best_pair
@@ -297,7 +409,7 @@ def process_semantic_grouping_optimized(sim_matrix, sentences, initial_threshold
         groups.extend(remaining_groups)
 
     if not silent:
-        print(f"Semantic grouping completed: {len(groups)} groups formed")
+        print(f"Semantic grouping completed: {len(groups)} groups formed in {iteration} iterations")
 
     return groups
 

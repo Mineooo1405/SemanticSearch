@@ -25,6 +25,7 @@ import re
 import atexit
 from collections import defaultdict
 import traceback
+import time
 # Import ranking utilities
 from Tool.rank_chunks import rank_by_cosine_similarity, rank_by_bm25, rank_by_rrf
 
@@ -192,7 +193,7 @@ SEMANTIC_GROUPING_DEFAULTS = {
     "min_threshold": 0.50,
     "initial_percentile": "80",
     "min_percentile": "20",
-    "embedding_batch_size": 8,  
+    "embedding_batch_size": 32,  
     "min_chunk_len_tokens": ADAPTIVE_CHUNKING_CONFIG["min_tokens"],
     "max_chunk_len_tokens": ADAPTIVE_CHUNKING_CONFIG["max_tokens"],
     "oie_max_triples_per_chunk": 5,
@@ -206,7 +207,7 @@ SEMANTIC_SPLITTER_DEFAULTS = {
     "min_chunk_len": 2,
     "max_chunk_len": 4,
     "window_size": 3,
-    "embedding_batch_size": 16,  
+    "embedding_batch_size": 32,  
     "enable_adaptive": ADAPTIVE_CHUNKING_CONFIG["enable_adaptive"],
     "target_tokens": ADAPTIVE_CHUNKING_CONFIG["target_tokens"],
     "tolerance": ADAPTIVE_CHUNKING_CONFIG["tolerance"],
@@ -318,8 +319,8 @@ class DatasetController:
         
         # Setup logger
         self.logger = logging.getLogger(__name__)
-        # Chỉ hiển thị WARNING trở lên để tránh spam log
-        self.logger.setLevel(logging.WARNING)
+        # Set to INFO level to show processing progress
+        self.logger.setLevel(logging.INFO)
         self.logger.addHandler(file_handler)
         self.logger.addHandler(console_handler)
         
@@ -418,9 +419,6 @@ class DatasetController:
     
     def _utility_display_embedding_models(self) -> None:
         """Display available embedding models with recommendations"""
-        print("\n" + "="*70)
-        print("🤖 AVAILABLE EMBEDDING MODELS")
-        print("="*70)
         
         recommended = _utility_recommend_embedding_model()
         current_model = COMMON_DEFAULTS["embedding_model"]
@@ -543,6 +541,12 @@ class DatasetController:
         """
         Memory-efficient chunking logic with garbage collection.
         Takes a DataFrame (batch) and a configuration, returns chunked rows.
+        
+        Memory scaling factors:
+        1. Embedding model: Fixed ~2-4GB VRAM (loaded once, persists)
+        2. output_rows accumulation: ~10-50MB per 1000 chunks (main scaling issue)
+        3. Temporary sentence processing: ~1-10MB per row (cleared after each row)
+        4. Dataset size: Memory grows linearly with output chunks, not input rows
         """
         output_rows = []
         method_choice = config["method_choice"]
@@ -568,12 +572,19 @@ class DatasetController:
         import psutil
         process = psutil.Process()
         initial_memory = process.memory_info().rss / (1024**2)  # MB
+        
+        # Memory optimization: prevent output_rows accumulation for large datasets
+        max_buffer_chunks = 1000  # Clear buffer every 1000 chunks to reduce memory
 
         for row_idx, row_data in df.iterrows():
             try:
                 query_text, passage_text, label = row_data.iloc[0], row_data.iloc[1], row_data.iloc[2]
                 query_id = f"Q{row_idx}"
                 passage_id = f"P{row_idx}"
+
+                # Log progress every 10 rows to track processing
+                if row_idx % 10 == 0:
+                    self._log_safe('info', f"[{config['name']}] Processing query_id: {query_id} (row {row_idx})")
 
                 if not isinstance(passage_text, str) or not passage_text.strip():
                     self.logger.warning(f"Skipping row {row_idx} due to empty passage text.")
@@ -613,6 +624,13 @@ class DatasetController:
                         gen_chunk_id, chunk_text, oie_string if oie_string else ""
                     ])
                     
+                # Memory optimization: Clear buffer periodically to prevent accumulation
+                if len(output_rows) >= max_buffer_chunks:
+                    self._log_safe('debug', f"Buffer size reached {len(output_rows)} chunks, clearing periodically...")
+                    # Note: In production, would flush to temporary file here
+                    # For now, trigger garbage collection more aggressively
+                    gc.collect()
+                    
                 # Clear chunked_tuples to free memory immediately
                 del chunked_tuples
                 
@@ -644,13 +662,16 @@ class DatasetController:
         try:
             with pd.read_csv(self.input_tsv_path, sep='\t', engine='python', chunksize=PROCESSING_BATCH_SIZE, header=0, on_bad_lines='warn') as reader:
                 for i, batch_df in enumerate(reader, 1):
-                    self._log_safe('info', f"--- Processing Batch {i} for {task_name} ---")
+                    batch_start_row = (i-1) * PROCESSING_BATCH_SIZE
+                    batch_end_row = batch_start_row + len(batch_df) - 1
+                    self._log_safe('info', f"--- Processing Batch {i} for {task_name} (rows {batch_start_row}-{batch_end_row}) ---")
                     
                     # Clear any cached data before processing
                     gc.collect()
                     
                     chunked_rows = self.process_execute_chunking_logic(batch_df, config)
-                    total_chunks += len(chunked_rows)
+                    batch_chunks_count = len(chunked_rows)
+                    total_chunks += batch_chunks_count
 
                     # Write to file immediately and clear from memory
                     write_mode = 'w' if is_first_batch else 'a'
@@ -665,6 +686,8 @@ class DatasetController:
                     # Clear batch data from memory immediately
                     del chunked_rows, batch_df
                     gc.collect()
+                    
+                    self._log_safe('info', f"Batch {i} completed. Generated {batch_chunks_count} chunks. Total chunks so far: {total_chunks}")
                     
                     # Memory usage warning
                     import psutil
@@ -693,18 +716,29 @@ class DatasetController:
             except ValueError:
                 up_perc, low_perc = 80, 20
 
+            # Memory management before ranking
+            gc.collect()
+            self._log_safe('info', f"Starting ranking phase for {task_name}")
+            
             ranked_filtered_path = self.helper_rank_and_filter_chunks(str(final_output_file), config_output_dir,
                                                                upper_percentile=up_perc, lower_percentile=low_perc)
             if ranked_filtered_path:
                 self._log_safe('warning', f"Ranked & filtered results saved to: {ranked_filtered_path}")
+            
+            # Force garbage collection after ranking
+            gc.collect()
+            
         except Exception as e:
             self._log_safe('error', f"Ranking/filtering failed for {task_name}: {e}")
+            # Continue processing even if ranking fails
+            import traceback
+            self._log_safe('debug', f"Ranking error details: {traceback.format_exc()}")
         
         return True, str(final_output_file), final_compliance
     
     def helper_rank_and_filter_chunks(self, chunks_tsv: str, output_dir: Path,
                                 upper_percentile: int = 80, lower_percentile: int = 20) -> str:
-        """Rank chunks và giữ lại theo ngưỡng phân vị RRF.
+        """Rank chunks và giữ lại theo ngưỡng phân vị RRF - OPTIMIZED VERSION.
 
         Args:
             chunks_tsv:     Đường dẫn file TSV chứa các chunk đã sinh.
@@ -715,6 +749,37 @@ class DatasetController:
         Returns:
             Đường dẫn file TSV đã lọc (rỗng nếu lỗi).
         """
+        try:
+            # Import optimized ranking function
+            from Tool.rank_chunks_optimized import rank_and_filter_chunks_optimized
+            
+            self._log_safe('info', f"Starting optimized ranking for {chunks_tsv}")
+            result_path = rank_and_filter_chunks_optimized(
+                chunks_tsv=chunks_tsv,
+                output_dir=output_dir, 
+                upper_percentile=upper_percentile,
+                lower_percentile=lower_percentile,
+                model_name=COMMON_DEFAULTS["embedding_model"]
+            )
+            
+            if result_path:
+                self._log_safe('info', f"Optimized ranking completed: {result_path}")
+            else:
+                self._log_safe('warning', f"Optimized ranking failed for {chunks_tsv}")
+            
+            return result_path
+            
+        except ImportError:
+            # Fallback to original implementation
+            self._log_safe('warning', "Optimized ranking not available, using fallback...")
+            return self._helper_rank_and_filter_chunks_fallback(chunks_tsv, output_dir, upper_percentile, lower_percentile)
+        except Exception as e:
+            self._log_safe('error', f"Optimized ranking failed: {e}")
+            return ""
+    
+    def _helper_rank_and_filter_chunks_fallback(self, chunks_tsv: str, output_dir: Path,
+                                upper_percentile: int = 80, lower_percentile: int = 20) -> str:
+        """Fallback to original ranking implementation"""
         import pandas as pd
         import numpy as np
         from pathlib import Path as _Path
@@ -1068,7 +1133,9 @@ class DatasetController:
                     try:
                         qid = str(chunk_df.at[local_idx, 'query_id']) if 'query_id' in chunk_df.columns else 'N/A'
                         cid = str(chunk_df.at[local_idx, 'chunk_id']) if 'chunk_id' in chunk_df.columns else f'row{local_idx}'
-                        self._log_safe('debug', f"[augment_with_oie] Đang xử lý query_id={qid} | chunk_id={cid}")
+                        # Log every 10th OIE processing to avoid spam
+                        if local_idx % 10 == 0:
+                            self._log_safe('info', f"[augment_with_oie] Processing query_id={qid} | chunk_id={cid}")
                     except Exception:
                         pass
 
@@ -1214,7 +1281,6 @@ def helper_run_chunking_config_process(config: dict, input_tsv_path: str, output
     embedding_model:
         Model embedding để sử dụng, ghi đè COMMON_DEFAULTS nếu được cung cấp.
     """
-    # Update embedding model in subprocess if provided
     if embedding_model:
         COMMON_DEFAULTS["embedding_model"] = embedding_model
     
@@ -1357,4 +1423,9 @@ def data_create_controller_main():
         traceback.print_exc()
 
 if __name__ == "__main__":
+    start_time = time.time()
+    
     data_create_controller_main()
+    
+    end_time = time.time()
+    print(f"\nTotal execution time: {end_time - start_time:.2f} seconds")

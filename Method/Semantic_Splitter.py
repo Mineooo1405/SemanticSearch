@@ -11,6 +11,7 @@ from Tool.OIE import extract_relations_from_paragraph
 # --- Semantic embedding imports ---
 import numpy as np
 from Tool.Sentence_Embedding import sentence_embedding as embed_text_list
+from sklearn.metrics.pairwise import cosine_similarity
 import hashlib
 import traceback
 from datetime import datetime
@@ -98,7 +99,8 @@ def split_by_sentence_optimized(
                     device_preference=device_pref,
                 )
             )
-            # Normalize for cosine similarity
+            # Note: cosine_similarity handles normalization internally, 
+            # but pre-normalization can still improve numerical stability
             norms = np.linalg.norm(embeddings, axis=1, keepdims=True)
             norms[norms == 0] = 1e-9
             embeddings = embeddings / norms
@@ -147,7 +149,10 @@ def split_by_sentence_optimized(
             and embeddings is not None
         ):
             last_idx = current_group_indices[-1]
-            sim_val = float(np.dot(embeddings[last_idx], embeddings[i]))
+            sim_val = float(cosine_similarity(
+                embeddings[last_idx].reshape(1, -1), 
+                embeddings[i].reshape(1, -1)
+            )[0, 0])
             if sim_val < semantic_threshold:
                 # Finish current chunk before adding new sentence
                 chunk_text = " ".join(current_chunk_sentences)
