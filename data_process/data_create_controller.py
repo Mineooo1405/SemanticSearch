@@ -1,6 +1,7 @@
 import subprocess
 import os
 import sys
+import psutil
 
 # Ensure the project root is in the Python path
 project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
@@ -9,6 +10,7 @@ if project_root not in sys.path:
     
 import json
 import pandas as pd
+import pandas as _pd  # For helper functions
 import numpy as np
 import gc
 from typing import Dict, List, Any, Tuple, Optional
@@ -38,12 +40,12 @@ from Method.Text_Splitter import chunk_passage_text_splitter
 try:
     from Tool.OIE import extract_relations_from_paragraph
     OIE_AVAILABLE_GLOBALLY = True
-    print("[DEBUG] OIE tool imported successfully")
+    #print("[DEBUG] OIE tool imported successfully")
 except (ImportError, Exception) as e:
     print(f"[DEBUG] OIE import failed: {e}")
     extract_relations_from_paragraph = None
     OIE_AVAILABLE_GLOBALLY = False
-
+import importlib
 try:
     from Tool.Sentence_Embedding import sentence_embedding  # noqa: F401  # type: ignore
 except ImportError:
@@ -56,6 +58,16 @@ try:
     csv.field_size_limit(sys.maxsize)
 except OverflowError:
     csv.field_size_limit(int(2**30))
+    
+try:
+    torch_directml = importlib.import_module("torch_directml")
+    if not (hasattr(torch_directml, 'is_available') and callable(torch_directml.is_available) and
+            hasattr(torch_directml, 'device') and callable(torch_directml.device)):
+        torch_directml = None
+except ImportError:
+    torch_directml = None
+except Exception:
+    torch_directml = None
 
 # --- Configuration for the controller ---
 PYTHON_EXECUTABLE = sys.executable
@@ -113,6 +125,149 @@ def _utility_recommend_embedding_model():
     except ImportError:
         return "minilm-l6"  # Most conservative option
 
+def _utility_calculate_optimal_ranking_workers():
+    """Calculate optimal worker count specifically for ranking operations"""
+    try:
+        import psutil
+        available_ram_gb = psutil.virtual_memory().available / (1024**3)
+        
+        # Ranking is memory-intensive, use conservative approach
+        # Each ranking worker needs ~1.5GB for embedding operations
+        memory_per_ranking_worker = 1.5  # GB
+        max_by_memory = max(1, int((available_ram_gb * 0.6) / memory_per_ranking_worker))
+        
+        # Cap at 4 workers for ranking efficiency (diminishing returns beyond this)
+        optimal_ranking_workers = min(multiprocessing.cpu_count() // 2, max_by_memory, 4)
+        
+        return max(1, optimal_ranking_workers)
+    except ImportError:
+        return 2  # Conservative default
+
+def _utility_calculate_total_vram_requirement(num_workers: int, embedding_model: str = None) -> float:
+    """Calculate total VRAM requirement for multiple workers with dedicated embedding models
+    
+    Args:
+        num_workers: Number of workers
+        embedding_model: Embedding model name (uses default if None)
+        
+    Returns:
+        Total VRAM requirement in GB
+    """
+    if embedding_model is None:
+        embedding_model = COMMON_DEFAULTS["embedding_model"]
+    
+    # Find VRAM requirement for the model
+    model_vram = 2.0  # Default fallback
+    for model_info in AVAILABLE_EMBEDDING_MODELS.values():
+        if model_info["model_name"] == embedding_model:
+            model_vram = model_info["vram_gb"]
+            break
+    
+    # Calculate total VRAM: each worker gets its own model + buffer
+    buffer_per_worker = 0.5  # GB buffer per worker
+    total_vram = num_workers * (model_vram + buffer_per_worker)
+    
+    return total_vram
+
+def _utility_check_vram_capacity(num_workers: int, embedding_model: str = None) -> dict:
+    """Check if system has enough VRAM for multiple workers
+    
+    Args:
+        num_workers: Number of workers
+        embedding_model: Embedding model name
+        
+    Returns:
+        Dictionary with capacity info
+    """
+    try:
+        import torch
+        if not torch.cuda.is_available():
+            return {
+                "has_gpu": False,
+                "recommendation": "Use CPU processing or install CUDA PyTorch",
+                "total_vram_gb": 0,
+                "required_vram_gb": 0
+            }
+        
+        # Get GPU info
+        total_vram_gb = torch.cuda.get_device_properties(0).total_memory / (1024**3)
+        required_vram_gb = _utility_calculate_total_vram_requirement(num_workers, embedding_model)
+        
+        has_capacity = total_vram_gb >= required_vram_gb
+        utilization_percent = (required_vram_gb / total_vram_gb) * 100
+        
+        return {
+            "has_gpu": True,
+            "has_capacity": has_capacity,
+            "total_vram_gb": total_vram_gb,
+            "required_vram_gb": required_vram_gb,
+            "utilization_percent": utilization_percent,
+            "recommendation": _get_vram_recommendation(has_capacity, utilization_percent, num_workers)
+        }
+    except ImportError:
+        return {
+            "has_gpu": False,
+            "recommendation": "PyTorch not available - use CPU processing",
+            "total_vram_gb": 0,
+            "required_vram_gb": 0
+        }
+
+def _get_vram_recommendation(has_capacity: bool, utilization_percent: float, num_workers: int) -> str:
+    """Get VRAM usage recommendation"""
+    if not has_capacity:
+        return f"Insufficient VRAM! Reduce workers to {max(1, num_workers//2)} or use smaller model"
+    elif utilization_percent > 85:
+        return f"High VRAM usage ({utilization_percent:.1f}%). Consider reducing workers or batch size"
+    elif utilization_percent > 70:
+        return f"Moderate VRAM usage ({utilization_percent:.1f}%). Good for performance"
+    else:
+        return f"Low VRAM usage ({utilization_percent:.1f}%). Can potentially increase workers"
+
+def _utility_monitor_gpu_usage():
+    """Monitor GPU memory usage including DirectML support"""
+    try:
+        import torch
+        
+        # Try DirectML first (for AMD GPUs)
+        try:
+            import torch_directml
+            if torch_directml.is_available():
+                device_count = torch_directml.device_count()
+                return {
+                    "type": "DirectML",
+                    "device_count": device_count,
+                    "device_name": torch_directml.device_name(0) if device_count > 0 else "Unknown DirectML Device",
+                    "available": True,
+                    "note": "DirectML memory monitoring limited"
+                }
+        except ImportError:
+            pass
+        
+        # Check CUDA GPUs
+        if torch.cuda.is_available():
+            gpu_count = torch.cuda.device_count()
+            usage_info = {"type": "CUDA"}
+            
+            for i in range(gpu_count):
+                props = torch.cuda.get_device_properties(i)
+                allocated = torch.cuda.memory_allocated(i) / (1024**3)  # GB
+                reserved = torch.cuda.memory_reserved(i) / (1024**3)   # GB
+                total = props.total_memory / (1024**3)                  # GB
+                
+                usage_info[f"gpu_{i}"] = {
+                    "allocated_gb": allocated,
+                    "reserved_gb": reserved, 
+                    "total_gb": total,
+                    "utilization_percent": (allocated / total) * 100,
+                    "device_name": props.name
+                }
+            
+            return usage_info
+        else:
+            return {"type": "CPU", "error": "No GPUs available - using CPU"}
+    except ImportError:
+        return {"error": "PyTorch not available"}
+
 def _utility_set_embedding_model(model_key: str) -> bool:
     """Set the embedding model in COMMON_DEFAULTS"""
     if model_key in AVAILABLE_EMBEDDING_MODELS:
@@ -126,7 +281,7 @@ PROCESSING_BATCH_SIZE = _utility_calculate_optimal_batch_size()  # Dynamic batch
 COMMON_DEFAULTS = {
     "base_output_dir": "./training_datasets",
     "embedding_model": "thenlper/gte-base",  # Default balanced model
-    "device_preference": ""  # Empty for auto-detection
+    "device_preference": "dml"  # Empty for auto-detection
 }
 
 # Available embedding models with memory requirements
@@ -274,11 +429,13 @@ RUN_CONFIGURATIONS = [
 
 class DatasetController:
 
-    def __init__(self, input_tsv_path: str, output_base_dir: str = "training_datasets", *, auto_start_oie: bool = True):
+    def __init__(self, input_tsv_path: str, output_base_dir: str = "training_datasets", *, 
+                 auto_start_oie: bool = True, silent_mode: bool = False):
         self.input_tsv_path = input_tsv_path
         self.output_base_dir = Path(output_base_dir)
         self.output_base_dir.mkdir(exist_ok=True)
         self._auto_start_oie = auto_start_oie  # lưu lại tuỳ chọn
+        self._silent_mode = silent_mode  # Skip verbose logging in worker processes
         
         # Memory safety check
         import psutil
@@ -343,11 +500,13 @@ class DatasetController:
         if model_info:
             self._log_safe('info', f"Embedding Model: {current_model}")
             self._log_safe('info', f"VRAM Required: ~{model_info['vram_gb']}GB | Dimensions: {model_info['dimensions']}")
-            # Also print to console for immediate visibility
-            print(f"[PROCESS] Using embedding model: {current_model}")
+            # Also print to console for immediate visibility (only in main process)
+            if not self._silent_mode:
+                print(f"[PROCESS] Using embedding model: {current_model}")
         else:
             self._log_safe('info', f"Embedding Model: {current_model} (custom model)")
-            print(f"[PROCESS] Using embedding model: {current_model} (custom model)")
+            if not self._silent_mode:
+                print(f"[PROCESS] Using embedding model: {current_model} (custom model)")
         
         # Validate OIE availability
         self.oie_available = OIE_AVAILABLE_GLOBALLY
@@ -372,7 +531,8 @@ class DatasetController:
 
     def _log_safe(self, level: str, message: str):
         """Helper to log messages without emoji processing"""
-        getattr(self.logger, level.lower(), self.logger.info)(message)
+        if not self._silent_mode:  # Only log if not in silent mode
+            getattr(self.logger, level.lower(), self.logger.info)(message)
     
     def _utility_memory_status(self) -> dict:
         """Get current memory status for monitoring"""
@@ -644,8 +804,81 @@ class DatasetController:
         
         return output_rows
 
-    def _run_single_config(self, config: dict) -> Tuple[bool, str, Optional[float]]:
-        """Runs a single data creation configuration, processing in batches."""
+    def _process_batches_parallel(self, batches: List[Tuple[int, pd.DataFrame]], config: dict, 
+                                 config_workers: int, task_name: str) -> List[List[List[Any]]]:
+        """Process batches in parallel for a single config
+        
+        Args:
+            batches: List of (batch_number, dataframe) tuples
+            config: Configuration dictionary
+            config_workers: Number of workers to use for this config
+            task_name: Name of the task for logging
+            
+        Returns:
+            List of chunked rows for each batch
+        """
+        from concurrent.futures import ProcessPoolExecutor, as_completed
+        import multiprocessing
+        
+        self._log_safe('info', f"Processing {len(batches)} batches with {config_workers} workers for {task_name}")
+        
+        # Limit workers to available batches and system resources
+        effective_workers = min(config_workers, len(batches), multiprocessing.cpu_count())
+        self._log_safe('info', f"Using {effective_workers} effective workers for {len(batches)} batches")
+        
+        # Get current embedding model for workers
+        current_embedding_model = COMMON_DEFAULTS["embedding_model"]
+        self._log_safe('info', f"Each worker will use dedicated embedding model: {current_embedding_model}")
+        
+        # Store results in order
+        batch_results = [None] * len(batches)
+        
+        with ProcessPoolExecutor(max_workers=effective_workers) as executor:
+            # Submit all batches with dedicated embedding model for each worker
+            future_to_batch = {}
+            worker_counter = 0
+            
+            for batch_num, batch_df in batches:
+                worker_id = worker_counter % effective_workers + 1  # Assign worker ID (1, 2, 3...)
+                future = executor.submit(
+                    helper_process_single_batch, 
+                    batch_df, 
+                    config, 
+                    batch_num,
+                    embedding_model=current_embedding_model,  # Pass embedding model to each worker
+                    worker_id=worker_id
+                )
+                future_to_batch[future] = batch_num - 1
+                worker_counter += 1
+            
+            # Collect results
+            completed_count = 0
+            for future in as_completed(future_to_batch):
+                batch_index = future_to_batch[future]
+                completed_count += 1
+                
+                try:
+                    chunked_rows = future.result()
+                    batch_results[batch_index] = chunked_rows
+                    chunk_count = len(chunked_rows) if chunked_rows else 0
+                    self._log_safe('info', f"Batch {batch_index + 1} completed: {chunk_count} chunks ({completed_count}/{len(batches)})")
+                except Exception as e:
+                    self._log_safe('error', f"Batch {batch_index + 1} failed: {e}")
+                    batch_results[batch_index] = []
+        
+        # Return results maintaining batch order
+        return batch_results
+        return output_rows
+
+    def _run_single_config(self, config: dict, ranking_workers: Optional[int] = None, 
+                          config_workers: Optional[int] = None) -> Tuple[bool, str, Optional[float]]:
+        """Runs a single data creation configuration, processing in batches.
+        
+        Args:
+            config: Configuration dictionary for the chunking task
+            ranking_workers: Number of workers for ranking phase (None = auto-calculate)
+            config_workers: Number of workers for this specific config (None = sequential processing)
+        """
         task_name = config["name"]
         self._log_safe('info', f"Starting task: {task_name} | {config['description']}")
         
@@ -660,42 +893,66 @@ class DatasetController:
         total_chunks = 0
 
         try:
-            with pd.read_csv(self.input_tsv_path, sep='\t', engine='python', chunksize=PROCESSING_BATCH_SIZE, header=0, on_bad_lines='warn') as reader:
-                for i, batch_df in enumerate(reader, 1):
-                    batch_start_row = (i-1) * PROCESSING_BATCH_SIZE
-                    batch_end_row = batch_start_row + len(batch_df) - 1
-                    self._log_safe('info', f"--- Processing Batch {i} for {task_name} (rows {batch_start_row}-{batch_end_row}) ---")
-                    
-                    # Clear any cached data before processing
-                    gc.collect()
-                    
-                    chunked_rows = self.process_execute_chunking_logic(batch_df, config)
-                    batch_chunks_count = len(chunked_rows)
-                    total_chunks += batch_chunks_count
+            # Collect all batches first if using parallel processing
+            if config_workers and config_workers > 1:
+                self._log_safe('info', f"Using {config_workers} workers for config {task_name}")
+                batches = []
+                with pd.read_csv(self.input_tsv_path, sep='\t', engine='python', chunksize=PROCESSING_BATCH_SIZE, header=0, on_bad_lines='warn') as reader:
+                    for i, batch_df in enumerate(reader, 1):
+                        batches.append((i, batch_df))
+                
+                # Process batches in parallel
+                all_chunked_rows = self._process_batches_parallel(batches, config, config_workers, task_name)
+                
+                # Write all results
+                total_chunks = 0
+                with open(final_output_file, 'w', encoding='utf-8', newline='') as f:
+                    writer = csv.writer(f, delimiter='\t')
+                    writer.writerow(['query_id', 'query_text', 'passage_id', 'original_passage', 'label', 'chunk_id', 'chunk_text', 'raw_oie_data'])
+                    for batch_chunks in all_chunked_rows:
+                        if batch_chunks:
+                            writer.writerows(batch_chunks)
+                            total_chunks += len(batch_chunks)
+                
+                self._log_safe('info', f"Parallel processing completed. Total chunks: {total_chunks}")
+            else:
+                # Sequential processing (original logic)
+                with pd.read_csv(self.input_tsv_path, sep='\t', engine='python', chunksize=PROCESSING_BATCH_SIZE, header=0, on_bad_lines='warn') as reader:
+                    for i, batch_df in enumerate(reader, 1):
+                        batch_start_row = (i-1) * PROCESSING_BATCH_SIZE
+                        batch_end_row = batch_start_row + len(batch_df) - 1
+                        self._log_safe('info', f"--- Processing Batch {i} for {task_name} (rows {batch_start_row}-{batch_end_row}) ---")
+                        
+                        # Clear any cached data before processing
+                        gc.collect()
+                        
+                        chunked_rows = self.process_execute_chunking_logic(batch_df, config)
+                        batch_chunks_count = len(chunked_rows)
+                        total_chunks += batch_chunks_count
 
-                    # Write to file immediately and clear from memory
-                    write_mode = 'w' if is_first_batch else 'a'
-                    with open(final_output_file, write_mode, encoding='utf-8', newline='') as f:
-                        writer = csv.writer(f, delimiter='\t')
-                        if is_first_batch:
-                            writer.writerow(['query_id', 'query_text', 'passage_id', 'original_passage', 'label', 'chunk_id', 'chunk_text', 'raw_oie_data'])
-                            is_first_batch = False
-                        if chunked_rows:
-                            writer.writerows(chunked_rows)
-                    
-                    # Clear batch data from memory immediately
-                    del chunked_rows, batch_df
-                    gc.collect()
-                    
-                    self._log_safe('info', f"Batch {i} completed. Generated {batch_chunks_count} chunks. Total chunks so far: {total_chunks}")
-                    
-                    # Memory usage warning
-                    import psutil
-                    memory_usage = psutil.virtual_memory().percent
-                    if memory_usage > 85:
-                        self._log_safe('warning', f"High RAM usage: {memory_usage:.1f}%. Consider reducing batch size.")
-            
-            self._log_safe('info', f"Total chunks generated for {task_name}: {total_chunks}")
+                        # Write to file immediately and clear from memory
+                        write_mode = 'w' if is_first_batch else 'a'
+                        with open(final_output_file, write_mode, encoding='utf-8', newline='') as f:
+                            writer = csv.writer(f, delimiter='\t')
+                            if is_first_batch:
+                                writer.writerow(['query_id', 'query_text', 'passage_id', 'original_passage', 'label', 'chunk_id', 'chunk_text', 'raw_oie_data'])
+                                is_first_batch = False
+                            if chunked_rows:
+                                writer.writerows(chunked_rows)
+                        
+                        # Clear batch data from memory immediately
+                        del chunked_rows, batch_df
+                        gc.collect()
+                        
+                        self._log_safe('info', f"Batch {i} completed. Generated {batch_chunks_count} chunks. Total chunks so far: {total_chunks}")
+                        
+                        # Memory usage warning
+                        import psutil
+                        memory_usage = psutil.virtual_memory().percent
+                        if memory_usage > 85:
+                            self._log_safe('warning', f"High RAM usage: {memory_usage:.1f}%. Consider reducing batch size.")
+                
+                self._log_safe('info', f"Total chunks generated for {task_name}: {total_chunks}")
 
         except Exception as e:
             self._log_safe('error', f"A critical error occurred during batch processing for {task_name}: {e}")
@@ -721,7 +978,8 @@ class DatasetController:
             self._log_safe('info', f"Starting ranking phase for {task_name}")
             
             ranked_filtered_path = self.helper_rank_and_filter_chunks(str(final_output_file), config_output_dir,
-                                                               upper_percentile=up_perc, lower_percentile=low_perc)
+                                                               upper_percentile=up_perc, lower_percentile=low_perc,
+                                                               ranking_workers=ranking_workers)
             if ranked_filtered_path:
                 self._log_safe('warning', f"Ranked & filtered results saved to: {ranked_filtered_path}")
             
@@ -737,7 +995,8 @@ class DatasetController:
         return True, str(final_output_file), final_compliance
     
     def helper_rank_and_filter_chunks(self, chunks_tsv: str, output_dir: Path,
-                                upper_percentile: int = 80, lower_percentile: int = 20) -> str:
+                                upper_percentile: int = 80, lower_percentile: int = 20, 
+                                ranking_workers: Optional[int] = None) -> str:
         """Rank chunks và giữ lại theo ngưỡng phân vị RRF - OPTIMIZED VERSION.
 
         Args:
@@ -745,22 +1004,43 @@ class DatasetController:
             output_dir:     Thư mục lưu file đã lọc.
             upper_percentile:Phần trăm trên để lấy POS (mặc định 80).
             lower_percentile:Phần trăm dưới để lấy NEG (mặc định 20).
+            ranking_workers: Số worker cho ranking (None = auto-calculate).
 
         Returns:
             Đường dẫn file TSV đã lọc (rỗng nếu lỗi).
         """
         try:
+            # Calculate optimal ranking workers if not specified
+            if ranking_workers is None:
+                ranking_workers = _utility_calculate_optimal_ranking_workers()
+                self._log_safe('info', f"Auto-calculated ranking workers: {ranking_workers}")
+            else:
+                self._log_safe('info', f"Using specified ranking workers: {ranking_workers}")
+            
             # Import optimized ranking function
             from Tool.rank_chunks_optimized import rank_and_filter_chunks_optimized
             
             self._log_safe('info', f"Starting optimized ranking for {chunks_tsv}")
-            result_path = rank_and_filter_chunks_optimized(
-                chunks_tsv=chunks_tsv,
-                output_dir=output_dir, 
-                upper_percentile=upper_percentile,
-                lower_percentile=lower_percentile,
-                model_name=COMMON_DEFAULTS["embedding_model"]
-            )
+            try:
+                # Try with max_workers parameter first
+                result_path = rank_and_filter_chunks_optimized(
+                    chunks_tsv=chunks_tsv,
+                    output_dir=output_dir, 
+                    upper_percentile=upper_percentile,
+                    lower_percentile=lower_percentile,
+                    model_name=COMMON_DEFAULTS["embedding_model"],
+                    max_workers=ranking_workers  # Pass ranking workers to optimization function
+                )
+            except TypeError:
+                # Fallback: call without max_workers parameter
+                self._log_safe('warning', f"Optimized ranking function doesn't support max_workers parameter, using fallback")
+                result_path = rank_and_filter_chunks_optimized(
+                    chunks_tsv=chunks_tsv,
+                    output_dir=output_dir, 
+                    upper_percentile=upper_percentile,
+                    lower_percentile=lower_percentile,
+                    model_name=COMMON_DEFAULTS["embedding_model"]
+                )
             
             if result_path:
                 self._log_safe('info', f"Optimized ranking completed: {result_path}")
@@ -772,14 +1052,23 @@ class DatasetController:
         except ImportError:
             # Fallback to original implementation
             self._log_safe('warning', "Optimized ranking not available, using fallback...")
-            return self._helper_rank_and_filter_chunks_fallback(chunks_tsv, output_dir, upper_percentile, lower_percentile)
+            return self._helper_rank_and_filter_chunks_fallback(chunks_tsv, output_dir, upper_percentile, lower_percentile, ranking_workers)
         except Exception as e:
             self._log_safe('error', f"Optimized ranking failed: {e}")
             return ""
     
     def _helper_rank_and_filter_chunks_fallback(self, chunks_tsv: str, output_dir: Path,
-                                upper_percentile: int = 80, lower_percentile: int = 20) -> str:
-        """Fallback to original ranking implementation"""
+                                upper_percentile: int = 80, lower_percentile: int = 20, 
+                                ranking_workers: Optional[int] = None) -> str:
+        """Fallback to original ranking implementation
+        
+        Args:
+            chunks_tsv: Path to chunks TSV file
+            output_dir: Output directory
+            upper_percentile: Upper percentile for positive samples
+            lower_percentile: Lower percentile for negative samples
+            ranking_workers: Number of workers for ranking (unused in fallback, kept for compatibility)
+        """
         import pandas as pd
         import numpy as np
         from pathlib import Path as _Path
@@ -940,19 +1229,39 @@ class DatasetController:
             pass
 
     # Simplified approach: Replace create_all_datasets method
-    def data_create_controller_main(self, use_parallel: bool = False, max_workers: Optional[int] = None) -> Dict[str, Any]:
-        """Create all 6 adaptive datasets with simple re-chunking loop"""
+    def data_create_controller_main(self, use_parallel: bool = False, max_workers: Optional[int] = None, 
+                                   ranking_workers: Optional[int] = None, config_workers: Optional[int] = None) -> Dict[str, Any]:
+        """Create all 6 adaptive datasets with simple re-chunking loop
+        
+        Args:
+            use_parallel: Whether to use parallel processing for chunking
+            max_workers: Number of workers for chunking/OIE phase (None = auto-calculate)
+            ranking_workers: Number of workers for ranking phase (None = auto-calculate)
+            config_workers: Number of workers per config for internal parallelism (None = sequential)
+        """
         
         if use_parallel:
-            return self.process_create_all_datasets_parallel(max_workers)
+            return self.process_create_all_datasets_parallel(max_workers, ranking_workers, config_workers)
         else:
-            return self.process_create_all_datasets_sequential()
+            return self.process_create_all_datasets_sequential(ranking_workers, config_workers)
 
-    def process_create_all_datasets_sequential(self) -> Dict[str, Any]:
-        """Sequential dataset creation."""
+    def process_create_all_datasets_sequential(self, ranking_workers: Optional[int] = None, 
+                                              config_workers: Optional[int] = None) -> Dict[str, Any]:
+        """Sequential dataset creation.
+        
+        Args:
+            ranking_workers: Number of workers for ranking phase (None = auto-calculate)
+            config_workers: Number of workers per config for internal parallelism (None = sequential)
+        """
         self._log_safe('info', "="*80)
         self._log_safe('info', "STARTING SEQUENTIAL ADAPTIVE DATASET CREATION")
         self._log_safe('info', "="*80)
+        
+        if ranking_workers is None:
+            ranking_workers = _utility_calculate_optimal_ranking_workers()
+            self._log_safe('info', f"Auto-calculated ranking workers: {ranking_workers}")
+        else:
+            self._log_safe('info', f"Using specified ranking workers: {ranking_workers}")
         
         if not self._utility_validate_input_file():
             self._log_safe('error', "Input file validation failed. Aborting.")
@@ -964,11 +1273,16 @@ class DatasetController:
         results = []
         successful_tasks = 0
         
+        if config_workers and config_workers > 1:
+            self._log_safe('info', f"Each config will use {config_workers} workers for batch processing")
+        else:
+            self._log_safe('info', "Using sequential batch processing for each config")
+        
         for i, config in enumerate(configs_to_run, 1):
             self._log_safe('info', f"\n>>> Configuration {i}/{len(configs_to_run)}: {config['name']} <<<")
             start_time = time.time()
             
-            success, output_file, final_compliance = self._run_single_config(config)
+            success, output_file, final_compliance = self._run_single_config(config, ranking_workers=ranking_workers, config_workers=config_workers)
 
             end_time = time.time()
 
@@ -990,15 +1304,36 @@ class DatasetController:
         self.helper_save_and_print_summary(summary)
         return summary
 
-    def process_create_all_datasets_parallel(self, max_workers: Optional[int] = None) -> Dict[str, Any]:
-        """Parallel dataset creation using ProcessPoolExecutor"""
+    def process_create_all_datasets_parallel(self, max_workers: Optional[int] = None, 
+                                            ranking_workers: Optional[int] = None, 
+                                            config_workers: Optional[int] = None) -> Dict[str, Any]:
+        """Parallel dataset creation using ProcessPoolExecutor
+        
+        Args:
+            max_workers: Number of workers for chunking/OIE phase (None = auto-calculate)
+            ranking_workers: Number of workers for ranking phase (None = auto-calculate)
+            config_workers: Number of workers per config for internal parallelism (None = sequential)
+        """
         self.logger.info("="*80)
         self.logger.info("STARTING PARALLEL ADAPTIVE DATASET CREATION")
         self.logger.info("="*80)
         
+        # Import psutil for memory monitoring
+        import psutil
+        
         if max_workers is None:
-            max_workers = min(multiprocessing.cpu_count(), 4)
-        self.logger.info(f"Using up to {max_workers} parallel workers")
+            # Calculate chunking workers based on memory and CPU
+            available_ram_gb = psutil.virtual_memory().available / (1024**3)
+            memory_per_worker = 2.0  # GB for gte-base model (chunking phase)
+            max_by_memory = max(1, int((available_ram_gb * 0.7) / memory_per_worker))
+            max_workers = min(multiprocessing.cpu_count(), max_by_memory)
+        
+        if ranking_workers is None:
+            ranking_workers = _utility_calculate_optimal_ranking_workers()
+            
+        self.logger.info(f"Using up to {max_workers} parallel workers for chunking/OIE")
+        self.logger.info(f"Using up to {ranking_workers} parallel workers for ranking")
+        self.logger.info(f"Memory consideration: {psutil.virtual_memory().available / (1024**3):.1f}GB available RAM")
         
         if not self._utility_validate_input_file():
             self.logger.error("Input file validation failed. Aborting.")
@@ -1007,26 +1342,105 @@ class DatasetController:
         # In normal mode, only run non-OIE configurations
         non_oie_configs = [c for c in RUN_CONFIGURATIONS if not c.get("include_oie")]
         
+        # Debug worker efficiency
+        actual_parallel_tasks = len(non_oie_configs)
+        if max_workers > actual_parallel_tasks:
+            self.logger.warning(f"WARNING: {max_workers} workers requested but only {actual_parallel_tasks} tasks available!")
+            self.logger.warning(f"Only {actual_parallel_tasks} processes will run simultaneously.")
+            self.logger.warning(f"Consider using sequential mode or enabling two-phase processing for better worker utilization.")
+        
+        self.logger.info(f"Parallel execution plan: {actual_parallel_tasks} tasks across {min(max_workers, actual_parallel_tasks)} workers")
+        
         results = []
         successful_tasks = 0
         
         # Run non-OIE configurations in parallel
         if non_oie_configs:
             self.logger.info(f"Running {len(non_oie_configs)} non-OIE configurations in parallel...")
-            with ProcessPoolExecutor(max_workers=max_workers) as executor:
+            # Use the minimum of requested workers and available tasks
+            effective_workers = min(max_workers, len(non_oie_configs))
+            self.logger.info(f"Using {effective_workers} effective workers for {len(non_oie_configs)} tasks")
+            
+            # Log config worker information
+            if config_workers and config_workers > 1:
+                self.logger.info(f"Each config will use {config_workers} internal workers for batch processing")
+                total_workers = effective_workers * config_workers
+                self.logger.info(f"Total system workers: {total_workers} (configs: {effective_workers} × workers per config: {config_workers})")
+            else:
+                self.logger.info("Each config will use sequential batch processing")
+            
+            with ProcessPoolExecutor(max_workers=effective_workers) as executor:
+                # Log initial GPU status
+                initial_gpu = _utility_monitor_gpu_usage()
+                if "error" not in initial_gpu:
+                    gpu_type = initial_gpu.get("type", "Unknown")
+                    if gpu_type == "DirectML":
+                        self.logger.info(f"Initial GPU status - DirectML: {initial_gpu['device_count']} device(s) available")
+                        self.logger.info(f"   Device: {initial_gpu['device_name']}")
+                    elif gpu_type == "CUDA":
+                        self.logger.info("Initial GPU status - CUDA:")
+                        for gpu_id, stats in initial_gpu.items():
+                            if gpu_id.startswith("gpu_"):
+                                self.logger.info(f"   {gpu_id}: {stats['allocated_gb']:.1f}GB allocated / {stats['total_gb']:.1f}GB total")
+                    else:
+                        self.logger.info(f"Initial GPU status: {initial_gpu}")
+                else:
+                    self.logger.warning(f"GPU monitoring unavailable: {initial_gpu.get('error', 'Unknown error')}")
+                
                 future_to_config = {
-                    executor.submit(helper_run_chunking_config_process, config, self.input_tsv_path, str(self.output_base_dir), auto_start_oie=False, embedding_model=COMMON_DEFAULTS["embedding_model"]): config
+                    executor.submit(helper_run_chunking_config_process, config, self.input_tsv_path, 
+                                  str(self.output_base_dir), auto_start_oie=False, 
+                                  embedding_model=COMMON_DEFAULTS["embedding_model"], 
+                                  ranking_workers=ranking_workers, config_workers=config_workers): config
                     for config in non_oie_configs
                 }
+                
+                # Monitor GPU during execution
+                completed_count = 0
+                total_tasks = len(future_to_config)
+                
                 for future in as_completed(future_to_config):
                     config_name = future_to_config[future]['name']
+                    completed_count += 1
+                    
                     try:
                         result = future.result()
                         results.append(result)
-                        if result["success"]: successful_tasks += 1
+                        if result["success"]: 
+                            successful_tasks += 1
+                            self.logger.info(f"✅ Completed {config_name} ({completed_count}/{total_tasks})")
+                        else:
+                            self.logger.error(f"❌ Failed {config_name} ({completed_count}/{total_tasks})")
                     except Exception as e:
                         self.logger.error(f"Process for {config_name} generated an exception: {e}")
                         results.append({"config_name": config_name, "success": False, "error": str(e)})
+                    
+                    # Log GPU status every task completion  
+                    if completed_count % 1 == 0:  # Log after each task 
+                        current_gpu = _utility_monitor_gpu_usage()
+                        if "error" not in current_gpu:
+                            gpu_type = current_gpu.get("type", "Unknown")
+                            if gpu_type == "DirectML":
+                                self.logger.info(f"GPU status after task {completed_count}/{total_tasks} - DirectML active")
+                            elif gpu_type == "CUDA":
+                                self.logger.info(f"GPU status after task {completed_count}/{total_tasks}:")
+                                for gpu_id, stats in current_gpu.items():
+                                    if gpu_id.startswith("gpu_"):
+                                        self.logger.info(f"   {gpu_id}: {stats['allocated_gb']:.1f}GB allocated ({stats['utilization_percent']:.1f}% utilization)")
+                
+                # Final GPU status
+                final_gpu = _utility_monitor_gpu_usage()
+                if "error" not in final_gpu:
+                    gpu_type = final_gpu.get("type", "Unknown")
+                    if gpu_type == "DirectML":
+                        self.logger.info("Final GPU status - DirectML: Processing completed successfully")
+                    elif gpu_type == "CUDA":
+                        self.logger.info("Final GPU status - CUDA:")
+                        for gpu_id, stats in final_gpu.items():
+                            if gpu_id.startswith("gpu_"):
+                                self.logger.info(f"   {gpu_id}: {stats['allocated_gb']:.1f}GB allocated / {stats['total_gb']:.1f}GB total")
+                    else:
+                        self.logger.info(f"Final GPU status: {final_gpu}")
 
         # Note: OIE configurations are not run in normal mode
 
@@ -1081,6 +1495,133 @@ class DatasetController:
         if successful_tasks > 0:
             self.logger.info(f"\nAll outputs saved to: {summary['output_base_directory']}")
             self.logger.info("="*80)
+
+    # ============================================================
+    # NEW: Helper để convert existing chunks sang OIE version
+    # ============================================================
+    def convert_existing_chunks_to_oie(self, source_chunks_file: str, target_config_name: str = None) -> str:
+        """Convert existing chunk file to OIE-enhanced version
+        
+        Args:
+            source_chunks_file: Path to existing chunks TSV file (output from without_OIE config)
+            target_config_name: Target config name (e.g., 'semantic_splitter_with_OIE')
+            
+        Returns:
+            Path to new OIE-enhanced file
+        """
+        try:
+            from pathlib import Path as _Path
+            
+            if not os.path.exists(source_chunks_file):
+                self._log_safe('error', f'Source chunks file not found: {source_chunks_file}')
+                return ""
+            
+            # Auto-detect target config name if not provided
+            source_path = _Path(source_chunks_file)
+            if target_config_name is None:
+                # Convert 'semantic_splitter_without_OIE' -> 'semantic_splitter_with_OIE'
+                source_dir_name = source_path.parent.name
+                if source_dir_name.endswith('_without_OIE'):
+                    target_config_name = source_dir_name.replace('_without_OIE', '_with_OIE')
+                else:
+                    target_config_name = f"{source_dir_name}_with_OIE"
+            
+            # Create target directory
+            target_dir = self.output_base_dir / target_config_name
+            target_dir.mkdir(exist_ok=True)
+            
+            target_file = target_dir / f"output_chunks_oie_converted_{self.timestamp}.tsv"
+            
+            self._log_safe('info', f'Converting {source_chunks_file} to OIE version: {target_file}')
+            
+            # Use the existing OIE augmentation function
+            result_path = self.process_augment_with_oie(source_chunks_file, threads=8)
+            
+            if result_path:
+                # Copy to target location with proper naming
+                import shutil
+                shutil.copy2(result_path, target_file)
+                self._log_safe('info', f'OIE conversion completed: {target_file}')
+                return str(target_file)
+            else:
+                self._log_safe('error', 'OIE conversion failed')
+                return ""
+                
+        except Exception as e:
+            self._log_safe('error', f'Error converting chunks to OIE: {e}')
+            return ""
+
+    # ============================================================
+    # NEW: Helper để tự động tạo cặp without/with OIE từ 1 config
+    # ============================================================
+    def process_config_pair_without_with_oie(self, base_config_name: str, 
+                                           ranking_workers: Optional[int] = None,
+                                           config_workers: Optional[int] = None) -> dict:
+        """Process a config pair: first without OIE, then convert to with OIE
+        
+        Args:
+            base_config_name: Base config name (e.g., 'semantic_splitter')
+            ranking_workers: Number of ranking workers
+            config_workers: Number of config workers
+            
+        Returns:
+            Dictionary with results for both versions
+        """
+        try:
+            # Find the without_OIE config
+            without_oie_config = None
+            for cfg in RUN_CONFIGURATIONS:
+                if cfg['name'] == f"{base_config_name}_without_OIE":
+                    without_oie_config = cfg
+                    break
+            
+            if not without_oie_config:
+                self._log_safe('error', f'Config {base_config_name}_without_OIE not found')
+                return {"success": False, "without_oie": None, "with_oie": None}
+            
+            results = {}
+            
+            # Step 1: Run without_OIE config
+            self._log_safe('info', f'Step 1: Running {base_config_name}_without_OIE')
+            success_without, output_file_without, compliance_without = self._run_single_config(
+                without_oie_config, 
+                ranking_workers=ranking_workers, 
+                config_workers=config_workers
+            )
+            
+            results['without_oie'] = {
+                'success': success_without,
+                'output_file': output_file_without,
+                'compliance': compliance_without
+            }
+            
+            if not success_without:
+                self._log_safe('error', f'Failed to run {base_config_name}_without_OIE')
+                return {"success": False, **results}
+            
+            # Step 2: Convert to with_OIE version
+            self._log_safe('info', f'Step 2: Converting to {base_config_name}_with_OIE')
+            oie_output_file = self.convert_existing_chunks_to_oie(
+                output_file_without, 
+                f"{base_config_name}_with_OIE"
+            )
+            
+            results['with_oie'] = {
+                'success': bool(oie_output_file),
+                'output_file': oie_output_file,
+                'source_file': output_file_without
+            }
+            
+            if oie_output_file:
+                self._log_safe('info', f'Successfully created {base_config_name} pair')
+                return {"success": True, **results}
+            else:
+                self._log_safe('error', f'Failed to convert to {base_config_name}_with_OIE')
+                return {"success": False, **results}
+                
+        except Exception as e:
+            self._log_safe('error', f'Error processing config pair {base_config_name}: {e}')
+            return {"success": False, "error": str(e)}
 
     # ============================================================
     # New helper: Augment existing TSV bằng OIE song song
@@ -1192,8 +1733,16 @@ class DatasetController:
     # ============================================================
     # New high-level: Hai pha – chunk trước, OIE sau
     # ============================================================
-    def process_create_all_datasets_two_phase(self, *, non_oie_parallel: bool = True, max_workers: Optional[int] = None, oie_threads: int = 8):
-        """Thực hiện 2 giai đoạn: (1) sinh chunks không OIE, (2) augment OIE."""
+    def process_create_all_datasets_two_phase(self, *, non_oie_parallel: bool = True, max_workers: Optional[int] = None, 
+                                             oie_threads: int = 8, ranking_workers: Optional[int] = None):
+        """Thực hiện 2 giai đoạn: (1) sinh chunks không OIE, (2) augment OIE.
+        
+        Args:
+            non_oie_parallel: Có sử dụng parallel cho giai đoạn chunking không
+            max_workers: Số worker cho giai đoạn chunking/OIE (None = auto-calculate)
+            oie_threads: Số thread cho OIE augmentation
+            ranking_workers: Số worker cho giai đoạn ranking (None = auto-calculate)
+        """
 
         # ---------------- PHA 1: without_OIE ----------------
         phase1_controller = self  
@@ -1208,20 +1757,33 @@ class DatasetController:
 
         if non_oie_parallel:
             if max_workers is None:
-                max_workers = min(multiprocessing.cpu_count(), 4)
-            self._log_safe('info', f'Pha 1: chạy song song (max_workers={max_workers})')
+                # Calculate chunking workers
+                import psutil
+                available_ram_gb = psutil.virtual_memory().available / (1024**3)
+                memory_per_worker = 2.0  # GB for gte-base model  
+                max_by_memory = max(1, int((available_ram_gb * 0.7) / memory_per_worker))
+                max_workers = min(multiprocessing.cpu_count(), max_by_memory)
+            
+            if ranking_workers is None:
+                ranking_workers = _utility_calculate_optimal_ranking_workers()
+                
+            self._log_safe('info', f'Pha 1: chạy song song (chunking_workers={max_workers}, ranking_workers={ranking_workers})')
+            self._log_safe('info', f'Memory consideration: {psutil.virtual_memory().available / (1024**3):.1f}GB available RAM')
 
             with ProcessPoolExecutor(max_workers=max_workers) as executor:
-                fut_to_cfg = {executor.submit(helper_run_chunking_config_process, cfg, phase1_controller.input_tsv_path, str(phase1_controller.output_base_dir), auto_start_oie=False, embedding_model=COMMON_DEFAULTS["embedding_model"]): cfg for cfg in configs_phase1}
+                fut_to_cfg = {executor.submit(helper_run_chunking_config_process, cfg, phase1_controller.input_tsv_path, str(phase1_controller.output_base_dir), auto_start_oie=False, embedding_model=COMMON_DEFAULTS["embedding_model"], ranking_workers=ranking_workers): cfg for cfg in configs_phase1}
                 for fut in as_completed(fut_to_cfg):
                     result = fut.result()
                     results_phase1.append(result)
                     if result.get('success'):
                         succ1 += 1
         else:
-            self._log_safe('info', 'Pha 1: chạy tuần tự.')
+            if ranking_workers is None:
+                ranking_workers = _utility_calculate_optimal_ranking_workers()
+                
+            self._log_safe('info', f'Pha 1: chạy tuần tự (ranking_workers={ranking_workers})')
             for cfg in configs_phase1:
-                success, out_file, _ = phase1_controller._run_single_config(cfg)
+                success, out_file, _ = phase1_controller._run_single_config(cfg, ranking_workers=ranking_workers)
                 results_phase1.append({'config_name': cfg['name'], 'success': success, 'output_file': out_file})
                 if success:
                     succ1 += 1
@@ -1272,7 +1834,10 @@ class DatasetController:
             self._log_safe('error', 'Không thể tắt server OpenIE5.')
 
 # Process-based worker function for parallel execution
-def helper_run_chunking_config_process(config: dict, input_tsv_path: str, output_base_dir: str, *, auto_start_oie: bool = True, embedding_model: str = None) -> dict:
+def helper_run_chunking_config_process(config: dict, input_tsv_path: str, output_base_dir: str, *, 
+                                     auto_start_oie: bool = True, embedding_model: str = None, 
+                                     ranking_workers: Optional[int] = None, 
+                                     config_workers: Optional[int] = None) -> dict:
     """Process-based worker function to run a single chunking configuration.
 
     auto_start_oie:
@@ -1280,23 +1845,70 @@ def helper_run_chunking_config_process(config: dict, input_tsv_path: str, output
         Đối với giai đoạn without_OIE nên đặt False để tránh khởi động thừa.
     embedding_model:
         Model embedding để sử dụng, ghi đè COMMON_DEFAULTS nếu được cung cấp.
+    ranking_workers:
+        Số worker cho giai đoạn ranking (None = auto-calculate).
+    config_workers:
+        Số worker cho config này cụ thể (None = sequential processing).
     """
+    import os
+    import time
+    import logging
+    
+    # Log process start with PID for debugging
+    process_id = os.getpid()
+    print(f"[PID {process_id}] Starting worker for config: {config['name']}")
+    
+    # Monitor GPU in subprocess
+    def log_gpu_status(prefix=""):
+        try:
+            import torch
+            
+            # Try DirectML first
+            try:
+                import torch_directml
+                if torch_directml.is_available():
+                    device_count = torch_directml.device_count()
+                    device_name = torch_directml.device_name(0) if device_count > 0 else "Unknown"
+                    print(f"[PID {process_id}] {prefix}DirectML: {device_count} device(s) - {device_name}")
+                    return
+            except ImportError:
+                pass
+            
+            # Check CUDA
+            if torch.cuda.is_available():
+                allocated = torch.cuda.memory_allocated(0) / (1024**3)
+                reserved = torch.cuda.memory_reserved(0) / (1024**3)
+                print(f"[PID {process_id}] {prefix}CUDA: {allocated:.2f}GB allocated, {reserved:.2f}GB reserved")
+            else:
+                print(f"[PID {process_id}] {prefix}Using CPU processing")
+        except Exception as e:
+            print(f"[PID {process_id}] {prefix}GPU monitoring failed: {e}")
+    
+    log_gpu_status("WORKER START - ")
+    
     if embedding_model:
         COMMON_DEFAULTS["embedding_model"] = embedding_model
     
-    controller = DatasetController(input_tsv_path, output_base_dir, auto_start_oie=auto_start_oie)
+    controller = DatasetController(input_tsv_path, output_base_dir, auto_start_oie=auto_start_oie, silent_mode=True)
     start_time = time.time()
+    
+    log_gpu_status("AFTER CONTROLLER INIT - ")
         
-    success, output_file, final_compliance = controller._run_single_config(config)
+    success, output_file, final_compliance = controller._run_single_config(config, ranking_workers=ranking_workers, config_workers=config_workers)
+    
+    log_gpu_status("AFTER CONFIG EXECUTION - ")
         
     end_time = time.time()
+    
+    print(f"[PID {process_id}] Completed worker for config: {config['name']} in {end_time - start_time:.1f}s")
         
     return {
         "config_name": config["name"], "description": config["description"],
         "success": success, "output_file": output_file or "",
-            "execution_time_seconds": end_time - start_time,
-            "final_compliance_rate": final_compliance
-        }
+        "execution_time_seconds": end_time - start_time,
+        "final_compliance_rate": final_compliance,
+        "worker_pid": process_id  # Add PID for debugging
+    }
 
 # -------------------------------------------------------------------
 # Worker cho pha 2 – augment OIE song song
@@ -1363,17 +1975,104 @@ def data_create_controller_main():
     else:
         print(f"\nFinal embedding model: {final_model} (custom)")
     
-    mode_choice = input("\nChạy hai pha Without→With OIE? (y/n, default: n): ").strip().lower()
-    two_phase = mode_choice == 'y'
+    mode_choice = input("\nMode Selection:\n1. Single-phase (Without OIE only)\n2. Two-phase (Without OIE → With OIE)\n3. Convert existing chunks to OIE\nEnter choice (1-3, default: 1): ").strip()
+    
+    if mode_choice == '2':
+        two_phase = True
+        convert_mode = False
+    elif mode_choice == '3':
+        two_phase = False
+        convert_mode = True
+    else:
+        two_phase = False
+        convert_mode = False
+
+    if convert_mode:
+        # Convert existing chunks mode
+        print("\n=== Convert Existing Chunks to OIE Mode ===")
+        source_file = input("Enter path to existing chunks file (TSV): ").strip()
+        if not source_file or not os.path.exists(source_file):
+            print("ERROR: Source file not found!")
+            return
+        
+        # Start OIE server
+        try:
+            from Tool.OIE import _is_port_open, _start_openie_server
+            if not _is_port_open(9000):
+                print("Starting OpenIE server...")
+                _start_openie_server(9000)
+                
+            controller = DatasetController(input_tsv_path, output_base_dir, auto_start_oie=False)
+            result_file = controller.convert_existing_chunks_to_oie(source_file)
+            
+            if result_file:
+                print(f"✅ Successfully converted to OIE version: {result_file}")
+            else:
+                print("❌ Conversion failed")
+                
+            # Cleanup
+            from Tool.OIE import terminate_openie_processes
+            terminate_openie_processes(port=9000, silent=True)
+            
+        except Exception as e:
+            print(f"Error during conversion: {e}")
+        
+        return
 
     parallel_choice = input("Use parallel processing cho pha chunk? (y/n, default: n): ").strip().lower()
     use_parallel = parallel_choice == 'y'
     
     max_workers = None
+    ranking_workers = None
+    oie_threads = 8  # Default value
+    
     if use_parallel:
-        max_workers_input = input(f"Max parallel workers (default: auto, max: {multiprocessing.cpu_count()}): ").strip()
+        print(f"\nWorker Configuration (Max CPU cores: {multiprocessing.cpu_count()})")
+        print("=" * 50)
+        
+        # Chunking/OIE workers
+        max_workers_input = input(f"Chunking/OIE workers (default: auto-calculate): ").strip()
         if max_workers_input.isdigit():
             max_workers = min(int(max_workers_input), multiprocessing.cpu_count())
+            print(f"Chunking/OIE workers: {max_workers}")
+        else:
+            print(f"Chunking/OIE workers: auto-calculate")
+    
+    # Config workers (ask for both parallel and sequential)
+    print(f"\nConfig Worker Configuration")
+    print("=" * 40)
+    print("Workers per config: Each config can use multiple workers for internal batch processing")
+    config_workers_input = input(f"Workers per config (default: 1=sequential, recommended: 2-5): ").strip()
+    config_workers = None
+    if config_workers_input.isdigit():
+        config_workers = min(int(config_workers_input), multiprocessing.cpu_count())
+        print(f"Workers per config: {config_workers}")
+        if use_parallel and max_workers and config_workers:
+            total_workers = max_workers * config_workers
+            print(f"Total system workers: {total_workers} (configs: {max_workers} × workers per config: {config_workers})")
+    else:
+        print(f"Workers per config: 1 (sequential)")
+    
+    # Ranking workers (ask for both parallel and sequential since ranking affects both)
+    print(f"\nRanking Worker Configuration")
+    print("=" * 40)
+    ranking_workers_input = input(f"Ranking workers (default: auto-calculate, recommended: 2-4): ").strip()
+    if ranking_workers_input.isdigit():
+        ranking_workers = min(int(ranking_workers_input), multiprocessing.cpu_count())
+        print(f"Ranking workers: {ranking_workers}")
+    else:
+        print(f"Ranking workers: auto-calculate")
+
+    # OIE threads (only for two-phase mode)
+    if two_phase:
+        print(f"\nOIE Thread Configuration (Two-phase mode)")
+        print("=" * 45)
+        oie_threads_input = input(f"OIE threads (default: 8, recommended: 4-8): ").strip()
+        if oie_threads_input.isdigit():
+            oie_threads = min(int(oie_threads_input), multiprocessing.cpu_count())
+            print(f"OIE threads: {oie_threads}")
+        else:
+            print(f"OIE threads: 8 (default)")
 
     # --- NEW: allow user to pick specific configurations ---
     print("\nAvailable configurations:")
@@ -1405,6 +2104,24 @@ def data_create_controller_main():
     else:
         print("Mode: Single-phase processing (Without OIE only)")
     
+    if use_parallel:
+        chunking_info = f"{max_workers or 'auto'} chunking workers"
+        ranking_info = f"{ranking_workers or 'auto'} ranking workers"
+        config_info = f"{config_workers or 1} workers per config"
+        if two_phase:
+            oie_info = f"{oie_threads} OIE threads"
+            print(f"Parallel mode: {chunking_info}, {config_info}, {ranking_info}, {oie_info}")
+        else:
+            print(f"Parallel mode: {chunking_info}, {config_info}, {ranking_info}")
+    else:
+        ranking_info = f"{ranking_workers or 'auto'} ranking workers"
+        config_info = f"{config_workers or 1} workers per config"
+        if two_phase:
+            oie_info = f"{oie_threads} OIE threads"
+            print(f"Sequential mode: {config_info}, {ranking_info}, {oie_info}")
+        else:
+            print(f"Sequential mode: {config_info}, {ranking_info}")
+    
     print("Starting process...")
     
     try:
@@ -1412,15 +2129,163 @@ def data_create_controller_main():
         controller = DatasetController(input_tsv_path, output_base_dir, auto_start_oie=False)
 
         if two_phase:
-            controller.process_create_all_datasets_two_phase(non_oie_parallel=use_parallel, max_workers=max_workers)
+            controller.process_create_all_datasets_two_phase(
+                non_oie_parallel=use_parallel, 
+                max_workers=max_workers, 
+                ranking_workers=ranking_workers,
+                oie_threads=oie_threads
+            )
         else:
-            controller.data_create_controller_main(use_parallel=use_parallel, max_workers=max_workers)
+            controller.data_create_controller_main(
+                use_parallel=use_parallel, 
+                max_workers=max_workers, 
+                ranking_workers=ranking_workers,
+                config_workers=config_workers
+            )
             
     except KeyboardInterrupt:
         print("\nInterrupted by user.")
     except Exception as e:
         print(f"A critical error occurred in main: {e}")
         traceback.print_exc()
+
+# -------------------------------------------------------------------
+# Helper function for parallel batch processing with dedicated embedding model
+# -------------------------------------------------------------------
+def helper_process_single_batch(batch_df: pd.DataFrame, config: dict, batch_num: int, 
+                               embedding_model: str = None, worker_id: int = None) -> List[List[Any]]:
+    """Process a single batch in a separate process with dedicated embedding model
+    
+    Args:
+        batch_df: DataFrame containing the batch data
+        config: Configuration dictionary for chunking
+        batch_num: Batch number for logging
+        embedding_model: Specific embedding model for this worker
+        worker_id: Unique worker identifier
+        
+    Returns:
+        List of chunked rows
+    """
+    import os
+    import gc
+    from pathlib import Path
+    
+    # Get process ID for debugging
+    process_id = os.getpid()
+    worker_tag = f"W{worker_id}" if worker_id is not None else "UNK"
+    
+    try:
+        print(f"[PID {process_id}|{worker_tag}] Processing batch {batch_num} with {len(batch_df)} rows")
+        
+        # Initialize dedicated embedding model for this worker
+        if embedding_model:
+            print(f"[PID {process_id}|{worker_tag}] Loading dedicated embedding model: {embedding_model}")
+            # Set the model for this worker process
+            COMMON_DEFAULTS["embedding_model"] = embedding_model
+        
+        # Check GPU/CPU availability for this worker
+        try:
+            import torch
+            
+            # Try DirectML first
+            try:
+                import torch_directml
+                if torch_directml.is_available():
+                    device_count = torch_directml.device_count()
+                    device_name = torch_directml.device_name(0) if device_count > 0 else "Unknown"
+                    print(f"[PID {process_id}|{worker_tag}] Using DirectML: {device_count} device(s) - {device_name}")
+                else:
+                    print(f"[PID {process_id}|{worker_tag}] DirectML not available")
+            except ImportError:
+                print(f"[PID {process_id}|{worker_tag}] DirectML not installed")
+            
+            # Check CUDA as fallback
+            if torch.cuda.is_available():
+                gpu_memory = torch.cuda.memory_allocated(0) / (1024**3)
+                print(f"[PID {process_id}|{worker_tag}] CUDA available: {gpu_memory:.2f}GB allocated")
+            else:
+                print(f"[PID {process_id}|{worker_tag}] Using CPU processing")
+        except ImportError:
+            print(f"[PID {process_id}|{worker_tag}] PyTorch not available, using CPU")
+        
+        # Process the batch using the chunking logic directly
+        output_rows = []
+        method_choice = config["method_choice"]
+        method_params = config["params"].copy()
+
+        # Determine if OIE should be used for this run
+        use_oie = config.get("include_oie", False) and OIE_AVAILABLE_GLOBALLY
+        method_params['include_oie'] = use_oie
+        method_params['save_raw_oie'] = use_oie and config.get("save_raw_oie", False)
+
+        chunking_function_map = {
+            "1": semantic_chunk_passage_from_grouping_logic,
+            "2": chunk_passage_text_splitter,
+            "3": chunk_passage_text_splitter,
+        }
+        chunking_function = chunking_function_map.get(method_choice)
+
+        if not chunking_function:
+            print(f"[PID {process_id}|{worker_tag}] No valid chunking function for method_choice '{method_choice}'. Skipping.")
+            return []
+
+        # Memory monitoring
+        import psutil
+        process = psutil.Process()
+        initial_memory = process.memory_info().rss / (1024**2)  # MB
+
+        for row_idx, row_data in batch_df.iterrows():
+            try:
+                query_text, passage_text, label = row_data.iloc[0], row_data.iloc[1], row_data.iloc[2]
+                query_id = f"Q{row_idx}"
+                passage_id = f"P{row_idx}"
+
+                if not isinstance(passage_text, str) or not passage_text.strip():
+                    continue
+
+                # Prepare parameters for the chunking function
+                common_params = {
+                    'passage_text': passage_text,
+                    'doc_id': f"{query_id}_{passage_id}",
+                    'output_dir': None,  # Not needed for batch processing
+                    'silent': True,
+                    **method_params
+                }
+                if method_choice in ["1", "2"]: # Semantic methods
+                    common_params['embedding_model'] = COMMON_DEFAULTS["embedding_model"]
+                    common_params['device'] = COMMON_DEFAULTS["device_preference"]
+
+                # Call the selected chunking function
+                chunked_tuples: List[Tuple[str, str, Optional[str]]] = chunking_function(**common_params)
+
+                if not chunked_tuples:
+                    continue
+                
+                # Format output rows
+                for gen_chunk_id, chunk_text, oie_string in chunked_tuples:
+                    output_rows.append([
+                        query_id, query_text, passage_id, passage_text, label,
+                        gen_chunk_id, chunk_text, oie_string if oie_string else ""
+                    ])
+                    
+                # Clear chunked_tuples to free memory immediately
+                del chunked_tuples
+                
+            except Exception as e:
+                print(f"[PID {process_id}|{worker_tag}] Error processing row {row_idx}: {e}")
+
+        # Final garbage collection
+        gc.collect()
+        final_memory = process.memory_info().rss / (1024**2)  # MB
+        
+        print(f"[PID {process_id}|{worker_tag}] Batch {batch_num} completed: {len(output_rows)} chunks")
+        print(f"[PID {process_id}|{worker_tag}] Memory: {initial_memory:.1f}MB → {final_memory:.1f}MB")
+        
+        return output_rows
+        
+    except Exception as e:
+        print(f"[PID {process_id}|{worker_tag}] Batch {batch_num} failed: {e}")
+        return []
 
 if __name__ == "__main__":
     start_time = time.time()

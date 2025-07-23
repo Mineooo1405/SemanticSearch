@@ -14,9 +14,9 @@ from rank_bm25 import BM25Okapi
 class OptimizedRanker:
     """Memory-efficient ranking with caching and batch processing"""
     
-    def __init__(self, model_name: str = "all-MiniLM-L6-v2", device_preference: str = None, cache_size: int = 1000):
+    def __init__(self, model_name: str = "all-MiniLM-L6-v2", device_preference: str = "dml", cache_size: int = 1000):
         self.model_name = model_name
-        self.device_preference = device_preference
+        self.device_preference = device_preference if device_preference else "dml"  # Default to DirectML
         self.cache_size = cache_size
         
         # Caches for embeddings to avoid recomputation
@@ -159,15 +159,20 @@ class OptimizedRanker:
 
 def rank_and_filter_chunks_optimized(chunks_tsv: str, output_dir: Path,
                                     upper_percentile: int = 80, lower_percentile: int = 20,
-                                    model_name: str = "thenlper/gte-base") -> str:
-    """Optimized version of rank_and_filter_chunks with memory efficiency"""
+                                    model_name: str = "thenlper/gte-base", max_workers: int = None) -> str:
+    """Optimized version of rank_and_filter_chunks with memory efficiency and parallel processing
+    
+    Args:
+        chunks_tsv: Path to input TSV file
+        output_dir: Output directory
+        upper_percentile: Upper percentile for positive samples
+        lower_percentile: Lower percentile for negative samples
+        model_name: Embedding model name
+        max_workers: Number of parallel workers (None = sequential processing)
+    """
     
     if not Path(chunks_tsv).exists():
         return ""
-    
-    # Read data in chunks to manage memory
-    chunk_size = 1000  # Process 1000 rows at a time
-    ranker = OptimizedRanker(model_name=model_name)
     
     print(f"Loading data from {chunks_tsv}...")
     df = pd.read_csv(chunks_tsv, sep='\t', on_bad_lines='warn', engine='python')
@@ -178,46 +183,16 @@ def rank_and_filter_chunks_optimized(chunks_tsv: str, output_dir: Path,
         print(f"Missing required columns. Found: {df.columns.tolist()}")
         return ""
     
-    kept_rows = []
-    processed_queries = 0
     total_queries = df['query_id'].nunique()
-    
     print(f"Processing {total_queries} unique queries...")
     
-    # Process each query group
-    for query_id, group_df in df.groupby('query_id'):
-        try:
-            processed_queries += 1
-            if processed_queries % 10 == 0:
-                print(f"Processed {processed_queries}/{total_queries} queries...")
-                gc.collect()  # Periodic garbage collection
-            
-            query_text = str(group_df['query_text'].iloc[0])
-            
-            # Skip very small groups
-            if len(group_df) < 2:
-                continue
-            
-            # Use optimized ranking
-            ranked_df = ranker.rank_single_query_optimized(query_text, group_df)
-            
-            if ranked_df.empty:
-                continue
-            
-            # Apply percentile filtering
-            scores = ranked_df['rrf_score'].to_numpy(dtype=float)
-            pos_thr = np.percentile(scores, upper_percentile)
-            neg_thr = np.percentile(scores, lower_percentile)
-            
-            selected = ranked_df[(ranked_df['rrf_score'] >= pos_thr) | 
-                               (ranked_df['rrf_score'] <= neg_thr)]
-            
-            if not selected.empty:
-                kept_rows.append(selected)
-            
-        except Exception as e:
-            print(f"Error processing query {query_id}: {e}")
-            continue
+    # Choose processing method based on max_workers
+    if max_workers and max_workers > 1:
+        print(f"Using parallel processing with {max_workers} workers (dedicated models)")
+        kept_rows = _process_queries_parallel(df, model_name, upper_percentile, lower_percentile, max_workers)
+    else:
+        print("Using sequential processing (single model)")
+        kept_rows = _process_queries_sequential(df, model_name, upper_percentile, lower_percentile)
     
     if not kept_rows:
         print("No data to save after filtering")
@@ -242,11 +217,179 @@ def rank_and_filter_chunks_optimized(chunks_tsv: str, output_dir: Path,
     
     print(f"Ranking complete. Saved {len(final_df)} filtered chunks to {save_path}")
     
+    # Force cleanup
+    gc.collect()
+    
+    return str(save_path)
+
+
+def _process_queries_sequential(df: pd.DataFrame, model_name: str, 
+                              upper_percentile: int, lower_percentile: int) -> List[pd.DataFrame]:
+    """Sequential processing with single model instance"""
+    ranker = OptimizedRanker(model_name=model_name)
+    kept_rows = []
+    processed_queries = 0
+    total_queries = df['query_id'].nunique()
+    
+    # Process each query group
+    for query_id, group_df in df.groupby('query_id'):
+        try:
+            processed_queries += 1
+            if processed_queries % 10 == 0:
+                print(f"Sequential: Processed {processed_queries}/{total_queries} queries...")
+                gc.collect()  # Periodic garbage collection
+            
+            query_text = str(group_df['query_text'].iloc[0])
+            
+            # Skip very small groups
+            if len(group_df) < 2:
+                continue
+            
+            # Use optimized ranking
+            ranked_df = ranker.rank_single_query_optimized(query_text, group_df)
+            
+            if ranked_df.empty:
+                continue
+            
+            # Apply percentile filtering
+            scores = ranked_df['rrf_score'].to_numpy(dtype=float)
+            pos_thr = np.percentile(scores, upper_percentile)
+            neg_thr = np.percentile(scores, lower_percentile)
+            
+            selected = ranked_df[(ranked_df['rrf_score'] >= pos_thr) | 
+                               (ranked_df['rrf_score'] <= neg_thr)]
+            
+            if not selected.empty:
+                selected['label'] = (selected['rrf_score'] >= pos_thr).astype(int)
+                kept_rows.append(selected)
+            
+        except Exception as e:
+            print(f"Error processing query {query_id}: {e}")
+            continue
+    
     # Clean up
     del ranker
     gc.collect()
     
-    return str(save_path)
+    return kept_rows
+
+
+def _process_queries_parallel(df: pd.DataFrame, model_name: str, 
+                            upper_percentile: int, lower_percentile: int, max_workers: int) -> List[pd.DataFrame]:
+    """Parallel processing with dedicated model instances per worker"""
+    from concurrent.futures import ProcessPoolExecutor, as_completed
+    import multiprocessing
+    
+    # Limit workers to available resources
+    effective_workers = min(max_workers, multiprocessing.cpu_count(), df['query_id'].nunique())
+    print(f"Using {effective_workers} effective workers for ranking")
+    
+    # Group queries for batch processing
+    query_groups = []
+    for query_id, group_df in df.groupby('query_id'):
+        if len(group_df) >= 2:  # Skip very small groups
+            query_groups.append((query_id, group_df))
+    
+    if not query_groups:
+        return []
+    
+    print(f"Processing {len(query_groups)} query groups with {effective_workers} workers...")
+    
+    # Process in parallel with dedicated models per worker
+    kept_rows = []
+    
+    with ProcessPoolExecutor(max_workers=effective_workers) as executor:
+        # Submit all tasks
+        future_to_query = {}
+        worker_counter = 0
+        
+        for query_id, group_df in query_groups:
+            worker_id = worker_counter % effective_workers + 1
+            future = executor.submit(
+                _rank_single_query_worker,
+                query_id,
+                group_df,
+                model_name,
+                upper_percentile,
+                lower_percentile,
+                worker_id
+            )
+            future_to_query[future] = query_id
+            worker_counter += 1
+        
+        # Collect results
+        completed_count = 0
+        for future in as_completed(future_to_query):
+            query_id = future_to_query[future]
+            completed_count += 1
+            
+            try:
+                result = future.result(timeout=300)  # 5 minute timeout per query
+                if result is not None and not result.empty:
+                    kept_rows.append(result)
+                
+                if completed_count % 10 == 0:
+                    print(f"Parallel: Completed {completed_count}/{len(query_groups)} queries...")
+                    
+            except Exception as e:
+                print(f"Error processing query {query_id} in parallel: {e}")
+                continue
+    
+    print(f"Parallel processing completed. {len(kept_rows)} successful query rankings.")
+    return kept_rows
+
+
+def _rank_single_query_worker(query_id: str, group_df: pd.DataFrame, model_name: str,
+                            upper_percentile: int, lower_percentile: int, worker_id: int) -> Optional[pd.DataFrame]:
+    """Worker function for parallel query ranking with dedicated model
+    
+    Args:
+        query_id: Query ID for logging
+        group_df: DataFrame with chunks for this query
+        model_name: Embedding model name
+        upper_percentile: Upper percentile threshold
+        lower_percentile: Lower percentile threshold  
+        worker_id: Worker ID for logging
+        
+    Returns:
+        Filtered DataFrame or None if error
+    """
+    try:
+        # Each worker gets its own model instance
+        ranker = OptimizedRanker(model_name=model_name)
+        
+        query_text = str(group_df['query_text'].iloc[0])
+        
+        # Use optimized ranking
+        ranked_df = ranker.rank_single_query_optimized(query_text, group_df)
+        
+        if ranked_df.empty:
+            return None
+        
+        # Apply percentile filtering
+        scores = ranked_df['rrf_score'].to_numpy(dtype=float)
+        pos_thr = np.percentile(scores, upper_percentile)
+        neg_thr = np.percentile(scores, lower_percentile)
+        
+        selected = ranked_df[(ranked_df['rrf_score'] >= pos_thr) | 
+                           (ranked_df['rrf_score'] <= neg_thr)].copy()  # Use copy() to avoid SettingWithCopyWarning
+        
+        if not selected.empty:
+            selected['label'] = (selected['rrf_score'] >= pos_thr).astype(int)
+            return selected
+        else:
+            return None
+            
+    except Exception as e:
+        print(f"Worker W{worker_id} error processing query {query_id}: {e}")
+        return None
+    finally:
+        # Cleanup worker resources
+        try:
+            del ranker
+        except:
+            pass
+        gc.collect()
 
 
 # Legacy compatibility functions

@@ -56,7 +56,26 @@ def sentence_embedding(text_list: list, model_name: str, batch_size: int = 32, d
     global loaded_models
 
     effective_device = get_device(device_preference)
-
+    
+    # Special handling for DirectML: try DirectML first, fallback to CPU if error
+    if str(effective_device) == 'privateuseone:0':  # DirectML device
+        try:
+            if model_name not in loaded_models:
+                loaded_models[model_name] = SentenceTransformer(model_name, device=str(effective_device))
+            
+            model = loaded_models[model_name]
+            embeddings = model.encode(text_list, batch_size=batch_size, show_progress_bar=False)
+            return embeddings
+            
+        except Exception as directml_error:
+            logging.warning(f"DirectML failed for model {model_name}: {directml_error}")
+            logging.info("Falling back to CPU for embeddings...")
+            # Fallback to CPU
+            effective_device = torch.device('cpu')
+            if model_name in loaded_models:
+                del loaded_models[model_name]  # Remove the failed DirectML model
+    
+    # Standard loading for CPU/CUDA
     if model_name not in loaded_models:
         try:
             loaded_models[model_name] = SentenceTransformer(model_name, device=str(effective_device))
