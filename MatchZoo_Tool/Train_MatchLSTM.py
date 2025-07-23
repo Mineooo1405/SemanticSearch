@@ -13,7 +13,6 @@ print(f"Đã chọn device: {device}.")
 # --- 1. Tải các DataPack ---
 data_pack_dir = input("Nhập đường dẫn đến thư mục chứa các DataPack: ")
 train_pack_raw = mz.load_data_pack(os.path.join(data_pack_dir, 'train_pack.dam'))
-dev_pack_raw = mz.load_data_pack(os.path.join(data_pack_dir, 'dev_pack.dam'))
 test_pack_raw = mz.load_data_pack(os.path.join(data_pack_dir, 'test_pack.dam'))
 print("Tải DataPacks thành công.")
 
@@ -28,7 +27,6 @@ ranking_task.metrics = [
 # --- 3. Tiền xử lý dữ liệu ---
 preprocessor = mz.models.MatchLSTM.get_default_preprocessor()
 train_pack_processed = preprocessor.fit_transform(train_pack_raw)
-dev_pack_processed = preprocessor.transform(dev_pack_raw)
 test_pack_processed = preprocessor.transform(test_pack_raw)
 print("Tiền xử lý dữ liệu hoàn tất.")
 

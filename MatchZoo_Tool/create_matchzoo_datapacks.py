@@ -5,14 +5,16 @@ import os
 import sys
 from typing import cast
 
-def create_and_split_datapack(input_file: str, train_ratio: float, dev_ratio: float, has_header: bool):
+def create_and_split_datapack(input_file: str, train_ratio: float, has_header: bool):
     """
-    Đọc file TSV, chuyển đổi thành các DataPack của MatchZoo, và lưu chúng lại.
+    Đọc file TSV, chuyển đổi thành các DataPack của MatchZoo (train và test), và lưu chúng lại.
     
     :param input_file: Đường dẫn đến file TSV.
-    :param train_ratio: Tỷ lệ cho tập huấn luyện.
-    :param dev_ratio: Tỷ lệ cho tập phát triển.
+    :param train_ratio: Tỷ lệ cho tập huấn luyện (phần còn lại sẽ là test).
     :param has_header: True nếu file có dòng tiêu đề.
+    
+    Note: MatchZoo thường chỉ sử dụng train_pack và test_pack. 
+          Validation được thực hiện thông qua validation_split trong quá trình training.
     """
     print(f"Đang xử lý file: {input_file}")
     output_dir = os.path.dirname(input_file)
@@ -57,26 +59,24 @@ def create_and_split_datapack(input_file: str, train_ratio: float, dev_ratio: fl
     pack = mz.pack(df[['text_left', 'text_right', 'label']])
     print("Đã tạo DataPack thành công.")
 
-    # 5) Xáo trộn và phân chia
-    np.random.seed(42) # Để đảm bảo kết quả chia nhất quán
+    # 5) Xáo trộn và phân chia thành train/test
+    np.random.seed(42)  # Để đảm bảo kết quả chia nhất quán
     pack = cast(mz.DataPack, pack.shuffle())
     
     total_size = len(pack)
     train_end = int(total_size * train_ratio)
-    dev_end = train_end + int(total_size * dev_ratio)
 
     train_pack = pack[:train_end]
-    dev_pack = pack[train_end:dev_end]
-    test_pack = pack[dev_end:]
+    test_pack = pack[train_end:]
 
-    print(f"Đã chia dữ liệu: {len(train_pack)} train, {len(dev_pack)} dev, {len(test_pack)} test.")
+    print(f"Đã chia dữ liệu: {len(train_pack)} train, {len(test_pack)} test.")
+    print("Note: Validation sẽ được thực hiện thông qua validation_split trong quá trình training.")
 
     # 6) Lưu các DataPack
     try:
         train_pack.save(os.path.join(output_dir, 'train_pack.dam'))
-        dev_pack.save(os.path.join(output_dir, 'dev_pack.dam'))
         test_pack.save(os.path.join(output_dir, 'test_pack.dam'))
-        print(f"Đã lưu các file DataPack vào thư mục: {output_dir}")
+        print(f"Đã lưu train_pack.dam và test_pack.dam vào thư mục: {output_dir}")
     except Exception as e:
         print(f"Lỗi khi lưu file DataPack: {e}")
         sys.exit(1)
@@ -93,7 +93,7 @@ if __name__ == "__main__":
 
     while True:
         try:
-            train_ratio_str = input("Nhập tỉ lệ train (mặc định 0.8): ")
+            train_ratio_str = input("Nhập tỉ lệ train (mặc định 0.8, phần còn lại sẽ là test): ")
             if not train_ratio_str:
                 train_ratio = 0.8
                 break
@@ -105,26 +105,9 @@ if __name__ == "__main__":
         except ValueError:
             print("Vui lòng nhập một số hợp lệ.")
 
-    while True:
-        try:
-            dev_ratio_str = input("Nhập tỉ lệ dev (mặc định 0.1): ")
-            if not dev_ratio_str:
-                dev_ratio = 0.1
-                break
-            dev_ratio = float(dev_ratio_str)
-            if 0 < dev_ratio < 1:
-                break
-            else:
-                print("Tỉ lệ dev phải là số trong khoảng (0, 1).")
-        except ValueError:
-            print("Vui lòng nhập một số hợp lệ.")
-
-    if train_ratio + dev_ratio >= 1.0:
-        print(f"Lỗi: Tổng tỉ lệ train ({train_ratio}) và dev ({dev_ratio}) phải nhỏ hơn 1.")
-        sys.exit(1)
-        
-    test_ratio = 1.0 - train_ratio - dev_ratio
+    test_ratio = 1.0 - train_ratio
     print(f"Tỉ lệ test được tính tự động: {test_ratio:.2f}")
+    print("Note: Validation sẽ được thực hiện thông qua validation_split trong training script.")
 
     while True:
         has_header_str = input("File có header không? (yes/no, mặc định yes): ").lower()
@@ -137,5 +120,5 @@ if __name__ == "__main__":
         else:
             print("Vui lòng nhập 'yes' hoặc 'no'.")
 
-    create_and_split_datapack(input_file, train_ratio, dev_ratio, has_header)
+    create_and_split_datapack(input_file, train_ratio, has_header)
     print("--- Hoàn thành! ---")

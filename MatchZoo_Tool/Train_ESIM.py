@@ -28,7 +28,6 @@ ranking_task.metrics = [
 # --- 3. Tiền xử lý dữ liệu ---
 preprocessor = mz.models.ESIM.get_default_preprocessor()
 train_pack_processed = preprocessor.fit_transform(train_pack_raw)
-dev_pack_processed = preprocessor.transform(dev_pack_raw)
 test_pack_processed = preprocessor.transform(test_pack_raw)
 print("Tiền xử lý dữ liệu hoàn tất.")
 
