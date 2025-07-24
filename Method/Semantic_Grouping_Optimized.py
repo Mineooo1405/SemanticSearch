@@ -809,3 +809,52 @@ def helper_save_raw_oie_data(oie_data: List[Dict], chunk_id: str, output_dir: st
     except Exception as e:
         print(f"Warning: Could not save raw OIE data: {e}")
         return None
+
+# Compatibility wrapper to match interface expected by data_create_controller
+def semantic_chunk_passage_from_grouping_logic(
+    doc_id: str,
+    passage_text: str,
+    embedding_model: str = "thenlper/gte-base",
+    initial_threshold: Union[str, float] = "auto",
+    decay_factor: float = 0.85,
+    min_threshold: Union[str, float] = "auto",
+    window_size: int = 3,  # Unused in optimized version but kept for compatibility
+    embedding_batch_size: int = 16,
+    include_oie: bool = False,
+    save_raw_oie: bool = False,
+    output_dir: str = "./output",
+    initial_percentile: str = "85",
+    min_percentile: str = "25",
+    target_tokens: int = 120,
+    tolerance: float = 0.25,
+    silent: bool = False,
+    device: Optional[object] = None,
+    **kwargs
+) -> List[Tuple[str, str, Optional[str]]]:
+    """
+    Compatibility wrapper for the optimized semantic grouping.
+    This function maintains the same interface as the original semantic_chunk_passage_from_grouping_logic
+    but uses the optimized implementation.
+    """
+    # Convert target_tokens to max_chunk_len_tokens for optimized function
+    max_tokens = int(target_tokens * (1 + tolerance)) if target_tokens else 200
+    min_tokens = int(target_tokens * (1 - tolerance)) if target_tokens else 0
+    
+    return semantic_grouping_main(
+        passage_text=passage_text,
+        doc_id=doc_id,
+        embedding_model=embedding_model,
+        initial_threshold=initial_threshold,
+        decay_factor=decay_factor,
+        min_threshold=min_threshold,
+        min_chunk_len_tokens=min_tokens,
+        max_chunk_len_tokens=max_tokens,
+        include_oie=include_oie,
+        save_raw_oie=save_raw_oie,
+        output_dir=output_dir,
+        initial_percentile=initial_percentile,
+        min_percentile=min_percentile,
+        embedding_batch_size=embedding_batch_size,
+        silent=silent,
+        **kwargs
+    )

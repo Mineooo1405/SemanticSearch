@@ -42,12 +42,34 @@ import time
 # Local imports - ranking utilities
 from Tool.rank_chunks import rank_by_cosine_similarity, rank_by_bm25, rank_by_rrf
 
-# Local imports - chunking methods
-from Method.Semantic_Grouping import semantic_chunk_passage_from_grouping_logic
-from Method.Semantic_Splitter import chunk_passage_text_splitter
-from Method.Text_Splitter import chunk_passage_text_splitter
+# Local imports - chunking methods (using optimized versions with compatibility wrappers)
+from Method.Semantic_Grouping_Optimized import semantic_chunk_passage_from_grouping_logic as semantic_grouping_optimized
+from Method.Semantic_Splitter_Optimized import chunk_passage_text_splitter as semantic_splitter_optimized
+from Method.Text_Splitter_Optimized import chunk_passage_text_splitter as text_splitter_optimized
 
 # Optional imports with graceful error handling
+try:
+    import shutil
+except ImportError:
+    print("Warning: shutil not available, some features may be limited")
+
+# Process isolation configuration for better worker separation
+def configure_process_isolation():
+    """Configure multiprocessing for better process isolation and model separation."""
+    try:
+        # Use 'spawn' method for better process isolation on Windows
+        # This ensures each worker process starts fresh without shared state
+        if multiprocessing.get_start_method(allow_none=True) != 'spawn':
+            multiprocessing.set_start_method('spawn', force=True)
+            print("Configured multiprocessing with 'spawn' method for better process isolation")
+    except RuntimeError as e:
+        # Start method may already be set
+        print(f"Note: Multiprocessing start method already configured: {e}")
+    except Exception as e:
+        print(f"Warning: Could not configure process isolation: {e}")
+
+# Configure process isolation at module level
+configure_process_isolation()
 try:
     from Tool.OIE import extract_relations_from_paragraph
     OIE_AVAILABLE_GLOBALLY = True
@@ -120,9 +142,23 @@ def _utility_recommend_embedding_model():
         # Check GPU memory first for DirectML/CUDA support
         try:
             import torch
-            if torch.cuda.is_available():
+            gpu_memory_gb = None
+            
+            # Check DirectML first (AMD GPUs)
+            try:
+                import torch_directml
+                if torch_directml.is_available():
+                    # DirectML doesn't provide detailed memory info, assume high-end GPU
+                    gpu_memory_gb = 8.0  # Conservative estimate for modern AMD GPUs
+            except ImportError:
+                pass
+            
+            # Check CUDA if DirectML not available
+            if gpu_memory_gb is None and torch.cuda.is_available():
                 gpu_memory_gb = torch.cuda.get_device_properties(0).total_memory / (1024**3)
-                
+            
+            # Make recommendation based on GPU memory
+            if gpu_memory_gb is not None:
                 if gpu_memory_gb >= 6:
                     return "gte-large"
                 elif gpu_memory_gb >= 3:
@@ -447,6 +483,7 @@ SEMANTIC_SPLITTER_DEFAULTS = {
     "enable_adaptive": ADAPTIVE_CHUNKING_CONFIG["enable_adaptive"],
     "target_tokens": ADAPTIVE_CHUNKING_CONFIG["target_tokens"],
     "tolerance": ADAPTIVE_CHUNKING_CONFIG["tolerance"],
+    "semantic_threshold": 0.30,  # Add semantic threshold to enable embedding-based splitting
     "oie_token_budget": 40
 }
 
@@ -660,7 +697,7 @@ class DatasetController:
         """
         if not self._silent_mode:  # Only log if not in silent mode
             getattr(self.logger, level.lower(), self.logger.info)(message)
-    
+
     def _utility_memory_status(self) -> dict:
         """Monitor current system memory usage for processing optimization.
         
@@ -926,11 +963,11 @@ class DatasetController:
         method_params['include_oie'] = use_oie
         method_params['save_raw_oie'] = use_oie and config.get("save_raw_oie", False)
 
-        # Map method choices to their corresponding chunking functions
+        # Map method choices to their corresponding optimized chunking functions
         chunking_function_map = {
-            "1": semantic_chunk_passage_from_grouping_logic,      # Semantic grouping
-            "2": chunk_passage_text_splitter,                    # Semantic splitting
-            "3": chunk_passage_text_splitter,                    # Text splitting
+            "1": semantic_grouping_optimized,                    # Semantic grouping (optimized)
+            "2": semantic_splitter_optimized,                    # Semantic splitting (optimized)
+            "3": text_splitter_optimized,                        # Text splitting (optimized)
         }
         chunking_function = chunking_function_map.get(method_choice)
 
@@ -1039,7 +1076,9 @@ class DatasetController:
         self._log_safe('info', f"Processing {len(batches)} batches with {config_workers} workers for {task_name}")
         
         # Optimize worker allocation based on available resources
-        effective_workers = min(config_workers, len(batches), multiprocessing.cpu_count())
+        effective_workers = min(config_workers, len(batches))  # Remove CPU limit to allow more workers
+        if effective_workers > multiprocessing.cpu_count():
+            self._log_safe('warning', f"Using {effective_workers} workers > {multiprocessing.cpu_count()} CPU cores. This may reduce performance.")
         self._log_safe('info', f"Using {effective_workers} effective workers for {len(batches)} batches")
         
         # Get current embedding model for workers
@@ -1253,20 +1292,34 @@ class DatasetController:
             # Import optimized ranking function
             from Tool.rank_chunks_optimized import rank_and_filter_chunks_optimized
             
-            self._log_safe('info', f"Starting optimized ranking for {chunks_tsv}")
+            # Calculate optimal chunk size based on available memory
+            import psutil
+            available_ram_gb = psutil.virtual_memory().available / (1024**3)
+            # Use smaller chunks for low memory systems
+            if available_ram_gb < 4:
+                chunk_size = 20000  # 20K rows for low memory
+            elif available_ram_gb < 8:
+                chunk_size = 35000  # 35K rows for moderate memory  
+            else:
+                chunk_size = 50000  # 50K rows for high memory
+                
+            self._log_safe('info', f"Starting memory-optimized ranking for {chunks_tsv}")
+            self._log_safe('info', f"Using chunk size: {chunk_size:,} rows (RAM available: {available_ram_gb:.1f}GB)")
+            
             try:
-                # Try with max_workers parameter first
+                # Try with all parameters including chunk_size
                 result_path = rank_and_filter_chunks_optimized(
                     chunks_tsv=chunks_tsv,
                     output_dir=output_dir, 
                     upper_percentile=upper_percentile,
                     lower_percentile=lower_percentile,
                     model_name=COMMON_DEFAULTS["embedding_model"],
-                    max_workers=ranking_workers  # Pass ranking workers to optimization function
+                    max_workers=ranking_workers,  # Pass ranking workers to optimization function
+                    chunk_size=chunk_size  # Memory optimization parameter
                 )
             except TypeError:
-                # Fallback: call without max_workers parameter
-                self._log_safe('warning', f"Optimized ranking function doesn't support max_workers parameter, using fallback")
+                # Fallback: call without newer parameters
+                self._log_safe('warning', f"Using fallback ranking without memory optimization")
                 result_path = rank_and_filter_chunks_optimized(
                     chunks_tsv=chunks_tsv,
                     output_dir=output_dir, 
@@ -1618,6 +1671,8 @@ class DatasetController:
             self.logger.info(f"Running {len(non_oie_configs)} non-OIE configurations in parallel...")
             # Use optimal worker count based on available tasks
             effective_workers = min(max_workers, len(non_oie_configs))
+            if max_workers > len(non_oie_configs):
+                self.logger.info(f"Note: Requested {max_workers} workers but only {len(non_oie_configs)} configs available")
             self.logger.info(f"Using {effective_workers} effective workers for {len(non_oie_configs)} tasks")
             
             # Log internal worker configuration details
@@ -2095,7 +2150,10 @@ class DatasetController:
         succ_file_paths = [res.get('output_file', '') for res in results_phase1 if res.get('success') and res.get('output_file')]
 
         if succ_file_paths:
-            max_aug_workers = min(len(succ_file_paths), max(1, multiprocessing.cpu_count() // 2))
+            # Allow more workers than CPU cores for OIE augmentation (I/O bound)
+            max_aug_workers = len(succ_file_paths)  # Use as many workers as files (remove CPU limit)
+            if max_aug_workers > multiprocessing.cpu_count():
+                self._log_safe('info', f'Using {max_aug_workers} augment workers > {multiprocessing.cpu_count()} CPU cores (OIE is I/O bound)')
             self._log_safe('info', f'Pha 2: augment {len(succ_file_paths)} file song song (workers={max_aug_workers})')
 
             with ProcessPoolExecutor(max_workers=max_aug_workers) as executor:
@@ -2149,6 +2207,7 @@ def helper_run_chunking_config_process(config: dict, input_tsv_path: str, output
     def log_gpu_status(prefix=""):
         try:
             import torch
+            gpu_found = False
             
             # Try DirectML first
             try:
@@ -2157,16 +2216,20 @@ def helper_run_chunking_config_process(config: dict, input_tsv_path: str, output
                     device_count = torch_directml.device_count()
                     device_name = torch_directml.device_name(0) if device_count > 0 else "Unknown"
                     print(f"[PID {process_id}] {prefix}DirectML: {device_count} device(s) - {device_name}")
-                    return
+                    gpu_found = True
             except ImportError:
                 pass
             
-            # Check CUDA
-            if torch.cuda.is_available():
-                allocated = torch.cuda.memory_allocated(0) / (1024**3)
-                reserved = torch.cuda.memory_reserved(0) / (1024**3)
-                print(f"[PID {process_id}] {prefix}CUDA: {allocated:.2f}GB allocated, {reserved:.2f}GB reserved")
-            else:
+            # Check CUDA only if DirectML not found
+            if not gpu_found:
+                if torch.cuda.is_available():
+                    allocated = torch.cuda.memory_allocated(0) / (1024**3)
+                    reserved = torch.cuda.memory_reserved(0) / (1024**3)
+                    print(f"[PID {process_id}] {prefix}CUDA: {allocated:.2f}GB allocated, {reserved:.2f}GB reserved")
+                    gpu_found = True
+                    
+            # Only print CPU message if no GPU found
+            if not gpu_found:
                 print(f"[PID {process_id}] {prefix}Using CPU processing")
         except Exception as e:
             print(f"[PID {process_id}] {prefix}GPU monitoring failed: {e}")
@@ -2175,6 +2238,27 @@ def helper_run_chunking_config_process(config: dict, input_tsv_path: str, output
     
     if embedding_model:
         COMMON_DEFAULTS["embedding_model"] = embedding_model
+        # Force clear global model cache to ensure each config worker loads its own model
+        try:
+            from Tool.Sentence_Embedding import loaded_models
+            loaded_models.clear()
+            print(f"[PID {process_id}] Cleared model cache - loading dedicated model: {embedding_model}")
+            
+            # Pre-load and verify the model
+            from Tool.Sentence_Embedding import sentence_embedding
+            test_embedding = sentence_embedding(["test"], embedding_model, batch_size=1)
+            print(f"[PID {process_id}] Successfully loaded dedicated model for config: {config['name']}")
+            del test_embedding  # Free test memory
+        except Exception as e:
+            print(f"[PID {process_id}] Warning: Could not pre-load model: {e}")
+    else:
+        # Still clear cache even for default model to ensure fresh load
+        try:
+            from Tool.Sentence_Embedding import loaded_models
+            loaded_models.clear()
+            print(f"[PID {process_id}] Cleared model cache for default model")
+        except Exception as e:
+            print(f"[PID {process_id}] Warning: Could not clear model cache: {e}")
     
     controller = DatasetController(input_tsv_path, output_base_dir, auto_start_oie=auto_start_oie, silent_mode=True)
     start_time = time.time()
@@ -2203,9 +2287,34 @@ def helper_run_chunking_config_process(config: dict, input_tsv_path: str, output
 
 def helper_run_augment_process(source_tsv: str, output_base_dir: str, oie_threads: int, embedding_model: str = None) -> str:
     """Process-based worker: augment single TSV with OIE and RRF filter."""
+    import os
+    
+    process_id = os.getpid()
+    
     # Update embedding model in subprocess if provided
     if embedding_model:
         COMMON_DEFAULTS["embedding_model"] = embedding_model
+        # Force clear global model cache to ensure each augment worker loads its own model
+        try:
+            from Tool.Sentence_Embedding import loaded_models
+            loaded_models.clear()
+            print(f"[PID {process_id}] Augment worker: Cleared model cache - loading dedicated model: {embedding_model}")
+            
+            # Pre-load and verify the model
+            from Tool.Sentence_Embedding import sentence_embedding
+            test_embedding = sentence_embedding(["test"], embedding_model, batch_size=1)
+            print(f"[PID {process_id}] Augment worker: Successfully loaded dedicated model")
+            del test_embedding  # Free test memory
+        except Exception as e:
+            print(f"[PID {process_id}] Augment worker: Warning: Could not pre-load model: {e}")
+    else:
+        # Still clear cache even for default model
+        try:
+            from Tool.Sentence_Embedding import loaded_models
+            loaded_models.clear()
+            print(f"[PID {process_id}] Augment worker: Cleared model cache for default model")
+        except Exception as e:
+            print(f"[PID {process_id}] Augment worker: Warning: Could not clear model cache: {e}")
     
     controller = DatasetController(source_tsv, output_base_dir, auto_start_oie=False)
     return controller.process_augment_with_oie(source_tsv, threads=oie_threads)
@@ -2268,7 +2377,7 @@ def data_create_controller_main():
         print(f"   VRAM: ~{model_info['vram_gb']}GB | Dimensions: {model_info['dimensions']}")
     else:
         print(f"\nFinal embedding model: {final_model} (custom configuration)")
-    
+
     # Processing mode selection with comprehensive options
     mode_choice = input("\nProcessing Mode Selection:\n1. Single-phase (Without OIE only)\n2. Two-phase (Without OIE → With OIE)\n3. Convert existing chunks to OIE\nEnter choice (1-3, default: 1): ").strip()
     
@@ -2323,13 +2432,16 @@ def data_create_controller_main():
     oie_threads = 8  # Default value
     
     if use_parallel:
-        print(f"\nWorker Configuration (Max CPU cores: {multiprocessing.cpu_count()})")
+        print(f"\nWorker Configuration (CPU cores: {multiprocessing.cpu_count()})")
         print("=" * 50)
+        print("Note: You can use more workers than CPU cores, but it may reduce performance")
         
         # Chunking/OIE workers
-        max_workers_input = input(f"Chunking/OIE workers (default: auto-calculate): ").strip()
+        max_workers_input = input(f"Chunking/OIE workers (default: auto-calculate, max recommended: {multiprocessing.cpu_count() * 2}): ").strip()
         if max_workers_input.isdigit():
-            max_workers = min(int(max_workers_input), multiprocessing.cpu_count())
+            max_workers = int(max_workers_input)
+            if max_workers > multiprocessing.cpu_count():
+                print(f"WARNING: {max_workers} workers > {multiprocessing.cpu_count()} CPU cores. This may reduce performance.")
             print(f"Chunking/OIE workers: {max_workers}")
         else:
             print(f"Chunking/OIE workers: auto-calculate")
@@ -2338,23 +2450,29 @@ def data_create_controller_main():
     print(f"\nConfig Worker Configuration")
     print("=" * 40)
     print("Workers per config: Each config can use multiple workers for internal batch processing")
-    config_workers_input = input(f"Workers per config (default: 1=sequential, recommended: 2-5): ").strip()
+    config_workers_input = input(f"Workers per config (default: 1=sequential, max recommended: {multiprocessing.cpu_count()}): ").strip()
     config_workers = None
     if config_workers_input.isdigit():
-        config_workers = min(int(config_workers_input), multiprocessing.cpu_count())
+        config_workers = int(config_workers_input)
+        if config_workers > multiprocessing.cpu_count():
+            print(f"WARNING: {config_workers} workers > {multiprocessing.cpu_count()} CPU cores. This may reduce performance.")
         print(f"Workers per config: {config_workers}")
         if use_parallel and max_workers and config_workers:
             total_workers = max_workers * config_workers
             print(f"Total system workers: {total_workers} (configs: {max_workers} × workers per config: {config_workers})")
+            if total_workers > multiprocessing.cpu_count() * 2:
+                print(f"WARNING: Total workers ({total_workers}) is very high. Consider reducing.")
     else:
         print(f"Workers per config: 1 (sequential)")
     
     # Ranking workers (ask for both parallel and sequential since ranking affects both)
     print(f"\nRanking Worker Configuration")
     print("=" * 40)
-    ranking_workers_input = input(f"Ranking workers (default: auto-calculate, recommended: 2-4): ").strip()
+    ranking_workers_input = input(f"Ranking workers (default: auto-calculate, max recommended: {multiprocessing.cpu_count()}): ").strip()
     if ranking_workers_input.isdigit():
-        ranking_workers = min(int(ranking_workers_input), multiprocessing.cpu_count())
+        ranking_workers = int(ranking_workers_input)
+        if ranking_workers > multiprocessing.cpu_count():
+            print(f"WARNING: {ranking_workers} workers > {multiprocessing.cpu_count()} CPU cores. This may reduce performance.")
         print(f"Ranking workers: {ranking_workers}")
     else:
         print(f"Ranking workers: auto-calculate")
@@ -2363,9 +2481,11 @@ def data_create_controller_main():
     if two_phase:
         print(f"\nOIE Thread Configuration (Two-phase mode)")
         print("=" * 45)
-        oie_threads_input = input(f"OIE threads (default: 8, recommended: 4-8): ").strip()
+        oie_threads_input = input(f"OIE threads (default: 8, max recommended: {multiprocessing.cpu_count() * 2}): ").strip()
         if oie_threads_input.isdigit():
-            oie_threads = min(int(oie_threads_input), multiprocessing.cpu_count())
+            oie_threads = int(oie_threads_input)
+            if oie_threads > multiprocessing.cpu_count() * 2:
+                print(f"WARNING: {oie_threads} threads > {multiprocessing.cpu_count() * 2} (2x CPU cores). This may reduce performance.")
             print(f"OIE threads: {oie_threads}")
         else:
             print(f"OIE threads: 8 (default)")
@@ -2486,8 +2606,33 @@ def helper_process_single_batch(batch_df: pd.DataFrame, config: dict, batch_num:
             print(f"[PID {process_id}|{worker_tag}] Loading dedicated embedding model: {embedding_model}")
             # Configure model for this worker process
             COMMON_DEFAULTS["embedding_model"] = embedding_model
+            
+            # IMPORTANT: Force clear global model cache to ensure each worker loads its own model
+            try:
+                from Tool.Sentence_Embedding import loaded_models
+                # Clear the shared cache to force reload in this worker process
+                loaded_models.clear()
+                print(f"[PID {process_id}|{worker_tag}] Cleared shared model cache - forcing dedicated model load")
+                
+                # Pre-load the model to verify it works
+                from Tool.Sentence_Embedding import sentence_embedding
+                test_embedding = sentence_embedding(["test"], embedding_model, batch_size=1)
+                print(f"[PID {process_id}|{worker_tag}] Successfully loaded dedicated model - {len(test_embedding)} embeddings generated")
+                del test_embedding  # Free test memory
+            except Exception as e:
+                print(f"[PID {process_id}|{worker_tag}] Warning: Could not pre-load model: {e}")
+        else:
+            print(f"[PID {process_id}|{worker_tag}] Using default embedding model: {COMMON_DEFAULTS['embedding_model']}")
+            # Still clear cache to ensure fresh model load
+            try:
+                from Tool.Sentence_Embedding import loaded_models
+                loaded_models.clear()
+                print(f"[PID {process_id}|{worker_tag}] Cleared shared model cache for default model")
+            except Exception as e:
+                print(f"[PID {process_id}|{worker_tag}] Warning: Could not clear model cache: {e}")
         
         # Assess GPU/CPU availability for this worker with DirectML support
+        gpu_available = False
         try:
             import torch
             
@@ -2498,17 +2643,22 @@ def helper_process_single_batch(batch_df: pd.DataFrame, config: dict, batch_num:
                     device_count = torch_directml.device_count()
                     device_name = torch_directml.device_name(0) if device_count > 0 else "Unknown"
                     print(f"[PID {process_id}|{worker_tag}] Using DirectML: {device_count} device(s) - {device_name}")
+                    gpu_available = True
                 else:
                     print(f"[PID {process_id}|{worker_tag}] DirectML not available")
             except ImportError:
                 print(f"[PID {process_id}|{worker_tag}] DirectML not installed")
             
-            # Check CUDA as fallback
-            if torch.cuda.is_available():
+            # Check CUDA as fallback only if DirectML is not available
+            if not gpu_available and torch.cuda.is_available():
                 gpu_memory = torch.cuda.memory_allocated(0) / (1024**3)
-                print(f"[PID {process_id}|{worker_tag}] CUDA available: {gpu_memory:.2f}GB allocated")
-            else:
+                print(f"[PID {process_id}|{worker_tag}] Using CUDA: {gpu_memory:.2f}GB allocated")
+                gpu_available = True
+            
+            # Only print CPU message if no GPU is available
+            if not gpu_available:
                 print(f"[PID {process_id}|{worker_tag}] Using CPU processing")
+                
         except ImportError:
             print(f"[PID {process_id}|{worker_tag}] PyTorch not available, using CPU processing")
         
@@ -2522,11 +2672,11 @@ def helper_process_single_batch(batch_df: pd.DataFrame, config: dict, batch_num:
         method_params['include_oie'] = use_oie
         method_params['save_raw_oie'] = use_oie and config.get("save_raw_oie", False)
 
-        # Map method choices to their corresponding chunking functions
+        # Map method choices to their corresponding optimized chunking functions
         chunking_function_map = {
-            "1": semantic_chunk_passage_from_grouping_logic,      # Semantic grouping
-            "2": chunk_passage_text_splitter,                    # Semantic splitting  
-            "3": chunk_passage_text_splitter,                    # Text splitting
+            "1": semantic_grouping_optimized,                    # Semantic grouping (optimized)
+            "2": semantic_splitter_optimized,                    # Semantic splitting (optimized)
+            "3": text_splitter_optimized,                        # Text splitting (optimized)
         }
         chunking_function = chunking_function_map.get(method_choice)
 

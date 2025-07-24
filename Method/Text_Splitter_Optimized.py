@@ -606,3 +606,40 @@ def text_splitter_main(
                 pass  # Ignore OIE errors in fallback
         
         return [(f"{doc_id}_error_fallback", final_text, oie_string)]
+
+# Compatibility wrapper to match interface expected by data_create_controller
+def chunk_passage_text_splitter(
+    doc_id: str,
+    passage_text: str,
+    chunk_size: int = 1000,
+    chunk_overlap: int = 0,
+    include_oie: bool = False,
+    save_raw_oie: bool = False,
+    output_dir: str = "./output",
+    device: Optional[object] = None,
+    target_tokens: int = 140,
+    tolerance: float = 0.075,
+    enable_adaptive: bool = True,
+    silent: bool = False,
+    **kwargs 
+) -> List[Tuple[str, str, Optional[str]]]:
+    """
+    Compatibility wrapper for the optimized text splitter.
+    This function maintains the same interface as the original chunk_passage_text_splitter
+    but uses the optimized implementation.
+    """
+    return text_splitter_main(
+        doc_id=doc_id,
+        passage_text=passage_text,
+        chunk_size=chunk_size,
+        chunk_overlap=chunk_overlap,
+        include_oie=include_oie,
+        save_raw_oie=save_raw_oie,
+        output_dir=output_dir,
+        device=device,
+        target_tokens=target_tokens,
+        tolerance=tolerance,
+        enable_adaptive=enable_adaptive,
+        silent=silent,
+        **kwargs
+    )

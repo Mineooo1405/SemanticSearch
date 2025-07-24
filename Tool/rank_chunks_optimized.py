@@ -4,11 +4,45 @@ Optimized ranking module with memory efficiency and caching
 import pandas as pd
 import numpy as np
 import gc
+import os
 from typing import Dict, List, Tuple, Optional
 from pathlib import Path
 import hashlib
 from sklearn.metrics.pairwise import cosine_similarity
 from rank_bm25 import BM25Okapi
+
+
+def estimate_memory_usage(file_path: str) -> Dict[str, float]:
+    """Estimate memory usage for processing a TSV file
+    
+    Returns:
+        Dict with estimated memory usage in GB for different processing methods
+    """
+    if not os.path.exists(file_path):
+        return {"error": "File not found"}
+    
+    try:
+        # Get file size
+        file_size_bytes = os.path.getsize(file_path)
+        file_size_mb = file_size_bytes / (1024 * 1024)
+        
+        # Estimate based on file size and typical data overhead
+        # TSV files typically expand 3-5x in memory due to pandas overhead
+        pandas_overhead_factor = 4.0
+        estimated_memory_gb = (file_size_bytes * pandas_overhead_factor) / (1024**3)
+        
+        # Embedding processing typically adds 50-100% memory overhead
+        embedding_overhead_factor = 1.7
+        peak_memory_gb = estimated_memory_gb * embedding_overhead_factor
+        
+        return {
+            "file_size_mb": file_size_mb,
+            "estimated_memory_gb": estimated_memory_gb,
+            "peak_memory_gb": peak_memory_gb,
+            "recommended_chunk_size": max(10000, min(100000, int(50000 / max(1, estimated_memory_gb / 2))))
+        }
+    except Exception as e:
+        return {"error": str(e)}
 
 
 class OptimizedRanker:
@@ -159,8 +193,9 @@ class OptimizedRanker:
 
 def rank_and_filter_chunks_optimized(chunks_tsv: str, output_dir: Path,
                                     upper_percentile: int = 80, lower_percentile: int = 20,
-                                    model_name: str = "thenlper/gte-base", max_workers: int = None) -> str:
-    """Optimized version of rank_and_filter_chunks with memory efficiency and parallel processing
+                                    model_name: str = "thenlper/gte-base", max_workers: int = None,
+                                    chunk_size: int = 50000) -> str:
+    """Memory-optimized version with chunked data loading to prevent RAM overflow
     
     Args:
         chunks_tsv: Path to input TSV file
@@ -169,38 +204,151 @@ def rank_and_filter_chunks_optimized(chunks_tsv: str, output_dir: Path,
         lower_percentile: Lower percentile for negative samples
         model_name: Embedding model name
         max_workers: Number of parallel workers (None = sequential processing)
+        chunk_size: Number of rows to process at once (default: 50,000)
     """
     
     if not Path(chunks_tsv).exists():
         return ""
     
-    print(f"Loading data from {chunks_tsv}...")
-    df = pd.read_csv(chunks_tsv, sep='\t', on_bad_lines='warn', engine='python')
-    df.columns = df.columns.str.strip()
+    print(f"Starting memory-optimized ranking from {chunks_tsv}...")
     
-    required_cols = {'query_id', 'query_text', 'chunk_text', 'chunk_id'}
-    if not required_cols.issubset(set(df.columns)):
-        print(f"Missing required columns. Found: {df.columns.tolist()}")
+    # Estimate memory requirements and adjust chunk size accordingly
+    memory_estimate = estimate_memory_usage(chunks_tsv)
+    if "error" in memory_estimate:
+        print(f"Warning: Could not estimate memory usage: {memory_estimate['error']}")
+        file_size_mb = Path(chunks_tsv).stat().st_size / (1024 * 1024)
+    else:
+        file_size_mb = memory_estimate["file_size_mb"]
+        estimated_memory = memory_estimate["estimated_memory_gb"]
+        peak_memory = memory_estimate["peak_memory_gb"]
+        recommended_chunk = memory_estimate["recommended_chunk_size"]
+        
+        print(f"Memory analysis:")
+        print(f"  File size: {file_size_mb:.1f} MB")
+        print(f"  Estimated memory usage: {estimated_memory:.1f} GB")
+        print(f"  Peak memory usage: {peak_memory:.1f} GB")
+        print(f"  Recommended chunk size: {recommended_chunk:,} rows")
+        
+        # Use smaller chunk size if file is very large
+        if chunk_size > recommended_chunk:
+            chunk_size = recommended_chunk
+            print(f"  Adjusting chunk size to {chunk_size:,} rows for memory efficiency")
+    
+    print(f"Input file size: {file_size_mb:.1f} MB")
+    
+    # First pass: Count total rows and get column info without loading all data
+    print("Scanning file structure...")
+    try:
+        header_sample = pd.read_csv(chunks_tsv, sep='\t', nrows=0, on_bad_lines='warn', engine='python')
+        header_sample.columns = header_sample.columns.str.strip()
+        
+        required_cols = {'query_id', 'query_text', 'chunk_text', 'chunk_id'}
+        if not required_cols.issubset(set(header_sample.columns)):
+            print(f"Missing required columns. Found: {header_sample.columns.tolist()}")
+            return ""
+        
+        # Get total row count efficiently
+        total_rows = sum(1 for _ in open(chunks_tsv, 'r', encoding='utf-8')) - 1  # Subtract header
+        print(f"Total rows: {total_rows:,}")
+        
+    except Exception as e:
+        print(f"Error scanning file: {e}")
         return ""
     
-    total_queries = df['query_id'].nunique()
-    print(f"Processing {total_queries} unique queries...")
+    # Process data in memory-friendly chunks
+    kept_rows = []
+    processed_rows = 0
     
-    # Choose processing method based on max_workers
-    if max_workers and max_workers > 1:
-        print(f"Using parallel processing with {max_workers} workers (dedicated models)")
-        kept_rows = _process_queries_parallel(df, model_name, upper_percentile, lower_percentile, max_workers)
-    else:
-        print("Using sequential processing (single model)")
-        kept_rows = _process_queries_sequential(df, model_name, upper_percentile, lower_percentile)
+    print(f"Processing in chunks of {chunk_size:,} rows to optimize memory usage...")
+    
+    # Monitor memory usage during processing
+    try:
+        import psutil
+        initial_memory = psutil.virtual_memory()
+        print(f"Initial RAM usage: {(initial_memory.total - initial_memory.available) / (1024**3):.1f}GB / {initial_memory.total / (1024**3):.1f}GB")
+    except ImportError:
+        print("Memory monitoring not available (psutil not installed)")
+    
+    # Read and process file in chunks
+    chunk_iterator = pd.read_csv(chunks_tsv, sep='\t', chunksize=chunk_size, 
+                                on_bad_lines='warn', engine='python')
+    
+    for chunk_num, df_chunk in enumerate(chunk_iterator, 1):
+        try:
+            df_chunk.columns = df_chunk.columns.str.strip()
+            processed_rows += len(df_chunk)
+            
+            print(f"Processing chunk {chunk_num}: rows {processed_rows - len(df_chunk) + 1:,} to {processed_rows:,}")
+            
+            # Get unique queries in this chunk
+            chunk_queries = df_chunk['query_id'].nunique()
+            print(f"  Found {chunk_queries} unique queries in chunk {chunk_num}")
+            
+            # Log memory usage every few chunks
+            if chunk_num % 3 == 0:
+                try:
+                    current_memory = psutil.virtual_memory()
+                    memory_used = (current_memory.total - current_memory.available) / (1024**3)
+                    print(f"  Current RAM usage: {memory_used:.1f}GB / {current_memory.total / (1024**3):.1f}GB ({current_memory.percent:.1f}%)")
+                except:
+                    pass
+            
+            # Process this chunk based on max_workers
+            if max_workers and max_workers > 1:
+                chunk_results = _process_queries_parallel(df_chunk, model_name, upper_percentile, 
+                                                        lower_percentile, max_workers)
+            else:
+                chunk_results = _process_queries_sequential(df_chunk, model_name, upper_percentile, 
+                                                          lower_percentile)
+            
+            if chunk_results:
+                kept_rows.extend(chunk_results)
+                print(f"  Chunk {chunk_num} yielded {len(chunk_results)} ranked query groups")
+            
+            # Force garbage collection after each chunk
+            del df_chunk
+            gc.collect()
+            
+        except Exception as e:
+            print(f"Error processing chunk {chunk_num}: {e}")
+            continue
+    
+    print(f"Completed processing {processed_rows:,} total rows in {chunk_num} chunks")
     
     if not kept_rows:
         print("No data to save after filtering")
         return ""
     
-    # Combine results
-    print("Combining and saving results...")
-    final_df = pd.concat(kept_rows, ignore_index=True)
+    # Combine results with memory optimization
+    print(f"Combining {len(kept_rows)} result groups...")
+    
+    # Process results in smaller batches to avoid memory spike
+    batch_size = 10  # Process 10 result DataFrames at a time
+    final_dfs = []
+    
+    for i in range(0, len(kept_rows), batch_size):
+        batch = kept_rows[i:i+batch_size]
+        if batch:
+            batch_df = pd.concat(batch, ignore_index=True)
+            final_dfs.append(batch_df)
+            
+            # Clear the batch from memory
+            for df in batch:
+                del df
+            del batch
+            gc.collect()
+            
+            print(f"  Processed batch {(i//batch_size) + 1}/{(len(kept_rows) + batch_size - 1) // batch_size}")
+    
+    # Final combine
+    print("Final combination...")
+    final_df = pd.concat(final_dfs, ignore_index=True)
+    
+    # Clear intermediate results
+    del final_dfs, kept_rows
+    gc.collect()
+    
+    print(f"Combined dataset: {len(final_df):,} rows")
     
     # Save main file
     save_path = output_dir / f"{Path(chunks_tsv).stem}_rrf_filtered.tsv"
@@ -212,12 +360,14 @@ def rank_and_filter_chunks_optimized(chunks_tsv: str, output_dir: Path,
         simple_df.columns = ['query', 'passage', 'label']
         simple_path = output_dir / f"{Path(chunks_tsv).stem}_rrf_filtered_3col.tsv"
         simple_df.to_csv(simple_path, sep='\t', index=False)
+        del simple_df  # Free memory immediately
     except Exception as e:
         print(f"Warning: Could not create 3-column file: {e}")
     
-    print(f"Ranking complete. Saved {len(final_df)} filtered chunks to {save_path}")
+    print(f"Memory-optimized ranking complete. Saved {len(final_df):,} filtered chunks to {save_path}")
     
-    # Force cleanup
+    # Final cleanup
+    del final_df
     gc.collect()
     
     return str(save_path)
