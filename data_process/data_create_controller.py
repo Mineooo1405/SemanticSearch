@@ -640,14 +640,8 @@ class DatasetController:
         self.logger.addHandler(console_handler)
         
         # Define target IR models optimized for semantic chunking
-        self.target_models = ["knrm", "drmm", "anmm", "dssm", "cdssm", "conv_knrm"]
-        
-        # Log system configuration details
-        self._log_safe('info', f"Adaptive Controller initialized for dataset: {input_tsv_path}")
-        self._log_safe('info', f"Target models: {', '.join(self.target_models)}")
-        self._log_safe('info', f"Adaptive chunk range: {ADAPTIVE_CHUNKING_CONFIG['min_tokens']}-{ADAPTIVE_CHUNKING_CONFIG['max_tokens']} tokens")
-        self._log_safe('info', f"Target: {ADAPTIVE_CHUNKING_CONFIG['target_tokens']} tokens ±{ADAPTIVE_CHUNKING_CONFIG['tolerance']*100:.0f}%")
-        
+        self.target_models = []
+
         # Log current embedding model configuration
         current_model = COMMON_DEFAULTS["embedding_model"]
         model_info = None
@@ -740,56 +734,7 @@ class DatasetController:
         except ImportError:
             return {"error": "psutil not available"}
     
-    def _utility_check_memory_safety(self, warn_threshold: float = 85.0) -> bool:
-        """Validate system memory safety before continuing processing operations.
-        
-        Monitors RAM usage and provides warnings when memory consumption approaches
-        dangerous levels that could cause system instability or processing failures.
-        
-        Args:
-            warn_threshold (float): RAM usage percentage threshold for warnings (default: 85.0)
-            
-        Returns:
-            bool: True if memory usage is safe to continue, False if critical levels reached
-        """
-        status = self._utility_memory_status()
-        if "error" in status:
-            return True  # Cannot check memory status, assume safe to continue
-            
-        ram_usage = status.get("ram_usage_percent", 0)
-        if ram_usage > warn_threshold:
-            self._log_safe('warning', f"High RAM usage: {ram_usage:.1f}%. Consider reducing batch size or freeing memory.")
-            if ram_usage > 95:
-                self._log_safe('error', f"Critical RAM usage: {ram_usage:.1f}%. Processing may fail!")
-                return False
-        
-        return True
     
-    def _utility_display_embedding_models(self) -> None:
-        """Display comprehensive list of available embedding models with system recommendations.
-        
-        Shows all configured embedding models with their specifications, memory requirements,
-        and suitability recommendations based on current system capabilities.
-        """
-        
-        recommended = _utility_recommend_embedding_model()
-        current_model = COMMON_DEFAULTS["embedding_model"]
-        
-        for key, info in AVAILABLE_EMBEDDING_MODELS.items():
-            status_flags = []
-            if info["model_name"] == current_model:
-                status_flags.append("CURRENT")
-            if key == recommended:
-                status_flags.append("RECOMMENDED")
-            
-            status_str = f" [{', '.join(status_flags)}]" if status_flags else ""
-            
-            print(f"\n{key.upper()}{status_str}")
-            print(f"   Model: {info['model_name']}")
-            print(f"   Description: {info['description']}")
-            print(f"   VRAM Required: ~{info['vram_gb']}GB")
-            print(f"   Dimensions: {info['dimensions']}")
-            print(f"   Best For: {info['recommended_for']}")
     
     def _utility_change_embedding_model(self, model_key: str = None) -> bool:
         """Change the active embedding model with comprehensive validation.
@@ -1032,13 +977,8 @@ class DatasetController:
                         query_id, query_text, passage_id, passage_text, label,
                         gen_chunk_id, chunk_text, oie_string if oie_string else ""
                     ])
-                    
-                # Memory optimization: Clear buffer periodically to prevent accumulation
-                # Memory optimization: Clear buffer when reaching capacity
+
                 if len(output_rows) >= max_buffer_chunks:
-                    self._log_safe('debug', f"Buffer size reached {len(output_rows)} chunks, triggering memory cleanup...")
-                    # Note: In production environments, would flush to temporary file here
-                    # For now, trigger aggressive garbage collection to free memory
                     gc.collect()
                     
                 # Immediately free memory from processed chunks
@@ -1049,8 +989,6 @@ class DatasetController:
         
         # Final memory cleanup and statistics
         gc.collect()
-        final_memory = process.memory_info().rss / (1024**2)  # Convert to MB
-        self._log_safe('info', f"Batch processing completed. Memory: {initial_memory:.1f}MB → {final_memory:.1f}MB ({len(output_rows)} chunks)")
         
         return output_rows
 
@@ -1077,8 +1015,6 @@ class DatasetController:
         
         # Optimize worker allocation based on available resources
         effective_workers = min(config_workers, len(batches))  # Remove CPU limit to allow more workers
-        if effective_workers > multiprocessing.cpu_count():
-            self._log_safe('warning', f"Using {effective_workers} workers > {multiprocessing.cpu_count()} CPU cores. This may reduce performance.")
         self._log_safe('info', f"Using {effective_workers} effective workers for {len(batches)} batches")
         
         # Get current embedding model for workers
@@ -1112,14 +1048,12 @@ class DatasetController:
                 batch_index = future_to_batch[future]
                 completed_count += 1
                 
-                try:
-                    chunked_rows = future.result()
-                    batch_results[batch_index] = chunked_rows
-                    chunk_count = len(chunked_rows) if chunked_rows else 0
-                    self._log_safe('info', f"Batch {batch_index + 1} completed: {chunk_count} chunks ({completed_count}/{len(batches)})")
-                except Exception as e:
-                    self._log_safe('error', f"Batch {batch_index + 1} failed: {e}")
-                    batch_results[batch_index] = []
+
+                chunked_rows = future.result()
+                batch_results[batch_index] = chunked_rows
+                chunk_count = len(chunked_rows) if chunked_rows else 0
+                self._log_safe('info', f"Batch {batch_index + 1} completed: {chunk_count} chunks ({completed_count}/{len(batches)})")
+
         
         # Return results maintaining original batch order
         return batch_results
@@ -1175,7 +1109,7 @@ class DatasetController:
                 total_chunks = 0
                 with open(final_output_file, 'w', encoding='utf-8', newline='') as f:
                     writer = csv.writer(f, delimiter='\t')
-                    writer.writerow(['query_id', 'query_text', 'passage_id', 'original_passage', 'label', 'chunk_id', 'chunk_text', 'raw_oie_data'])
+                    writer.writerow(['query_id', 'query_text', 'passage_id', 'label', 'chunk_id', 'chunk_text', 'raw_oie_data'])
                     for batch_chunks in all_chunked_rows:
                         if batch_chunks:
                             writer.writerows(batch_chunks)
@@ -1202,7 +1136,7 @@ class DatasetController:
                         with open(final_output_file, write_mode, encoding='utf-8', newline='') as f:
                             writer = csv.writer(f, delimiter='\t')
                             if is_first_batch:
-                                writer.writerow(['query_id', 'query_text', 'passage_id', 'original_passage', 'label', 'chunk_id', 'chunk_text', 'raw_oie_data'])
+                                writer.writerow(['query_id', 'query_text', 'passage_id', 'label', 'chunk_id', 'chunk_text', 'raw_oie_data'])
                                 is_first_batch = False
                             if chunked_rows:
                                 writer.writerows(chunked_rows)
@@ -2332,8 +2266,7 @@ def data_create_controller_main():
     and system optimization recommendations.
     """
     global RUN_CONFIGURATIONS  # Allow runtime configuration override
-    print("Integrated Adaptive Dataset Controller for Neural Ranking Models")
-    print("="*60)
+    print("Integrated Dataset Controller for Neural Ranking Models")
     
     # Collect input parameters with validation
     input_tsv_path = input("Enter path to input TSV file (query<tab>passage<tab>label): ").strip()
@@ -2354,15 +2287,6 @@ def data_create_controller_main():
         # Show quick presets for common configurations
         temp_controller._utility_quick_model_switch()
         
-        # Provide option for detailed model exploration
-        advanced = input("\nWant to see all models with detailed specifications? (y/n): ").strip().lower()
-        if advanced == 'y':
-            temp_controller._utility_display_embedding_models()
-            model_choice = input("\nEnter model key manually: ").strip().lower()
-            if model_choice and model_choice in AVAILABLE_EMBEDDING_MODELS:
-                _utility_set_embedding_model(model_choice)
-                model_info = AVAILABLE_EMBEDDING_MODELS[model_choice]
-                print(f"Selected: {model_info['model_name']}")
     
     # Display final model configuration for confirmation
     final_model = COMMON_DEFAULTS['embedding_model']
