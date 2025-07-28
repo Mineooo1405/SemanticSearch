@@ -1,11 +1,3 @@
-"""
-Integrated Adaptive Dataset Controller for Neural Ranking Models
-
-This module provides comprehensive data processing capabilities for creating
-training datasets optimized for neural ranking models like KNRM, DRMM, etc.
-Supports multiple chunking strategies with DirectML GPU acceleration.
-"""
-
 # Standard library imports
 import subprocess
 import os
@@ -47,11 +39,6 @@ from Method.Semantic_Grouping_Optimized import semantic_chunk_passage_from_group
 from Method.Semantic_Splitter_Optimized import chunk_passage_text_splitter as semantic_splitter_optimized
 from Method.Text_Splitter_Optimized import chunk_passage_text_splitter as text_splitter_optimized
 
-# Optional imports with graceful error handling
-try:
-    import shutil
-except ImportError:
-    print("Warning: shutil not available, some features may be limited")
 
 # Process isolation configuration for better worker separation
 def configure_process_isolation():
@@ -70,21 +57,14 @@ def configure_process_isolation():
 
 # Configure process isolation at module level
 configure_process_isolation()
-try:
-    from Tool.OIE import extract_relations_from_paragraph
-    OIE_AVAILABLE_GLOBALLY = True
-except (ImportError, Exception) as e:
-    print(f"[DEBUG] OIE import failed: {e}")
-    extract_relations_from_paragraph = None
-    OIE_AVAILABLE_GLOBALLY = False
+
+from Tool.OIE import extract_relations_from_paragraph
+OIE_AVAILABLE_GLOBALLY = True
 
 import importlib
-try:
-    from Tool.Sentence_Embedding import sentence_embedding  # noqa: F401  # type: ignore
-except ImportError:
-    # Placeholder function for missing sentence embedding tool
-    def sentence_embedding(*args, **kwargs):
-        raise ImportError("Sentence_Embedding tool is not available and is required for semantic chunking.")
+
+from Tool.Sentence_Embedding import sentence_embedding  # noqa: F401  # type: ignore
+
 
 # Configure CSV field size limits for handling large text content
 try:
@@ -242,101 +222,6 @@ def _utility_calculate_total_vram_requirement(num_workers: int, embedding_model:
     
     return total_vram
 
-def _utility_check_vram_capacity(num_workers: int, embedding_model: str = None) -> dict:
-    """Validate system VRAM capacity for concurrent worker processes.
-    
-    Analyzes available GPU memory against requirements for multiple workers,
-    providing detailed capacity assessment and optimization recommendations.
-    
-    Args:
-        num_workers (int): Number of concurrent worker processes planned
-        embedding_model (str, optional): Target embedding model. Uses default if None.
-        
-    Returns:
-        dict: Comprehensive capacity analysis containing:
-            - has_gpu (bool): GPU availability status
-            - has_capacity (bool): Whether sufficient VRAM exists
-            - total_vram_gb (float): Available GPU memory in GB
-            - required_vram_gb (float): Memory needed for specified configuration
-            - utilization_percent (float): Percentage of GPU memory that would be used
-            - recommendation (str): Optimization advice for configuration
-    """
-    try:
-        import torch
-        
-        # Check for DirectML support first (AMD GPUs)
-        try:
-            import torch_directml
-            if torch_directml.is_available():
-                # DirectML doesn't provide detailed memory info
-                required_vram_gb = _utility_calculate_total_vram_requirement(num_workers, embedding_model)
-                return {
-                    "has_gpu": True,
-                    "has_capacity": True,  # Assume capacity exists for DirectML
-                    "total_vram_gb": "Unknown (DirectML)",
-                    "required_vram_gb": required_vram_gb,
-                    "utilization_percent": "Unknown",
-                    "recommendation": f"DirectML detected. Estimated requirement: {required_vram_gb:.1f}GB"
-                }
-        except ImportError:
-            pass
-        
-        # Check CUDA GPUs
-        if not torch.cuda.is_available():
-            return {
-                "has_gpu": False,
-                "recommendation": "No GPU available. Use CPU processing or install DirectML/CUDA PyTorch",
-                "total_vram_gb": 0,
-                "required_vram_gb": 0
-            }
-        
-        # Analyze CUDA GPU capacity
-        total_vram_gb = torch.cuda.get_device_properties(0).total_memory / (1024**3)
-        required_vram_gb = _utility_calculate_total_vram_requirement(num_workers, embedding_model)
-        
-        has_capacity = total_vram_gb >= required_vram_gb
-        utilization_percent = (required_vram_gb / total_vram_gb) * 100
-        
-        return {
-            "has_gpu": True,
-            "has_capacity": has_capacity,
-            "total_vram_gb": total_vram_gb,
-            "required_vram_gb": required_vram_gb,
-            "utilization_percent": utilization_percent,
-            "recommendation": _get_vram_recommendation(has_capacity, utilization_percent, num_workers)
-        }
-    except ImportError:
-        return {
-            "has_gpu": False,
-            "recommendation": "PyTorch not available - install PyTorch with GPU support",
-            "total_vram_gb": 0,
-            "required_vram_gb": 0
-        }
-
-def _get_vram_recommendation(has_capacity: bool, utilization_percent: float, num_workers: int) -> str:
-    """Generate optimization recommendations based on VRAM utilization analysis.
-    
-    Provides specific guidance for GPU memory usage optimization based on
-    current capacity assessment and utilization metrics.
-    
-    Args:
-        has_capacity (bool): Whether system has sufficient VRAM
-        utilization_percent (float): Percentage of VRAM that would be utilized
-        num_workers (int): Current number of workers planned
-        
-    Returns:
-        str: Specific recommendation for optimizing GPU memory usage
-    """
-    if not has_capacity:
-        suggested_workers = max(1, num_workers // 2)
-        return f"Insufficient VRAM! Reduce workers to {suggested_workers} or use smaller embedding model"
-    elif utilization_percent > 85:
-        return f"High VRAM usage ({utilization_percent:.1f}%). Consider reducing workers or batch size for stability"
-    elif utilization_percent > 70:
-        return f"Moderate VRAM usage ({utilization_percent:.1f}%). Good balance for performance"
-    else:
-        return f"Low VRAM usage ({utilization_percent:.1f}%). Can potentially increase workers for better throughput"
-
 def _utility_monitor_gpu_usage():
     """Monitor GPU memory usage with DirectML and CUDA support.
     
@@ -389,12 +274,6 @@ def _utility_monitor_gpu_usage():
     except ImportError:
         return {"error": "PyTorch not available"}
 
-def _utility_set_embedding_model(model_key: str) -> bool:
-    """Set the embedding model in COMMON_DEFAULTS"""
-    if model_key in AVAILABLE_EMBEDDING_MODELS:
-        COMMON_DEFAULTS["embedding_model"] = AVAILABLE_EMBEDDING_MODELS[model_key]["model_name"]
-        return True
-    return False
 
 PROCESSING_BATCH_SIZE = _utility_calculate_optimal_batch_size()  # Dynamic batch size
 
@@ -546,26 +425,6 @@ RUN_CONFIGURATIONS = [
 ]
 
 class DatasetController:
-    """Advanced dataset controller for adaptive semantic chunking and training data generation.
-    
-    Manages the complete pipeline for creating optimized training datasets from raw input data,
-    supporting multiple chunking strategies with DirectML/CUDA acceleration and adaptive
-    parameter tuning for various information retrieval models.
-    
-    Key Features:
-        - Multi-strategy chunking (semantic grouping, semantic splitting, text splitting)
-        - DirectML and CUDA GPU acceleration support
-        - Adaptive parameter optimization based on data characteristics
-        - Memory-efficient processing with configurable batch sizes
-        - OpenIE-based relationship extraction integration
-        - Comprehensive logging and progress tracking
-    
-    Attributes:
-        input_tsv_path (str): Path to input TSV file containing raw dataset
-        output_base_dir (Path): Base directory for generated training datasets
-        target_models (list): Supported IR models for optimization
-        logger (Logger): Configured logging instance for tracking operations
-    """
 
     def __init__(self, input_tsv_path: str, output_base_dir: str = "training_datasets", *, 
                  auto_start_oie: bool = True, silent_mode: bool = False):
@@ -691,50 +550,6 @@ class DatasetController:
         """
         if not self._silent_mode:  # Only log if not in silent mode
             getattr(self.logger, level.lower(), self.logger.info)(message)
-
-    def _utility_memory_status(self) -> dict:
-        """Monitor current system memory usage for processing optimization.
-        
-        Provides comprehensive memory statistics including system RAM, process memory,
-        and GPU memory (if available) for performance monitoring and optimization.
-        
-        Returns:
-            dict: Memory status containing:
-                - total_ram_gb (float): Total system RAM in GB
-                - available_ram_gb (float): Available RAM in GB
-                - ram_usage_percent (float): System RAM utilization percentage
-                - process_memory_mb (float): Current process memory usage in MB
-                - gpu_memory_gb (float, optional): Total GPU memory if CUDA available
-                - gpu_allocated_gb (float, optional): Allocated GPU memory if CUDA available
-                - gpu_reserved_gb (float, optional): Reserved GPU memory if CUDA available
-        """
-        try:
-            import psutil
-            memory = psutil.virtual_memory()
-            process = psutil.Process()
-            
-            status = {
-                "total_ram_gb": memory.total / (1024**3),
-                "available_ram_gb": memory.available / (1024**3),
-                "ram_usage_percent": memory.percent,
-                "process_memory_mb": process.memory_info().rss / (1024**2)
-            }
-            
-            # Add GPU memory statistics if CUDA is available
-            try:
-                import torch
-                if torch.cuda.is_available():
-                    status["gpu_memory_gb"] = torch.cuda.get_device_properties(0).total_memory / (1024**3)
-                    status["gpu_allocated_gb"] = torch.cuda.memory_allocated(0) / (1024**3)
-                    status["gpu_reserved_gb"] = torch.cuda.memory_reserved(0) / (1024**3)
-            except ImportError:
-                pass
-                
-            return status
-        except ImportError:
-            return {"error": "psutil not available"}
-    
-    
     
     def _utility_change_embedding_model(self, model_key: str = None) -> bool:
         """Change the active embedding model with comprehensive validation.
@@ -1024,7 +839,11 @@ class DatasetController:
         # Store results in order
         batch_results = [None] * len(batches)
         
-        with ProcessPoolExecutor(max_workers=effective_workers) as executor:
+        with ProcessPoolExecutor(
+            max_workers=effective_workers,
+            initializer=_worker_init,
+            initargs=(COMMON_DEFAULTS["embedding_model"], COMMON_DEFAULTS["device_preference"])
+        ) as executor:
             # Submit all batches with dedicated embedding model instances for each worker
             future_to_batch = {}
             worker_counter = 0
@@ -1032,12 +851,12 @@ class DatasetController:
             for batch_num, batch_df in batches:
                 worker_id = worker_counter % effective_workers + 1  # Assign unique worker ID (1, 2, 3...)
                 future = executor.submit(
-                    helper_process_single_batch, 
-                    batch_df, 
-                    config, 
+                    helper_process_single_batch,
+                    batch_df,
+                    config,
                     batch_num,
-                    embedding_model=current_embedding_model,  # Provide model to each worker
-                    worker_id=worker_id
+                    None,
+                    worker_id
                 )
                 future_to_batch[future] = batch_num - 1
                 worker_counter += 1
@@ -1343,76 +1162,6 @@ class DatasetController:
             simple_path = ""
 
         return str(save_path)
-    
-    def helper_extract_output_path(self, stdout: str, task_name: str, config_output_dir: Path) -> str:
-        """Extract output file path from stdout"""
-        try:
-            # Look for output file patterns in stdout
-            lines = stdout.split('\n')
-            for line in lines:
-                if "Output file:" in line and ".tsv" in line:
-                    # Extract path from quotes
-                    if "'" in line:
-                        start = line.find("'") + 1
-                        end = line.rfind("'")
-                        if start > 0 and end > start:
-                            return line[start:end]
-            
-            # Fallback: look for most recent TSV file in subdirectories
-            if config_output_dir.exists():
-                tsv_files = list(config_output_dir.glob("**/*.tsv"))
-                if tsv_files:
-                    most_recent = max(tsv_files, key=lambda f: f.stat().st_mtime)
-                    return str(most_recent)
-            
-            return str(config_output_dir / "output_chunks.tsv")
-            
-        except Exception as e:
-            self.logger.warning(f"Error extracting output path for {task_name}: {e}")
-            return str(config_output_dir / "output_chunks.tsv")
-
-    def helper_analyze_chunk_distribution(self, output_file: str, task_name: str) -> None:
-        """Analyze token distribution of generated chunks"""
-        try:
-            if not os.path.exists(output_file):
-                self.logger.warning(f"Output file not found for analysis: {output_file}")
-                return
-            
-            df = pd.read_csv(output_file, sep='\t', on_bad_lines='warn', engine='python')
-            if 'chunk_text' not in df.columns:
-                self.logger.warning(f"Column 'chunk_text' not found in {output_file}. Cannot analyze.")
-                return
-            df.dropna(subset=['chunk_text'], inplace=True)
-            chunk_token_counts = df['chunk_text'].apply(self._utility_count_tokens).tolist()
-        
-            if not chunk_token_counts:
-                self.logger.warning(f"No valid chunks found in {output_file} for analysis.")
-                return
-            
-            # Calculate statistics
-            min_tokens = min(chunk_token_counts)
-            max_tokens = max(chunk_token_counts)
-            avg_tokens = sum(chunk_token_counts) / len(chunk_token_counts)
-            
-            # Count chunks in target range
-            target_min = ADAPTIVE_CHUNKING_CONFIG["min_tokens"]
-            target_max = ADAPTIVE_CHUNKING_CONFIG["max_tokens"]
-            in_range = sum(1 for count in chunk_token_counts if target_min <= count <= target_max)
-            in_range_percent = (in_range / len(chunk_token_counts)) * 100 if chunk_token_counts else 0
-            
-            self.logger.info(f"Chunk Analysis for {task_name}:")
-            self.logger.info(f"   Total chunks: {len(chunk_token_counts)}")
-            self.logger.info(f"   Token range: {min_tokens}-{max_tokens} (avg: {avg_tokens:.1f})")
-            self.logger.info(f"   In target range ({target_min}-{target_max}): {in_range}/{len(chunk_token_counts)} ({in_range_percent:.1f}%)")
-                
-        except Exception as e:
-            self.logger.warning(f"Error analyzing chunk distribution for {task_name}: {e}")
-
-    def _utility_count_tokens(self, text: str) -> int:
-        """Simple token counting for analysis"""
-        if not isinstance(text, str):
-            return 0
-        return len(re.findall(r'\b\w+\b|[^\w\s]', text))
 
     def helper_create_summary(self, results: List[dict], successful_tasks: int) -> Dict[str, Any]:
         """Create summary of all tasks"""
@@ -1485,10 +1234,7 @@ class DatasetController:
                 - successful_tasks (int): Number of configurations completed successfully
                 - total_tasks (int): Total number of configurations processed
         """
-        self._log_safe('info', "="*80)
-        self._log_safe('info', "STARTING SEQUENTIAL ADAPTIVE DATASET CREATION")
-        self._log_safe('info', "="*80)
-        
+               
         if ranking_workers is None:
             ranking_workers = _utility_calculate_optimal_ranking_workers()
             self._log_safe('info', f"Auto-calculated ranking workers: {ranking_workers}")
@@ -1560,9 +1306,7 @@ class DatasetController:
                 - total_tasks (int): Total number of configurations processed
                 - worker_allocation (Dict): Details about worker resource allocation
         """
-        self.logger.info("="*80)
-        self.logger.info("STARTING PARALLEL ADAPTIVE DATASET CREATION")
-        self.logger.info("="*80)
+
         
         # Import psutil for comprehensive memory monitoring
         import psutil
@@ -1617,7 +1361,11 @@ class DatasetController:
             else:
                 self.logger.info("Each configuration will use sequential batch processing")
             
-            with ProcessPoolExecutor(max_workers=effective_workers) as executor:
+            with ProcessPoolExecutor(
+                max_workers=effective_workers,
+                initializer=_worker_init,
+                initargs=(COMMON_DEFAULTS["embedding_model"], COMMON_DEFAULTS["device_preference"])
+            ) as executor:
                 # Log initial GPU status
                 initial_gpu = _utility_monitor_gpu_usage()
                 if "error" not in initial_gpu:
@@ -1696,34 +1444,9 @@ class DatasetController:
         self.helper_save_and_print_summary(summary)
         return summary
 
-    def helper_get_compliance_rate(self, output_file: str) -> Optional[float]:
-        """Get compliance rate from output file."""
-        try:
-            if not os.path.exists(output_file): return None
-            
-            df = pd.read_csv(output_file, sep='\t', on_bad_lines='warn', engine='python')
-            if 'chunk_text' not in df.columns:
-                self.logger.warning(f"Column 'chunk_text' not found in {output_file}. Cannot calculate compliance.")
-                return None
-            df.dropna(subset=['chunk_text'], inplace=True)
-            chunk_token_counts = df['chunk_text'].apply(self._utility_count_tokens).tolist()
-
-            if not chunk_token_counts: return 0.0
-            
-            target_min = ADAPTIVE_CHUNKING_CONFIG["min_tokens"]
-            target_max = ADAPTIVE_CHUNKING_CONFIG["max_tokens"]
-            in_range = sum(1 for count in chunk_token_counts if target_min <= count <= target_max)
-            return (in_range / len(chunk_token_counts)) * 100
-            
-        except Exception as e:
-            self.logger.error(f"Error calculating compliance for {output_file}: {e}")
-            return None
-
     def helper_print_final_summary(self, summary: Dict[str, Any]) -> None:
         """Print final summary to console"""
-        self.logger.info("\n" + "="*80)
-        self.logger.info("ADAPTIVE DATASET CREATION SUMMARY")
-        self.logger.info("="*80)
+
         
         for result in summary["task_results"]:
             status = "SUCCESS" if result.get("success") else "FAILED"
@@ -1745,7 +1468,7 @@ class DatasetController:
             self.logger.info("="*80)
 
     # ============================================================
-    # NEW: Helper để convert existing chunks sang OIE version
+    # Helper để convert existing chunks sang OIE version
     # ============================================================
     def convert_existing_chunks_to_oie(self, source_chunks_file: str, target_config_name: str = None) -> str:
         """Convert existing chunk file to OIE-enhanced version
@@ -1798,78 +1521,6 @@ class DatasetController:
         except Exception as e:
             self._log_safe('error', f'Error converting chunks to OIE: {e}')
             return ""
-
-    # ============================================================
-    # NEW: Helper để tự động tạo cặp without/with OIE từ 1 config
-    # ============================================================
-    def process_config_pair_without_with_oie(self, base_config_name: str, 
-                                           ranking_workers: Optional[int] = None,
-                                           config_workers: Optional[int] = None) -> dict:
-        """Process a config pair: first without OIE, then convert to with OIE
-        
-        Args:
-            base_config_name: Base config name (e.g., 'semantic_splitter')
-            ranking_workers: Number of ranking workers
-            config_workers: Number of config workers
-            
-        Returns:
-            Dictionary with results for both versions
-        """
-        try:
-            # Find the without_OIE config
-            without_oie_config = None
-            for cfg in RUN_CONFIGURATIONS:
-                if cfg['name'] == f"{base_config_name}_without_OIE":
-                    without_oie_config = cfg
-                    break
-            
-            if not without_oie_config:
-                self._log_safe('error', f'Config {base_config_name}_without_OIE not found')
-                return {"success": False, "without_oie": None, "with_oie": None}
-            
-            results = {}
-            
-            # Step 1: Run without_OIE config
-            self._log_safe('info', f'Step 1: Running {base_config_name}_without_OIE')
-            success_without, output_file_without, compliance_without = self._run_single_config(
-                without_oie_config, 
-                ranking_workers=ranking_workers, 
-                config_workers=config_workers
-            )
-            
-            results['without_oie'] = {
-                'success': success_without,
-                'output_file': output_file_without,
-                'compliance': compliance_without
-            }
-            
-            if not success_without:
-                self._log_safe('error', f'Failed to run {base_config_name}_without_OIE')
-                return {"success": False, **results}
-            
-            # Step 2: Convert to with_OIE version
-            self._log_safe('info', f'Step 2: Converting to {base_config_name}_with_OIE')
-            oie_output_file = self.convert_existing_chunks_to_oie(
-                output_file_without, 
-                f"{base_config_name}_with_OIE"
-            )
-            
-            results['with_oie'] = {
-                'success': bool(oie_output_file),
-                'output_file': oie_output_file,
-                'source_file': output_file_without
-            }
-            
-            if oie_output_file:
-                self._log_safe('info', f'Successfully created {base_config_name} pair')
-                return {"success": True, **results}
-            else:
-                self._log_safe('error', f'Failed to convert to {base_config_name}_with_OIE')
-                return {"success": False, **results}
-                
-        except Exception as e:
-            self._log_safe('error', f'Error processing config pair {base_config_name}: {e}')
-            return {"success": False, "error": str(e)}
 
     # ============================================================
     # OpenIE Integration: Augment existing datasets with relationship extraction
@@ -2131,7 +1782,6 @@ def helper_run_chunking_config_process(config: dict, input_tsv_path: str, output
     """
     import os
     import time
-    import logging
     
     # Log process start with PID for debugging
     process_id = os.getpid()
@@ -2175,21 +1825,17 @@ def helper_run_chunking_config_process(config: dict, input_tsv_path: str, output
         # Force clear global model cache to ensure each config worker loads its own model
         try:
             from Tool.Sentence_Embedding import loaded_models
-            loaded_models.clear()
-            print(f"[PID {process_id}] Cleared model cache - loading dedicated model: {embedding_model}")
-            
-            # Pre-load and verify the model
-            from Tool.Sentence_Embedding import sentence_embedding
-            test_embedding = sentence_embedding(["test"], embedding_model, batch_size=1)
-            print(f"[PID {process_id}] Successfully loaded dedicated model for config: {config['name']}")
-            del test_embedding  # Free test memory
+            # Không xóa cache để tái sử dụng model đã nạp
+            print(f"[PID {process_id}] Reusing cached embedding model: {embedding_model}")
+            # Bỏ qua bước pre-load thử vì model đã sẵn sàng từ _worker_init
+            pass
         except Exception as e:
-            print(f"[PID {process_id}] Warning: Could not pre-load model: {e}")
+            print(f"[PID {process_id}] Warning: Unexpected error khi tái sử dụng model: {e}")
     else:
         # Still clear cache even for default model to ensure fresh load
         try:
             from Tool.Sentence_Embedding import loaded_models
-            loaded_models.clear()
+            # loaded_models.clear()  # giữ cache, không xoá
             print(f"[PID {process_id}] Cleared model cache for default model")
         except Exception as e:
             print(f"[PID {process_id}] Warning: Could not clear model cache: {e}")
@@ -2197,12 +1843,8 @@ def helper_run_chunking_config_process(config: dict, input_tsv_path: str, output
     controller = DatasetController(input_tsv_path, output_base_dir, auto_start_oie=auto_start_oie, silent_mode=True)
     start_time = time.time()
     
-    log_gpu_status("AFTER CONTROLLER INIT - ")
-        
     success, output_file, final_compliance = controller._run_single_config(config, ranking_workers=ranking_workers, config_workers=config_workers)
-    
-    log_gpu_status("AFTER CONFIG EXECUTION - ")
-        
+
     end_time = time.time()
     
     print(f"[PID {process_id}] Completed worker for config: {config['name']} in {end_time - start_time:.1f}s")
@@ -2231,21 +1873,18 @@ def helper_run_augment_process(source_tsv: str, output_base_dir: str, oie_thread
         # Force clear global model cache to ensure each augment worker loads its own model
         try:
             from Tool.Sentence_Embedding import loaded_models
-            loaded_models.clear()
+            # loaded_models.clear()  # giữ cache
             print(f"[PID {process_id}] Augment worker: Cleared model cache - loading dedicated model: {embedding_model}")
             
-            # Pre-load and verify the model
-            from Tool.Sentence_Embedding import sentence_embedding
-            test_embedding = sentence_embedding(["test"], embedding_model, batch_size=1)
-            print(f"[PID {process_id}] Augment worker: Successfully loaded dedicated model")
-            del test_embedding  # Free test memory
+            # Bỏ qua bước pre-load thử vì model đã sẵn sàng từ _worker_init
+            pass
         except Exception as e:
-            print(f"[PID {process_id}] Augment worker: Warning: Could not pre-load model: {e}")
+            print(f"[PID {process_id}] Augment worker: Warning: Unexpected error khi tái sử dụng model: {e}")
     else:
         # Still clear cache even for default model
         try:
             from Tool.Sentence_Embedding import loaded_models
-            loaded_models.clear()
+            # loaded_models.clear()  # giữ cache
             print(f"[PID {process_id}] Augment worker: Cleared model cache for default model")
         except Exception as e:
             print(f"[PID {process_id}] Augment worker: Warning: Could not clear model cache: {e}")
@@ -2253,11 +1892,8 @@ def helper_run_augment_process(source_tsv: str, output_base_dir: str, oie_thread
     controller = DatasetController(source_tsv, output_base_dir, auto_start_oie=False)
     return controller.process_augment_with_oie(source_tsv, threads=oie_threads)
 
-# -------------------------------------------------------------------
 # MAIN ENTRY
-# ============================================================
-# Main Function: Interactive Dataset Controller Interface
-# ============================================================
+
 def data_create_controller_main():
     """Interactive main function for adaptive dataset controller execution.
     
@@ -2357,9 +1993,7 @@ def data_create_controller_main():
     
     if use_parallel:
         print(f"\nWorker Configuration (CPU cores: {multiprocessing.cpu_count()})")
-        print("=" * 50)
-        print("Note: You can use more workers than CPU cores, but it may reduce performance")
-        
+
         # Chunking/OIE workers
         max_workers_input = input(f"Chunking/OIE workers (default: auto-calculate, max recommended: {multiprocessing.cpu_count() * 2}): ").strip()
         if max_workers_input.isdigit():
@@ -2373,7 +2007,6 @@ def data_create_controller_main():
     # Config workers (ask for both parallel and sequential)
     print(f"\nConfig Worker Configuration")
     print("=" * 40)
-    print("Workers per config: Each config can use multiple workers for internal batch processing")
     config_workers_input = input(f"Workers per config (default: 1=sequential, max recommended: {multiprocessing.cpu_count()}): ").strip()
     config_workers = None
     if config_workers_input.isdigit():
@@ -2489,7 +2122,6 @@ def data_create_controller_main():
         print(f"A critical error occurred in main: {e}")
         traceback.print_exc()
 
-# -------------------------------------------------------------------
 # ============================================================
 # Worker Functions: Parallel batch processing with dedicated models
 # ============================================================
@@ -2536,13 +2168,13 @@ def helper_process_single_batch(batch_df: pd.DataFrame, config: dict, batch_num:
                 from Tool.Sentence_Embedding import loaded_models
                 # Clear the shared cache to force reload in this worker process
                 loaded_models.clear()
-                print(f"[PID {process_id}|{worker_tag}] Cleared shared model cache - forcing dedicated model load")
+                print(f"[PID {process_id}|{worker_tag}] Reusing cached embedding model")
                 
-                # Pre-load the model to verify it works
-                from Tool.Sentence_Embedding import sentence_embedding
-                test_embedding = sentence_embedding(["test"], embedding_model, batch_size=1)
-                print(f"[PID {process_id}|{worker_tag}] Successfully loaded dedicated model - {len(test_embedding)} embeddings generated")
-                del test_embedding  # Free test memory
+                # Không gọi loaded_models.clear() – tái sử dụng cache
+                print(f"[PID {process_id}|{worker_tag}] Reusing cached embedding model")
+                
+                # Bỏ qua bước pre-load thử – model đã tồn tại nhờ _worker_init
+                pass
             except Exception as e:
                 print(f"[PID {process_id}|{worker_tag}] Warning: Could not pre-load model: {e}")
         else:
@@ -2550,7 +2182,7 @@ def helper_process_single_batch(batch_df: pd.DataFrame, config: dict, batch_num:
             # Still clear cache to ensure fresh model load
             try:
                 from Tool.Sentence_Embedding import loaded_models
-                loaded_models.clear()
+                # loaded_models.clear()  # giữ cache
                 print(f"[PID {process_id}|{worker_tag}] Cleared shared model cache for default model")
             except Exception as e:
                 print(f"[PID {process_id}|{worker_tag}] Warning: Could not clear model cache: {e}")
@@ -2667,12 +2299,25 @@ def helper_process_single_batch(batch_df: pd.DataFrame, config: dict, batch_num:
         print(f"[PID {process_id}|{worker_tag}] Batch {batch_num} failed with error: {e}")
         return []
 
+# ================================
+# NEW: initializer cho ProcessPoolExecutor để nạp model duy nhất một lần
+# ================================
 
-# ============================================================
-# Main Entry Point: Dataset Controller Execution
-# ============================================================
+def _worker_init(embedding_model_name: str, device_preference: str):
+    """Hàm được ProcessPoolExecutor gọi khi spawn process.
+    Bảo đảm mỗi process con chỉ nạp mô hình embedding đúng một lần và tái sử dụng
+    trong suốt vòng đời process.
+    """
+    try:
+        from Tool.Sentence_Embedding import sentence_embedding, loaded_models
+        if embedding_model_name not in loaded_models:
+            # Thực hiện encode giả để kích hoạt việc nạp model
+            sentence_embedding(["init"], embedding_model_name, batch_size=1, device_preference=device_preference)
+        # Không override loaded_models.clear để tránh lỗi attribute read-only; chỉ đơn giản không gọi hàm clear ở các worker
+    except Exception as e:
+        print(f"[worker_init] Failed to preload embedding model {embedding_model_name}: {e}")
+
 if __name__ == "__main__":
-    """Main entry point for dataset controller execution with performance tracking."""
     start_time = time.time()
     
     data_create_controller_main()
