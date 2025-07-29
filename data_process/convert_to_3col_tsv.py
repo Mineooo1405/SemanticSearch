@@ -18,7 +18,8 @@ from typing import Optional
 # Tăng giới hạn kích thước trường để xử lý các passage rất dài
 csv.field_size_limit(min(sys.maxsize, 2147483647))
 
-def convert_tsv_format(input_file: str, output_file: Optional[str] = None) -> str:
+def convert_tsv_format(input_file: str, output_file: Optional[str] = None, *,
+                       keep_unprocessed: bool = True) -> str:
     """
     Convert TSV từ nhiều định dạng (6 hoặc 8 cột) về định dạng 3 cột
 
@@ -51,6 +52,8 @@ def convert_tsv_format(input_file: str, output_file: Optional[str] = None) -> st
     rows_processed = 0
     rows_written = 0
     
+    skipped_rows: list[list[str]] = []
+
     try:
         with open(input_file, 'r', encoding='utf-8') as infile, \
              open(output_file, 'w', encoding='utf-8', newline='') as outfile:
@@ -67,6 +70,8 @@ def convert_tsv_format(input_file: str, output_file: Optional[str] = None) -> st
                     input_format = '8col'
                 elif len(header) >= 6:
                     input_format = '6col'
+                elif len(header) >= 7 and {'query_text', 'chunk_text'}.issubset(set([h.lower() for h in header])):
+                    input_format = '7col'
                 else:
                     raise ValueError(f"Unsupported column count ({len(header)}) in header: {header}")
                 
@@ -89,6 +94,8 @@ def convert_tsv_format(input_file: str, output_file: Optional[str] = None) -> st
 
                     if len(row) < required_cols:
                         print(f"Skipping row {row_idx}: insufficient columns ({len(row)}/{required_cols})")
+                        if keep_unprocessed:
+                            skipped_rows.append(row)
                         continue
 
                     if input_format == '6col':
@@ -99,6 +106,16 @@ def convert_tsv_format(input_file: str, output_file: Optional[str] = None) -> st
                         query_parts = [part.strip() for part in (title, description, narrative) if part.strip()]
                         query = '. '.join(query_parts)
                         passage = data.strip()
+                    
+                    elif input_format == '7col':
+                        #query_id | query_text | passage_id | label | chunk_id | chunk_text
+                        query_text = row[1].strip()
+                        chunk_text = row[5].strip()
+                        label = row[3].strip()
+                        
+                        query = query_text
+                        passage = chunk_text
+                        
 
                     else:  # 8col
                         # query_id | query_text | passage_id | original_passage | label | chunk_id | chunk_text | raw_oie_data
@@ -112,14 +129,20 @@ def convert_tsv_format(input_file: str, output_file: Optional[str] = None) -> st
                     # Validate data
                     if not query:
                         print(f"Skipping row {row_idx}: empty query")
+                        if keep_unprocessed:
+                            skipped_rows.append(row)
                         continue
                     
                     if not passage:
                         print(f"Skipping row {row_idx}: empty passage")
+                        if keep_unprocessed:
+                            skipped_rows.append(row)
                         continue
                     
                     if not label:
                         print(f"Skipping row {row_idx}: empty label")
+                        if keep_unprocessed:
+                            skipped_rows.append(row)
                         continue
                     
                     # Write converted row
@@ -132,6 +155,8 @@ def convert_tsv_format(input_file: str, output_file: Optional[str] = None) -> st
                 
                 except Exception as e:
                     print(f"Error processing row {row_idx}: {e}")
+                    if keep_unprocessed:
+                        skipped_rows.append(row)
                     continue
     
     except Exception as e:
@@ -147,8 +172,36 @@ def convert_tsv_format(input_file: str, output_file: Optional[str] = None) -> st
     if os.path.exists(output_file):
         file_size = os.path.getsize(output_file)
         print(f"File size: {file_size:,} bytes")
+
+    # --- Rewrite input file để chỉ còn hàng chưa xử lý ---
+    if keep_unprocessed:
+        try:
+            if skipped_rows:
+                tmp_path = Path(input_file).with_suffix(".remaining.tsv.tmp")
+                with open(tmp_path, "w", encoding="utf-8", newline="") as tf:
+                    writer = csv.writer(tf, delimiter="\t")
+                    writer.writerow(header)  # original header
+                    writer.writerows(skipped_rows)
+                os.replace(tmp_path, input_file)
+                print(f"Input file cập nhật: còn {len(skipped_rows)} hàng chưa xử lý")
+            else:
+                # Không còn hàng nào → xóa file nguồn
+                os.remove(input_file)
+                print("Đã xử lý hết. Đã xóa file nguồn ban đầu.")
+        except Exception as e:
+            print(f"Warning: Không thể cập nhật file nguồn: {e}")
     
     return output_file
+
+# ------------------------------------------------------
+# Utility: đếm tổng số dòng (không tính header)
+# ------------------------------------------------------
+
+
+def count_rows(file_path: str) -> int:
+    """Đếm số hàng dữ liệu (bỏ qua header) trong TSV."""
+    with open(file_path, "r", encoding="utf-8") as f:
+        return sum(1 for _ in f) - 1
 
 def preview_file(file_path: str, num_rows: int = 3):
     """Preview first few rows of the file"""

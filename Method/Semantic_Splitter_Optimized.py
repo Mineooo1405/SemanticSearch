@@ -19,7 +19,7 @@ def _count_tokens_accurate(text: str) -> int:
 
 def process_sentence_splitting_with_semantics(
     text: str, 
-    chunk_size: int = 1000, 
+    chunk_size: Optional[int] = None,  # None = không giới hạn kích thước dựa ký tự
     chunk_overlap: int = 0,
     target_tokens: Optional[int] = None,
     tolerance: float = 0.25,
@@ -59,20 +59,20 @@ def process_sentence_splitting_with_semantics(
             norms[norms == 0] = 1e-9
             embeddings = embeddings / norms
         except Exception as e:
-            print(f"⚠️  Semantic embedding failed ({e}); fallback to length-only splitter")
+            print(f"Semantic embedding failed ({e}); fallback to length-only splitter")
             semantic_threshold = None
             embeddings = None
     
     if not sentences:
         return [text] if text.strip() else [], [], [[0]] if text.strip() else []
     
-    # If text is small enough, return as single chunk
-    if len(text) <= chunk_size:
+    # Nếu không đặt giới hạn chunk_size, bỏ qua check “small enough”.
+    if chunk_size is not None and len(text) <= chunk_size:
         sentence_indices = list(range(len(sentences)))
         return [text], sentences, [sentence_indices]
     
-    # Adaptive chunking parameters
-    if enable_adaptive and target_tokens:
+    # Adaptive chunking parameters – vẫn hoạt động nếu chunk_size None (cho phép chia tự nhiên)
+    if enable_adaptive and target_tokens and chunk_size is not None:
         # Convert target tokens to approximate character count
         # Rough estimate: 1 token ≈ 4.5 characters (including spaces)
         target_chars = int(target_tokens * 4.5)
@@ -81,8 +81,6 @@ def process_sentence_splitting_with_semantics(
         
         # Use adaptive targets instead of fixed chunk_size
         chunk_size = target_chars
-        print(f"🔧 Adaptive Text Splitter: Target {target_tokens} tokens (~{target_chars} chars)")
-        print(f"   Acceptable range: {min_chars}-{max_chars} characters")
     
     # Calculate sentence lengths
     sentence_lengths = [len(s) for s in sentences]
@@ -93,6 +91,9 @@ def process_sentence_splitting_with_semantics(
     sentence_groups = []
     current_group_indices = []
     
+    # Nếu chunk_size None, đặt thành float('inf') để bỏ qua giới hạn độ dài
+    effective_chunk_size = float('inf') if chunk_size is None else chunk_size
+
     for i, sentence in enumerate(sentences):
         sentence_len = sentence_lengths[i]
         
@@ -129,7 +130,7 @@ def process_sentence_splitting_with_semantics(
                     current_size = 0
         
         # Handle sentences that are too long for any chunk
-        if sentence_len > chunk_size:
+        if sentence_len > effective_chunk_size:
             # Save current chunk if exists
             if current_chunk_sentences:
                 chunk_text = ' '.join(current_chunk_sentences)
@@ -156,7 +157,7 @@ def process_sentence_splitting_with_semantics(
         if current_chunk_sentences:
             projected_size += 1  # Space between sentences
         
-        if projected_size > chunk_size and current_chunk_sentences:
+        if projected_size > effective_chunk_size and current_chunk_sentences:
             # Save current chunk
             chunk_text = ' '.join(current_chunk_sentences)
             chunks.append(chunk_text)

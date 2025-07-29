@@ -1,6 +1,7 @@
 """
 Optimized ranking module with memory efficiency and caching
 """
+import argparse
 import pandas as pd
 import numpy as np
 import gc
@@ -11,38 +12,87 @@ import hashlib
 from sklearn.metrics.pairwise import cosine_similarity
 from rank_bm25 import BM25Okapi
 
+# ---------------------------------------------------------------------------
+# Quick helper: estimate file size & memory usage (was removed earlier)
+# ---------------------------------------------------------------------------
 
 def estimate_memory_usage(file_path: str) -> Dict[str, float]:
-    """Estimate memory usage for processing a TSV file
-    
-    Returns:
-        Dict with estimated memory usage in GB for different processing methods
-    """
-    if not os.path.exists(file_path):
+    """Return rough memory usage estimates for a TSV file."""
+    if not Path(file_path).exists():
         return {"error": "File not found"}
-    
-    try:
-        # Get file size
-        file_size_bytes = os.path.getsize(file_path)
-        file_size_mb = file_size_bytes / (1024 * 1024)
-        
-        # Estimate based on file size and typical data overhead
-        # TSV files typically expand 3-5x in memory due to pandas overhead
-        pandas_overhead_factor = 4.0
-        estimated_memory_gb = (file_size_bytes * pandas_overhead_factor) / (1024**3)
-        
-        # Embedding processing typically adds 50-100% memory overhead
-        embedding_overhead_factor = 1.7
-        peak_memory_gb = estimated_memory_gb * embedding_overhead_factor
-        
-        return {
-            "file_size_mb": file_size_mb,
-            "estimated_memory_gb": estimated_memory_gb,
-            "peak_memory_gb": peak_memory_gb,
-            "recommended_chunk_size": max(10000, min(100000, int(50000 / max(1, estimated_memory_gb / 2))))
-        }
-    except Exception as e:
-        return {"error": str(e)}
+
+    file_size_bytes = os.path.getsize(file_path)
+    file_size_mb = file_size_bytes / (1024 * 1024)
+
+    # Assume pandas expands 4× in RAM, embedding adds ~70 %
+    pandas_overhead_factor = 4.0
+    embedding_overhead_factor = 1.7
+
+    estimated_memory_gb = (file_size_bytes * pandas_overhead_factor) / (1024 ** 3)
+    peak_memory_gb = estimated_memory_gb * embedding_overhead_factor
+
+    recommended_chunk_size = max(10000, min(100000, int(50000 / max(1, estimated_memory_gb / 2))))
+
+    return {
+        "file_size_mb": file_size_mb,
+        "estimated_memory_gb": estimated_memory_gb,
+        "peak_memory_gb": peak_memory_gb,
+        "recommended_chunk_size": recommended_chunk_size,
+    }
+
+# ---------------------------------------------------------------------------
+# Utility: detect and normalize column names
+# ---------------------------------------------------------------------------
+
+_QUERY_TEXT_KEYS = {"query_text", "query", "question"}
+_CHUNK_TEXT_KEYS = {"chunk_text", "passage", "text"}
+_QUERY_ID_KEYS   = {"query_id", "qid"}
+_CHUNK_ID_KEYS   = {"chunk_id", "cid", "pid"}
+_LABEL_KEYS      = {"label", "score", "target"}
+
+
+def _find_col(existing: list[str], candidates: set[str]) -> Optional[str]:
+    for col in existing:
+        if col.lower() in candidates:
+            return col
+    return None
+
+
+def _standardize_columns(df: pd.DataFrame, *, require_query_text: bool = True) -> pd.DataFrame:
+    """Chuẩn hoá tên cột về dạng chuẩn.
+
+    Args:
+        df: DataFrame input.
+        require_query_text: Nếu True, thiếu query_text sẽ raise; nếu False cho phép thiếu
+            (sẽ được bổ sung sau).
+    """
+    existing = [c.strip() for c in df.columns]
+
+    mapping: dict[str, str] = {}
+
+    qtext = _find_col(existing, _QUERY_TEXT_KEYS)
+    ctext = _find_col(existing, _CHUNK_TEXT_KEYS)
+
+    # ensure chunk_text mapping exists
+    mapping[ctext] = "chunk_text"
+
+    if qtext:
+        mapping[qtext] = "query_text"
+
+    qid = _find_col(existing, _QUERY_ID_KEYS)
+    if qid:
+        mapping[qid] = "query_id"
+
+    cid = _find_col(existing, _CHUNK_ID_KEYS)
+    if cid:
+        mapping[cid] = "chunk_id"
+
+    lab = _find_col(existing, _LABEL_KEYS)
+    if lab:
+        mapping[lab] = "label"
+
+    df = df.rename(columns=mapping)
+    return df
 
 
 class OptimizedRanker:
@@ -192,6 +242,7 @@ class OptimizedRanker:
 
 
 def rank_and_filter_chunks_optimized(chunks_tsv: str, output_dir: Path,
+                                    original_tsv: str,
                                     upper_percentile: int = 80, lower_percentile: int = 20,
                                     model_name: str = "thenlper/gte-base", max_workers: int = None,
                                     chunk_size: int = 50000) -> str:
@@ -212,6 +263,17 @@ def rank_and_filter_chunks_optimized(chunks_tsv: str, output_dir: Path,
     
     print(f"Starting memory-optimized ranking from {chunks_tsv}...")
     
+    # ------------------------------------------------------------
+    # Load mapping query_id → query_text từ file original
+    # ------------------------------------------------------------
+    try:
+        mapping_df = pd.read_csv(original_tsv, sep='\t', usecols=['query_id', 'query_text'], engine='python')
+        query_map = dict(mapping_df.groupby('query_id')['query_text'].first())
+        del mapping_df
+    except Exception as e:
+        print(f"Error loading original TSV for query_text mapping: {e}")
+        return ""
+
     # Estimate memory requirements and adjust chunk size accordingly
     memory_estimate = estimate_memory_usage(chunks_tsv)
     if "error" in memory_estimate:
@@ -239,12 +301,11 @@ def rank_and_filter_chunks_optimized(chunks_tsv: str, output_dir: Path,
     # First pass: Count total rows and get column info without loading all data
     print("Scanning file structure...")
     try:
-        header_sample = pd.read_csv(chunks_tsv, sep='\t', nrows=0, on_bad_lines='warn', engine='python')
-        header_sample.columns = header_sample.columns.str.strip()
-        
-        required_cols = {'query_id', 'query_text', 'chunk_text', 'chunk_id'}
+        header_sample = pd.read_csv(chunks_tsv, sep='\t', nrows=5, on_bad_lines='warn', engine='python')
+        header_sample = _standardize_columns(header_sample, require_query_text=False)
+        required_cols = {'chunk_text'}
         if not required_cols.issubset(set(header_sample.columns)):
-            print(f"Missing required columns. Found: {header_sample.columns.tolist()}")
+            print("File thiếu cột bắt buộc (chunk_text)")
             return ""
         
         # Get total row count efficiently
@@ -276,6 +337,12 @@ def rank_and_filter_chunks_optimized(chunks_tsv: str, output_dir: Path,
     for chunk_num, df_chunk in enumerate(chunk_iterator, 1):
         try:
             df_chunk.columns = df_chunk.columns.str.strip()
+            df_chunk = _standardize_columns(df_chunk, require_query_text=False)
+
+            # Thêm query_text nếu chưa có
+            if 'query_text' not in df_chunk.columns and 'query_id' in df_chunk.columns:
+                df_chunk['query_text'] = df_chunk['query_id'].map(query_map).fillna('')
+            
             processed_rows += len(df_chunk)
             
             print(f"Processing chunk {chunk_num}: rows {processed_rows - len(df_chunk) + 1:,} to {processed_rows:,}")
@@ -591,3 +658,67 @@ def rank_by_rrf(cosine_df: pd.DataFrame, bm25_df: pd.DataFrame, k: int = 60,
     rrf_df = pd.merge(rrf_df, merged_ranks[[id_column, 'rrf_score']], on=id_column, how='left')
     
     return rrf_df.sort_values('rrf_score', ascending=False).reset_index(drop=True)
+
+
+# ---------------------------------------------------------------------------
+# CLI entry point
+# ---------------------------------------------------------------------------
+
+
+def _cli():
+    parser = argparse.ArgumentParser(description="Optimized RRF ranking for chunk TSV")
+    parser.add_argument("input_tsv", type=Path, help="Đường dẫn file TSV chứa chunk")
+    parser.add_argument("output_dir", type=Path, help="Thư mục lưu kết quả")
+    parser.add_argument("original", type=Path, help="Đường dẫn file TSV gốc chứa query_text")
+    parser.add_argument("--model", default="sentence-transformers/all-MiniLM-L6-v2",
+                        help="Tên mô hình embedding (mặc định MiniLM-L6)")
+    parser.add_argument("--workers", type=int, default=4, help="Số worker song song cho ranking")
+    parser.add_argument("--chunk_size", type=int, default=50000, help="Số dòng đọc mỗi lượt")
+    parser.add_argument("--up", type=int, default=80, help="Upper percentile POS")
+    parser.add_argument("--low", type=int, default=20, help="Lower percentile NEG")
+    args = parser.parse_args()
+
+    args.output_dir.mkdir(exist_ok=True, parents=True)
+
+    rank_and_filter_chunks_optimized(
+        chunks_tsv=str(args.input_tsv),
+        output_dir=args.output_dir,
+        original_tsv=str(args.original),
+        upper_percentile=args.up,
+        lower_percentile=args.low,
+        model_name=args.model,
+        max_workers=args.workers,
+        chunk_size=args.chunk_size,
+    )
+
+
+if __name__ == "__main__":
+    import sys
+
+    if len(sys.argv) > 1:
+        _cli()
+    else:
+        # ----- Interactive prompt -----
+        print("Interactive RRF Ranking UI")
+        chunks_tsv = input("Enter path to CHUNKS TSV (from simple_chunk_controller): ").strip()
+        original_tsv = input("Enter path to ORIGINAL TSV (query_id\tquery_text…): ").strip()
+        output_dir = input("Enter output directory [training_datasets]: ").strip() or "training_datasets"
+
+        model = input("Embedding model [sentence-transformers/all-MiniLM-L6-v2]: ").strip() or "sentence-transformers/all-MiniLM-L6-v2"
+        workers = int(input("Parallel workers for ranking [4]: ") or "4")
+        up = int(input("Upper percentile POS [80]: ") or "80")
+        low = int(input("Lower percentile NEG [20]: ") or "20")
+        chunk_sz = int(input("Chunk size rows [50000]: ") or "50000")
+
+        Path(output_dir).mkdir(exist_ok=True, parents=True)
+
+        rank_and_filter_chunks_optimized(
+            chunks_tsv=chunks_tsv,
+            output_dir=Path(output_dir),
+            original_tsv=original_tsv,
+            upper_percentile=up,
+            lower_percentile=low,
+            model_name=model,
+            max_workers=workers,
+            chunk_size=chunk_sz,
+        )

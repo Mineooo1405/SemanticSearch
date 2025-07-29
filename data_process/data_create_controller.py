@@ -101,9 +101,9 @@ def _utility_calculate_optimal_batch_size():
         available_gb = psutil.virtual_memory().available / (1024**3)
         
         if available_gb > 16:
-            return 1000  # High memory system
+            return 600  # High memory system
         elif available_gb > 8:
-            return 500   # Medium memory system
+            return 300   # Medium memory system
         elif available_gb > 4:
             return 200   # Low memory system
         else:
@@ -855,7 +855,7 @@ class DatasetController:
                     batch_df,
                     config,
                     batch_num,
-                    None,
+                    current_embedding_model,
                     worker_id
                 )
                 future_to_batch[future] = batch_num - 1
@@ -2310,6 +2310,8 @@ def _worker_init(embedding_model_name: str, device_preference: str):
     """
     try:
         from Tool.Sentence_Embedding import sentence_embedding, loaded_models
+        # Cập nhật COMMON_DEFAULTS cho process con
+        COMMON_DEFAULTS["embedding_model"] = embedding_model_name
         if embedding_model_name not in loaded_models:
             # Thực hiện encode giả để kích hoạt việc nạp model
             sentence_embedding(["init"], embedding_model_name, batch_size=1, device_preference=device_preference)
