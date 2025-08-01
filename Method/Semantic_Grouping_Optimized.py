@@ -1,6 +1,6 @@
 import pandas as pd
 from dotenv import load_dotenv
-from Tool.Sentence_Segmenter import extract_sentences_spacy, count_tokens_spacy
+from Tool.Sentence_Segmenter import extract_sentences_spacy
 from Tool.Sentence_Embedding import sentence_embedding as embed_text_list 
 from Tool.OIE import extract_relations_from_paragraph 
 import os 
@@ -15,27 +15,63 @@ from pathlib import Path
 
 load_dotenv()
 
-def _count_tokens_accurate(text: str) -> int:
-    """Token counting using spaCy tokenizer"""
-    return count_tokens_spacy(text)
+def _normalize_device(device) -> str:
+    """Normalize device to 'cuda' or 'cpu'"""
+    if device is None:
+        return "cuda"
+    device_str = str(device).lower()
+    return "cuda" if device_str == "cuda" else "cpu"
 
-def process_sentence_embedding_in_batches(sentences, model_name, batch_size=32, device=None, silent=True):
+def _optimize_gpu_batch_size(sentences, base_batch_size, device):
+    """Optimize batch size based on sentence complexity and GPU memory"""
+    device = _normalize_device(device)
+    if device != "cuda":
+        return base_batch_size
+    
+    # Estimate complexity based on average sentence length
+    avg_length = sum(len(s) for s in sentences) / len(sentences) if sentences else 100
+    
+    # Aggressive sizing for RTX 5080 with large VRAM
+    if avg_length < 50:  # Short sentences
+        return min(256, len(sentences))
+    elif avg_length < 100:  # Medium sentences  
+        return min(128, len(sentences))
+    elif avg_length < 200:  # Long sentences
+        return min(64, len(sentences))
+    else:  # Very long sentences
+        return min(32, len(sentences))
+
+def process_sentence_embedding_in_batches(sentences, model_name, batch_size=32, device="cuda", silent=True):
     """
     Embeds a list of sentences in batches using a specified sentence transformer model.
-    Optimized for better memory management and error handling.
+    Optimized for better memory management and GPU utilization.
     """
     if not sentences:
         if not silent:
             print("No sentences provided to embed.")
         return np.array([])
+    
+    device = _normalize_device(device)
+    
+    # Log device and optimization info
+    if not silent:
+        print(f"Embedding Setup: Device={device}, Model={model_name}")
+        print(f"Input: {len(sentences)} sentences, Base batch size: {batch_size}")
 
-    # Dynamic batch size optimization based on sentence count
-    if len(sentences) <= 10:
-        batch_size = min(batch_size, len(sentences))  # Process all at once for tiny datasets
-    elif len(sentences) < 50:
-        batch_size = min(batch_size, 8)  # Very small batches for small datasets
-    elif len(sentences) > 200:
-        batch_size = min(batch_size * 2, 64)  # Larger batches for big datasets
+    # Optimize batch size for GPU utilization
+    if device == "cuda":
+        optimized_batch_size = _optimize_gpu_batch_size(sentences, batch_size, device)
+        if not silent:
+            print(f"   GPU Optimization: {batch_size} → {optimized_batch_size} (RTX 5080 optimized)")
+        batch_size = optimized_batch_size
+    else:
+        # Conservative CPU batching
+        if len(sentences) <= 10:
+            batch_size = min(batch_size, len(sentences))
+        elif len(sentences) < 50:
+            batch_size = min(batch_size, 8)
+        elif len(sentences) > 200:
+            batch_size = min(batch_size * 2, 64)
 
     all_embeddings = []
     if not silent:
@@ -51,8 +87,14 @@ def process_sentence_embedding_in_batches(sentences, model_name, batch_size=32, 
             print(f"  Embedding progress: {progress:.1f}% ({batch_num}/{total_batches})")
         
         try:
-            device_pref = str(device) if device is not None else "cpu"
-            batch_embeddings = embed_text_list(batch, model_name=model_name, batch_size=len(batch), device_preference=device_pref)
+            # For GPU, use larger internal batch size for better utilization
+            internal_batch_size = len(batch) if device == "cuda" else min(len(batch), 16)
+            batch_embeddings = embed_text_list(
+                batch, 
+                model_name=model_name, 
+                batch_size=internal_batch_size, 
+                device_preference=device
+            )
             if batch_embeddings is not None and len(batch_embeddings) > 0:
                 all_embeddings.append(batch_embeddings)
             else:
@@ -61,6 +103,7 @@ def process_sentence_embedding_in_batches(sentences, model_name, batch_size=32, 
         except Exception as e:
             if not silent:
                 print(f"Error during batched embedding batch {batch_num}: {e}")
+                print(f"Device being used: {device}, Batch size: {len(batch)}")
 
     if not all_embeddings:
         if not silent:
@@ -75,25 +118,33 @@ def process_sentence_embedding_in_batches(sentences, model_name, batch_size=32, 
             print(f"Error concatenating batch embeddings: {e}")
         return np.array([])
 
-def helper_create_semantic_matrix(sentences: List[str], model_name: str, batch_size_embed: int = 32, device: Optional[str] = None, silent: bool = True) -> Optional[np.ndarray]:
+def helper_create_semantic_matrix(sentences: List[str], model_name: str, batch_size_embed: int = 32, device: Optional[str] = "cuda", silent: bool = True) -> Optional[np.ndarray]:
     """Create semantic similarity matrix between sentences using batched embedding."""
     if len(sentences) < 2:
         return None
 
-    # Smart batch size for small documents
-    num_sentences = len(sentences)
-    if num_sentences <= 10:
-        # For very small documents, process all sentences in one batch
-        optimal_batch_size = num_sentences
-    elif num_sentences <= 30:
-        # For small documents, use small batches
-        optimal_batch_size = min(8, num_sentences)
-    else:
-        # For larger documents, use configured batch size
-        optimal_batch_size = min(max(batch_size_embed, 16), 64)
+    device = _normalize_device(device)
     
-    if not silent and num_sentences <= 10:
-        print(f"Small document ({num_sentences} sentences): Processing in single batch")
+    # GPU-optimized batch sizing using the new optimization function
+    num_sentences = len(sentences)
+    if device == "cuda":
+        optimal_batch_size = _optimize_gpu_batch_size(sentences, batch_size_embed, device)
+    else:
+        # Conservative CPU batching
+        if num_sentences <= 10:
+            optimal_batch_size = num_sentences
+        elif num_sentences <= 30:
+            optimal_batch_size = min(8, num_sentences)
+        else:
+            optimal_batch_size = min(max(batch_size_embed, 16), 64)
+    
+    if not silent:
+        device_info = f"GPU ({device})" if device == "cuda" else f"CPU ({device})"
+        print(f"Matrix Creation: {num_sentences} sentences on {device_info}")
+        print(f"Optimal batch size: {optimal_batch_size}")
+    
+    import time
+    start_time = time.time()
     
     embeddings = process_sentence_embedding_in_batches(
         sentences, 
@@ -102,6 +153,10 @@ def helper_create_semantic_matrix(sentences: List[str], model_name: str, batch_s
         device=device, 
         silent=silent
     )
+    
+    embedding_time = time.time() - start_time
+    if not silent:
+        print(f"   Embedding completed in {embedding_time:.2f}s ({len(sentences)/embedding_time:.1f} sentences/sec)")
 
     if embeddings is None or embeddings.shape[0] != len(sentences):
         if not silent:
@@ -161,8 +216,8 @@ def analyze_similarity_distribution(sim_matrix):
 
     return stats
 
-def helper_find_best_similarity_pairs(sim_matrix, ungrouped_indices, sentences, threshold, max_tokens, silent):
-    """Find pairs of sentences that meet similarity and token constraints - optimized version"""
+def helper_find_best_similarity_pairs(sim_matrix, ungrouped_indices, sentences, threshold, silent):
+    """Find pairs of sentences that meet similarity constraints - optimized version"""
     if len(ungrouped_indices) < 2:
         return []
         
@@ -192,16 +247,12 @@ def helper_find_best_similarity_pairs(sim_matrix, ungrouped_indices, sentences, 
     valid_j = j_filtered[threshold_mask]
     valid_sims = similarities[threshold_mask]
     
-    # Check token constraints for remaining pairs
-    for idx, (i, j, sim) in enumerate(zip(valid_i, valid_j, valid_sims)):
-        combined_text = sentences[i] + " " + sentences[j]
-        combined_tokens = _count_tokens_accurate(combined_text)
+    # Create valid pairs without token checking
+    for i, j, sim in zip(valid_i, valid_j, valid_sims):
+        valid_pairs.append(((i, j), sim))
         
-        if combined_tokens <= max_tokens:
-            valid_pairs.append(((i, j), sim))
-            
         # Limit checking to top candidates for performance
-        if len(valid_pairs) >= 10:  # Only check top 10 by similarity
+        if len(valid_pairs) >= 20:  # Check more pairs since no token constraint
             break
 
     # Sort by similarity score descending
@@ -209,8 +260,8 @@ def helper_find_best_similarity_pairs(sim_matrix, ungrouped_indices, sentences, 
     return valid_pairs
 
 def helper_expand_group_with_constraints(sim_matrix, sentences, current_group, ungrouped_indices, 
-                                threshold, max_tokens, silent):
-    """Expand a group by adding similar sentences while respecting token constraints"""
+                                threshold, silent):
+    """Expand a group by adding similar sentences"""
     added_in_iteration = True
     max_expansion_iterations = len(ungrouped_indices) + 1
     expansion_iteration = 0
@@ -227,12 +278,7 @@ def helper_expand_group_with_constraints(sim_matrix, sentences, current_group, u
                 max_similarity = max(max_similarity, similarity)
             
             if max_similarity >= threshold:
-                test_group_sentences = [sentences[idx] for idx in current_group + [ungrouped_idx]]
-                test_text = " ".join(test_group_sentences)
-                test_tokens = _count_tokens_accurate(test_text)
-                
-                if test_tokens <= max_tokens:
-                    candidates_to_add.append((ungrouped_idx, max_similarity))
+                candidates_to_add.append((ungrouped_idx, max_similarity))
 
         if candidates_to_add:
             candidates_to_add.sort(key=lambda x: x[1], reverse=True)
@@ -246,50 +292,25 @@ def helper_expand_group_with_constraints(sim_matrix, sentences, current_group, u
 
     return current_group
 
-def helper_handle_remaining_sentences(remaining_indices, sentences, min_tokens, max_tokens, silent):
-    """Handle sentences that couldn't be grouped, trying to merge small ones"""
+def helper_handle_remaining_sentences(remaining_indices, sentences, silent):
+    """Handle sentences that couldn't be grouped"""
     if not remaining_indices:
         return []
     
     groups = []
-    current_merge_group = []
-    current_merge_tokens = 0
     
     if not silent:
         print(f"Handling {len(remaining_indices)} remaining sentences...")
     
+    # Simply put each remaining sentence in its own group
     for idx in remaining_indices:
-        sentence_tokens = _count_tokens_accurate(sentences[idx])
-        
-        if sentence_tokens >= min_tokens:
-            if sentence_tokens <= max_tokens:
-                groups.append([idx])
-                if not silent:
-                    print(f"  Individual sentence {idx}: {sentence_tokens} tokens ✓")
-        else:
-            test_tokens = current_merge_tokens + sentence_tokens
-            if test_tokens <= max_tokens:
-                current_merge_group.append(idx)
-                current_merge_tokens = test_tokens
-            else:
-                if current_merge_tokens >= min_tokens and current_merge_group:
-                    groups.append(current_merge_group)
-                    if not silent:
-                        print(f"  Merged group: {len(current_merge_group)} sentences, {current_merge_tokens} tokens ✓")
-                
-                current_merge_group = [idx]
-                current_merge_tokens = sentence_tokens
-    
-    if current_merge_group:
-        if current_merge_tokens >= min_tokens:
-            groups.append(current_merge_group)
-            if not silent:
-                print(f"  Final merged group: {len(current_merge_group)} sentences, {current_merge_tokens} tokens ✓")
+        groups.append([idx])
+        if not silent:
+            print(f"  Individual sentence {idx} ✓")
     
     return groups
 
-def process_semantic_grouping_optimized(sim_matrix, sentences, initial_threshold, decay_factor, min_threshold, 
-                                        min_chunk_len, max_chunk_len, silent=True):
+def process_semantic_grouping_optimized(sim_matrix, sentences, initial_threshold, decay_factor, min_threshold, silent=True):
     """Optimized semantic grouping algorithm with early termination and fast path for small documents"""
     num_sentences = sim_matrix.shape[0]
     
@@ -298,43 +319,10 @@ def process_semantic_grouping_optimized(sim_matrix, sentences, initial_threshold
         if not silent:
             print(f"Fast path for small document ({num_sentences} sentences)")
         
-        # For small documents, try to group all sentences if they meet token constraints
-        all_text = " ".join(sentences)
-        all_tokens = _count_tokens_accurate(all_text)
-        
-        if all_tokens <= max_chunk_len:
-            if not silent:
-                print(f"  Single group: {num_sentences} sentences, {all_tokens} tokens ✓")
-            return [list(range(num_sentences))]
-        
-        # If too big, use simplified pairing approach
-        groups = []
-        remaining = list(range(num_sentences))
-        
-        while remaining:
-            current_group = [remaining.pop(0)]
-            current_text = sentences[current_group[0]]
-            current_tokens = _count_tokens_accurate(current_text)
-            
-            # Try to add more sentences to current group
-            i = 0
-            while i < len(remaining):
-                test_text = current_text + " " + sentences[remaining[i]]
-                test_tokens = _count_tokens_accurate(test_text)
-                
-                if test_tokens <= max_chunk_len:
-                    current_group.append(remaining.pop(i))
-                    current_text = test_text
-                    current_tokens = test_tokens
-                else:
-                    i += 1
-            
-            if current_tokens >= min_chunk_len:
-                groups.append(current_group)
-                if not silent:
-                    print(f"  Small doc group: {len(current_group)} sentences, {current_tokens} tokens ✓")
-        
-        return groups
+        # For small documents, try to group all sentences
+        if not silent:
+            print(f"  Single group: {num_sentences} sentences ✓")
+        return [list(range(num_sentences))]
     
     # Standard processing for larger documents
     ungrouped_indices = set(range(num_sentences))
@@ -346,7 +334,6 @@ def process_semantic_grouping_optimized(sim_matrix, sentences, initial_threshold
 
     if not silent:
         print(f"Starting semantic grouping with {num_sentences} sentences")
-        print(f"Token constraints: {min_chunk_len}-{max_chunk_len}")
         print(f"Thresholds: initial={initial_threshold:.3f}, decay={decay_factor}, min={min_threshold:.3f}")
 
     while len(ungrouped_indices) > 0 and iteration < max_iterations:
@@ -354,7 +341,7 @@ def process_semantic_grouping_optimized(sim_matrix, sentences, initial_threshold
         
         best_pairs = helper_find_best_similarity_pairs(
             sim_matrix, list(ungrouped_indices), sentences, 
-            current_threshold, max_chunk_len, silent
+            current_threshold, silent
         )
         
         if not best_pairs:
@@ -382,29 +369,21 @@ def process_semantic_grouping_optimized(sim_matrix, sentences, initial_threshold
         
         current_group = helper_expand_group_with_constraints(
             sim_matrix, sentences, current_group, list(ungrouped_indices),
-            current_threshold, max_chunk_len, silent
+            current_threshold, silent
         )
         
         for idx in current_group:
             ungrouped_indices.discard(idx)
         
-        group_text = " ".join([sentences[idx] for idx in current_group])
-        group_tokens = _count_tokens_accurate(group_text)
-        
-        if group_tokens >= min_chunk_len:
-            groups.append(sorted(current_group))
-            if not silent:
-                print(f"  Group {len(groups)}: {len(current_group)} sentences, {group_tokens} tokens ✓")
-        else:
-            if not silent:
-                print(f"  Group candidate: {group_tokens} tokens < {min_chunk_len}, discarding")
-            ungrouped_indices.update(current_group)
+        groups.append(sorted(current_group))
+        if not silent:
+            print(f"  Group {len(groups)}: {len(current_group)} sentences ✓")
 
         current_threshold = max(min_threshold, initial_threshold * (decay_factor ** len(groups)))
 
     if ungrouped_indices:
         remaining_groups = helper_handle_remaining_sentences(
-            list(ungrouped_indices), sentences, min_chunk_len, max_chunk_len, silent
+            list(ungrouped_indices), sentences, silent
         )
         groups.extend(remaining_groups)
 
@@ -434,44 +413,6 @@ def format_oie_triples_to_string(triples_list: List[Dict[str, str]], max_triples
 
     return " ".join(formatted_sentences).strip()
 
-def helper_force_split_too_large_chunk(text: str, max_tokens: int) -> List[str]:
-    """Splits a chunk of text that is over max_tokens into smaller chunks."""
-    sentences = extract_sentences_spacy(text)
-    if not sentences:
-        words = text.split()
-        return [" ".join(words[i:i + max_tokens]) for i in range(0, len(words), max_tokens)]
-
-    chunks = []
-    current_chunk_sentences = []
-    current_tokens = 0
-
-    for sentence in sentences:
-        sentence_len = _count_tokens_accurate(sentence)
-
-        if sentence_len > max_tokens:
-            if current_chunk_sentences:
-                chunks.append(" ".join(current_chunk_sentences))
-                current_chunk_sentences = []
-                current_tokens = 0
-            
-            words = sentence.split()
-            sub_chunks = [" ".join(words[i:i + max_tokens]) for i in range(0, len(words), max_tokens)]
-            chunks.extend(sub_chunks)
-            continue
-
-        if current_chunk_sentences and current_tokens + sentence_len > max_tokens:
-            chunks.append(" ".join(current_chunk_sentences))
-            current_chunk_sentences = [sentence]
-            current_tokens = sentence_len
-        else:
-            current_chunk_sentences.append(sentence)
-            current_tokens += sentence_len
-    
-    if current_chunk_sentences:
-        chunks.append(" ".join(current_chunk_sentences))
-
-    return [chunk for chunk in chunks if chunk]
-
 def process_oie_extraction(chunk_text: str, max_triples: Optional[int] = None, silent: bool = True) -> Optional[str]:
     """Extract OIE relations for a chunk and format them"""
     if not chunk_text or not chunk_text.strip():
@@ -479,7 +420,7 @@ def process_oie_extraction(chunk_text: str, max_triples: Optional[int] = None, s
     
     try:
         if not silent:
-            print(f"    Extracting OIE for chunk ({_count_tokens_accurate(chunk_text)} tokens)...")
+            print(f"    Extracting OIE for chunk...")
         
         relations = extract_relations_from_paragraph(chunk_text)
         
@@ -505,14 +446,13 @@ def semantic_grouping_main(
     initial_threshold: Union[str, float] = "auto",
     decay_factor: float = 0.85,
     min_threshold: Union[str, float] = "auto",
-    min_chunk_len_tokens: int = 0,  # Simplified: no minimum constraint      
-    max_chunk_len_tokens: int = 200,     
+    min_sentences_per_chunk: int = 1,  # Số câu tối thiểu mỗi chunk     
     include_oie: bool = False,
     save_raw_oie: bool = False,
     output_dir: str = "./output",
     initial_percentile: str = "85",  
     min_percentile: str = "25",
-    embedding_batch_size: int = 16,
+    embedding_batch_size: int = 64,  # Increased for RTX 5080
     silent: bool = False,
     **kwargs
 ) -> List[Tuple[str, str, Optional[str]]]:
@@ -526,7 +466,7 @@ def semantic_grouping_main(
     if not silent:
         print(f"    Processing passage {doc_id} with Enhanced Semantic Grouping")
         print(f"   Model: {embedding_model}")
-        print(f"   Token range: {min_chunk_len_tokens}-{max_chunk_len_tokens}")
+        print(f"   Min sentences per chunk: {min_sentences_per_chunk}")
         print(f"   OIE enabled: {include_oie}")
 
     # Extract sentences
@@ -544,11 +484,10 @@ def semantic_grouping_main(
         
         return [(f"{doc_id}_single_empty", final_text, oie_string)]
 
-    # Check if passage is small enough to keep as single chunk
-    total_tokens = _count_tokens_accurate(passage_text)
-    if total_tokens <= max_chunk_len_tokens:
+    # For single or few sentences, keep as one chunk
+    if len(sentences) <= 3:
         if not silent:
-            print(f"   Passage fits in single chunk ({total_tokens} tokens)")
+            print(f"   Small passage with {len(sentences)} sentences, keeping as single chunk")
         
         oie_string = None
         final_text = passage_text
@@ -567,7 +506,7 @@ def semantic_grouping_main(
         sentences, 
         model_name=embedding_model, 
         batch_size_embed=embedding_batch_size, 
-        device=kwargs.get('device'), 
+        device=_normalize_device(kwargs.get('device', 'cuda')), 
         silent=silent
     )
     
@@ -632,7 +571,7 @@ def semantic_grouping_main(
     
     group_indices = process_semantic_grouping_optimized(
         sim_matrix, sentences, actual_initial_threshold, decay_factor, 
-        actual_min_threshold, min_chunk_len_tokens, max_chunk_len_tokens, silent
+        actual_min_threshold, silent
     )
     
     del sim_matrix
@@ -696,15 +635,18 @@ def semantic_grouping_main(
                     print(f"      Error during OIE extraction: {e_oie}")
                 oie_string = None
         
-        base_tokens = _count_tokens_accurate(chunk_text)
-        if base_tokens >= min_chunk_len_tokens:
+        num_sentences = len(valid_indices)
+        
+        # Check sentence count requirement only
+        meets_sentence_requirement = num_sentences >= min_sentences_per_chunk
+        
+        if meets_sentence_requirement:
             final_chunks.append((chunk_id, final_chunk_text, oie_string))
             if not silent:
-                final_tokens = _count_tokens_accurate(final_chunk_text)
-                print(f"   ✓ Chunk {i}: {base_tokens} base tokens, {final_tokens} final tokens")
+                print(f"   ✓ Chunk {i}: {num_sentences} sentences")
         else:
             if not silent:
-                print(f"   ✗ Chunk {i}: {base_tokens} base tokens < {min_chunk_len_tokens} (discarded)")
+                print(f"   ✗ Chunk {i}: {num_sentences} sentences < {min_sentences_per_chunk} (discarded)")
 
     # Handle case where no valid chunks were created
     if not final_chunks:
@@ -720,46 +662,12 @@ def semantic_grouping_main(
         
         final_chunks = [(f"{doc_id}_filter_fail", final_text, oie_string)]
 
-    # Force-split any chunks that are still too large
-    if not silent:
-        print(f"   Ensuring all chunks respect max token limit ({max_chunk_len_tokens})...")
-
-    force_split_chunks = []
-    for chunk_id, chunk_text_w_oie, oie_string_from_chunker in final_chunks:
-        base_text = chunk_text_w_oie
-        if oie_string_from_chunker and base_text.endswith(oie_string_from_chunker):
-             base_text = base_text[:-len(oie_string_from_chunker)].strip()
-        
-        base_token_count = _count_tokens_accurate(base_text)
-
-        if base_token_count > max_chunk_len_tokens:
-            if not silent:
-                print(f"     Chunk {chunk_id} ({base_token_count} tokens) is too large. Force-splitting...")
-            
-            sub_chunks_text = helper_force_split_too_large_chunk(base_text, max_chunk_len_tokens)
-            
-            for i, sub_chunk_text_item in enumerate(sub_chunks_text):
-                sub_chunk_id = f"{chunk_id}_fs{i}"
-                
-                sub_oie_string = None
-                final_sub_chunk_text = sub_chunk_text_item
-                if include_oie:
-                    sub_oie_string = process_oie_extraction(sub_chunk_text_item, silent=silent)
-                    if sub_oie_string:
-                        final_sub_chunk_text = f"{sub_chunk_text_item} {sub_oie_string}"
-                
-                force_split_chunks.append((sub_chunk_id, final_sub_chunk_text, sub_oie_string))
-        else:
-            force_split_chunks.append((chunk_id, chunk_text_w_oie, oie_string_from_chunker))
-
-    final_chunks = force_split_chunks
-
     # Save raw OIE if needed
     if save_raw_oie and all_raw_oie_data:
         try:
             raw_oie_filepath = helper_save_raw_oie_data(all_raw_oie_data, doc_id, output_dir, "semantic_grouping")
             if raw_oie_filepath and not silent:
-                print(f"📄 Raw OIE data saved to: {raw_oie_filepath}")
+                print(f"Raw OIE data saved to: {raw_oie_filepath}")
                 total_relations = sum(entry['relation_count'] for entry in all_raw_oie_data)
                 print(f"   Total chunks with OIE: {len(all_raw_oie_data)}")
                 print(f"   Total relations extracted: {total_relations}")
@@ -768,12 +676,7 @@ def semantic_grouping_main(
                 print(f"Warning: Failed to save raw OIE data: {e}")
 
     if not silent:
-        token_counts = [_count_tokens_accurate(chunk[1]) for chunk in final_chunks]
-        if token_counts:
-            print(f"  Created {len(final_chunks)} final chunks after force-splitting.")
-            print(f"  Final token distribution: {min(token_counts)}-{max(token_counts)} (avg: {sum(token_counts)/len(token_counts):.1f})")
-        else:
-            print("   No chunks were created after processing.")
+        print(f"  Created {len(final_chunks)} final chunks.")
 
     return final_chunks
 
@@ -819,26 +722,24 @@ def semantic_chunk_passage_from_grouping_logic(
     decay_factor: float = 0.85,
     min_threshold: Union[str, float] = "auto",
     window_size: int = 3,  # Unused in optimized version but kept for compatibility
-    embedding_batch_size: int = 16,
+    embedding_batch_size: int = 64,  # Increased for RTX 5080
     include_oie: bool = False,
     save_raw_oie: bool = False,
     output_dir: str = "./output",
     initial_percentile: str = "85",
     min_percentile: str = "25",
-    target_tokens: int = 120,
-    tolerance: float = 0.25,
+    target_tokens: int = 120,  # Ignored - no token constraints
+    tolerance: float = 0.25,   # Ignored - no token constraints
+    min_sentences_per_chunk: int = 1,  # Số câu tối thiểu mỗi chunk
     silent: bool = False,
-    device: Optional[object] = None,
+    device: Optional[str] = "cuda",
     **kwargs
 ) -> List[Tuple[str, str, Optional[str]]]:
     """
     Compatibility wrapper for the optimized semantic grouping.
     This function maintains the same interface as the original semantic_chunk_passage_from_grouping_logic
-    but uses the optimized implementation.
+    but uses the optimized implementation without token constraints.
     """
-    # Convert target_tokens to max_chunk_len_tokens for optimized function
-    max_tokens = int(target_tokens * (1 + tolerance)) if target_tokens else 200
-    min_tokens = int(target_tokens * (1 - tolerance)) if target_tokens else 0
     
     return semantic_grouping_main(
         passage_text=passage_text,
@@ -847,8 +748,7 @@ def semantic_chunk_passage_from_grouping_logic(
         initial_threshold=initial_threshold,
         decay_factor=decay_factor,
         min_threshold=min_threshold,
-        min_chunk_len_tokens=min_tokens,
-        max_chunk_len_tokens=max_tokens,
+        min_sentences_per_chunk=min_sentences_per_chunk,
         include_oie=include_oie,
         save_raw_oie=save_raw_oie,
         output_dir=output_dir,
@@ -856,5 +756,6 @@ def semantic_chunk_passage_from_grouping_logic(
         min_percentile=min_percentile,
         embedding_batch_size=embedding_batch_size,
         silent=silent,
+        device=device,
         **kwargs
     )

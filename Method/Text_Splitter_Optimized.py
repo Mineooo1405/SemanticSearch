@@ -20,7 +20,8 @@ def process_sentence_splitting(
     chunk_overlap: int = 0,
     target_tokens: Optional[int] = None,
     tolerance: float = 0.25,
-    enable_adaptive: bool = False
+    enable_adaptive: bool = False,
+    min_sentences_per_chunk: int = 1  # Số câu tối thiểu mỗi chunk
 ) -> Tuple[List[str], List[str], List[List[int]]]:
     """
     Optimized sentence-based text splitting with adaptive token control.
@@ -95,7 +96,7 @@ def process_sentence_splitting(
         if current_chunk_sentences:
             projected_size += 1  # Space between sentences
         
-        if projected_size > chunk_size and current_chunk_sentences:
+        if projected_size > chunk_size and current_chunk_sentences and len(current_chunk_sentences) >= min_sentences_per_chunk:
             # Save current chunk
             chunk_text = ' '.join(current_chunk_sentences)
             chunks.append(chunk_text)
@@ -124,11 +125,28 @@ def process_sentence_splitting(
         if len(current_chunk_sentences) > 1:
             current_size += len(current_chunk_sentences) - 1  # Spaces
     
-    # Add final chunk if exists
-    if current_chunk_sentences:
+    # Add final chunk if exists and meets minimum sentence requirement
+    if current_chunk_sentences and len(current_chunk_sentences) >= min_sentences_per_chunk:
         chunk_text = ' '.join(current_chunk_sentences)
         chunks.append(chunk_text)
         sentence_groups.append(list(current_group_indices))
+    elif current_chunk_sentences and len(current_chunk_sentences) < min_sentences_per_chunk:
+        # Merge with previous chunk if it doesn't meet minimum
+        if chunks and sentence_groups:
+            # Merge with last chunk
+            last_chunk_text = chunks[-1]
+            last_sentence_group = sentence_groups[-1]
+            
+            merged_text = last_chunk_text + " " + " ".join(current_chunk_sentences)
+            merged_indices = last_sentence_group + current_group_indices
+            
+            chunks[-1] = merged_text
+            sentence_groups[-1] = merged_indices
+        else:
+            # No previous chunk to merge with, keep as is
+            chunk_text = ' '.join(current_chunk_sentences)
+            chunks.append(chunk_text)
+            sentence_groups.append(list(current_group_indices))
     
     return chunks, sentences, sentence_groups
 
@@ -426,6 +444,7 @@ def text_splitter_main(
     target_tokens: int = 140,
     tolerance: float = 0.075,
     enable_adaptive: bool = True,
+    min_sentences_per_chunk: int = 1,  # Số câu tối thiểu mỗi chunk
     silent: bool = False,
     **kwargs 
 ) -> List[Tuple[str, str, Optional[str]]]:
@@ -440,6 +459,7 @@ def text_splitter_main(
         print(f"    Processing passage {doc_id} with Enhanced Text Splitter")
         print(f"   Chunk size: {chunk_size} chars, Overlap: {chunk_overlap} chars")
         print(f"   Target tokens: {target_tokens} ±{tolerance*100:.0f}%")
+        print(f"   Min sentences per chunk: {min_sentences_per_chunk}")
         print(f"   OIE enabled: {include_oie}")
         print(f"   Adaptive mode: {enable_adaptive}")
 
@@ -474,7 +494,8 @@ def text_splitter_main(
             chunk_overlap=chunk_overlap,
             target_tokens=target_tokens,
             tolerance=tolerance,
-            enable_adaptive=enable_adaptive
+            enable_adaptive=enable_adaptive,
+            min_sentences_per_chunk=min_sentences_per_chunk
         )
         
         if not chunk_texts:
@@ -620,6 +641,7 @@ def chunk_passage_text_splitter(
     target_tokens: int = 140,
     tolerance: float = 0.075,
     enable_adaptive: bool = True,
+    min_sentences_per_chunk: int = 1,  # Số câu tối thiểu mỗi chunk
     silent: bool = False,
     **kwargs 
 ) -> List[Tuple[str, str, Optional[str]]]:
@@ -640,6 +662,7 @@ def chunk_passage_text_splitter(
         target_tokens=target_tokens,
         tolerance=tolerance,
         enable_adaptive=enable_adaptive,
+        min_sentences_per_chunk=min_sentences_per_chunk,
         silent=silent,
         **kwargs
     )

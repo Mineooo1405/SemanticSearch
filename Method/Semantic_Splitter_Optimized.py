@@ -25,6 +25,7 @@ def process_sentence_splitting_with_semantics(
     tolerance: float = 0.25,
     enable_adaptive: bool = False,
     semantic_threshold: Optional[float] = None,
+    min_sentences_per_chunk: int = 1,  # Số câu tối thiểu mỗi chunk
     embedding_model: str = "all-MiniLM-L6-v2",
     device: Optional[object] = None,
 ) -> Tuple[List[str], List[str], List[List[int]]]:
@@ -102,6 +103,7 @@ def process_sentence_splitting_with_semantics(
             semantic_threshold is not None
             and current_chunk_sentences
             and embeddings is not None
+            and len(current_chunk_sentences) >= min_sentences_per_chunk  # Chỉ cắt khi đã đủ câu tối thiểu
         ):
             last_idx = current_group_indices[-1]
             sim_val = float(cosine_similarity(
@@ -157,7 +159,7 @@ def process_sentence_splitting_with_semantics(
         if current_chunk_sentences:
             projected_size += 1  # Space between sentences
         
-        if projected_size > effective_chunk_size and current_chunk_sentences:
+        if projected_size > effective_chunk_size and current_chunk_sentences and len(current_chunk_sentences) >= min_sentences_per_chunk:
             # Save current chunk
             chunk_text = ' '.join(current_chunk_sentences)
             chunks.append(chunk_text)
@@ -186,11 +188,28 @@ def process_sentence_splitting_with_semantics(
         if len(current_chunk_sentences) > 1:
             current_size += len(current_chunk_sentences) - 1  # Spaces
     
-    # Add final chunk if exists
-    if current_chunk_sentences:
+    # Add final chunk if exists and meets minimum sentence requirement
+    if current_chunk_sentences and len(current_chunk_sentences) >= min_sentences_per_chunk:
         chunk_text = ' '.join(current_chunk_sentences)
         chunks.append(chunk_text)
         sentence_groups.append(list(current_group_indices))
+    elif current_chunk_sentences and len(current_chunk_sentences) < min_sentences_per_chunk:
+        # Merge with previous chunk if it doesn't meet minimum
+        if chunks and sentence_groups:
+            # Merge with last chunk
+            last_chunk_text = chunks[-1]
+            last_sentence_group = sentence_groups[-1]
+            
+            merged_text = last_chunk_text + " " + " ".join(current_chunk_sentences)
+            merged_indices = last_sentence_group + current_group_indices
+            
+            chunks[-1] = merged_text
+            sentence_groups[-1] = merged_indices
+        else:
+            # No previous chunk to merge with, keep as is
+            chunk_text = ' '.join(current_chunk_sentences)
+            chunks.append(chunk_text)
+            sentence_groups.append(list(current_group_indices))
     
     return chunks, sentences, sentence_groups
 
@@ -432,6 +451,7 @@ def semantic_splitter_main(
     tolerance: float = 0.25,
     enable_adaptive: bool = True,
     semantic_threshold: float = 0.30,
+    min_sentences_per_chunk: int = 1,  # Số câu tối thiểu mỗi chunk
     embedding_model: str = "all-MiniLM-L6-v2",
     silent: bool = False,
     **kwargs 
@@ -447,6 +467,8 @@ def semantic_splitter_main(
         print(f"    Processing passage {doc_id} with Enhanced Text Splitter")
         print(f"   Chunk size: {chunk_size} chars, Overlap: {chunk_overlap} chars")
         print(f"   Target tokens: {target_tokens} ±{tolerance*100:.0f}%")
+        print(f"   Min sentences per chunk: {min_sentences_per_chunk}")
+        print(f"   Semantic threshold: {semantic_threshold}")
         print(f"   OIE enabled: {include_oie}")
         print(f"   Adaptive mode: {enable_adaptive}")
 
@@ -483,6 +505,7 @@ def semantic_splitter_main(
             tolerance=tolerance,
             enable_adaptive=enable_adaptive,
             semantic_threshold=semantic_threshold,
+            min_sentences_per_chunk=min_sentences_per_chunk,
             embedding_model=embedding_model,
             device=device,
         )
@@ -627,6 +650,7 @@ def chunk_passage_text_splitter(
     tolerance: float = 0.25,
     enable_adaptive: bool = True,
     semantic_threshold: float = 0.5,
+    min_sentences_per_chunk: int = 1,  # Số câu tối thiểu mỗi chunk
     embedding_model: str = "all-MiniLM-L6-v2",
     silent: bool = False,
     **kwargs 
@@ -649,6 +673,7 @@ def chunk_passage_text_splitter(
         tolerance=tolerance,
         enable_adaptive=enable_adaptive,
         semantic_threshold=semantic_threshold,
+        min_sentences_per_chunk=min_sentences_per_chunk,
         embedding_model=embedding_model,
         silent=silent,
         **kwargs

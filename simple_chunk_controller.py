@@ -1,8 +1,35 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
+# ---------------------------------------------------------------------------
+# Suppress noisy FutureWarnings & verbose library logs
+# ---------------------------------------------------------------------------
+import os, warnings, logging
+
+# Disable tokenizers parallelism globally (must be before SentenceTransformer import)
+os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+
+# For newer tokenizers versions explicitly disable parallelism API
+try:
+    import tokenizers
+    tokenizers.set_parallelism(False)
+except Exception:
+    pass
+
+# Ẩn cảnh báo encoder_attention_mask deprecated (transformers >=4.37)
+warnings.filterwarnings(
+    "ignore",
+    message=r"`encoder_attention_mask` is deprecated.*BertSdpaSelfAttention.forward",
+    category=FutureWarning,
+)
+
+# Giảm mức log của sentence_transformers / transformers để không in INFO
+logging.getLogger("sentence_transformers").setLevel(logging.ERROR)
+logging.getLogger("transformers").setLevel(logging.ERROR)
+
 import argparse
 import csv
+import sys
 import gc
 import multiprocessing as mp
 from concurrent.futures import ProcessPoolExecutor, as_completed
@@ -26,7 +53,7 @@ from Method.Text_Splitter_Optimized import (
 BATCH_SIZE = 600  # dòng/đợt đọc pandas
 COMMON_DEFAULTS = {
     "embedding_model": "sentence-transformers/all-MiniLM-L6-v2",
-    "device_preference": "cpu",  # "cuda", "dml", hoặc "cpu"
+    "device_preference": "dml",  # "cuda", "dml", hoặc "cpu"
 }
 
 # ==== Worker initializer =====================================================
@@ -58,12 +85,17 @@ def _worker_init(model_name: str, device_pref: str):
             except Exception:
                 return "cpu"
         if pref == "cuda":
-            return "cuda" if torch.cuda.is_available() else "cpu"
+            if torch.cuda.is_available():
+                torch.cuda.set_device(0)
+                return torch.device("cuda")
+            return torch.device(pref)
         if pref in {"", "cpu"}:
             return "cuda" if torch.cuda.is_available() else "cpu"
         return pref
 
     device_obj = _resolve(device_pref)
+
+    print(f"[PID {os.getpid()}] Using device: {device_obj}")
     _GLOBALS["model"] = SentenceTransformer(model_name, device=device_obj)
 
 
@@ -152,7 +184,15 @@ def run_config(
 
     # đọc input theo chunk
     with pd.read_csv(
-        input_path, sep="\t", header=0, chunksize=batch_size, engine="python", on_bad_lines="skip"
+        input_path,
+        sep="\t",
+        header=0,
+        chunksize=batch_size,
+        engine="python",
+        on_bad_lines="warn",
+        quoting=csv.QUOTE_NONE,
+        dtype=str,
+        encoding_errors="replace",
     ) as reader:
         all_batches = [(idx + 1, df) for idx, df in enumerate(reader)]
 
@@ -188,9 +228,7 @@ def run_config(
 # ==== RUN_CONFIGURATIONS =====================================================
 
 _CHUNK_DEFAULTS = {
-    "enable_adaptive": True,
-    "target_tokens": 120,
-    "tolerance": 0.25,
+    "min_sentences_per_chunk": 3,  # Minimum sentences per chunk
 }
 
 RUN_CONFIGURATIONS: List[Dict[str, Any]] = [
@@ -202,7 +240,7 @@ RUN_CONFIGURATIONS: List[Dict[str, Any]] = [
             "chunk_overlap": 0,
             **_CHUNK_DEFAULTS,
         },
-        "description": "Rule-based splitter (approx len)"
+        "description": "Rule-based splitter (sentence-based)"
     },
     {
         "name": "semantic_splitter_without_OIE",
@@ -224,6 +262,53 @@ RUN_CONFIGURATIONS: List[Dict[str, Any]] = [
             **_CHUNK_DEFAULTS,
         },
         "description": "Semantic grouping"
+    },
+    # With OIE configurations
+    {
+        "name": "semantic_grouping_with_OIE",
+        "method_choice": "1",
+        "params": {
+            "initial_threshold": "auto",
+            "decay_factor": 0.85,
+            "min_threshold": "auto",
+            "include_oie": True,
+            **_CHUNK_DEFAULTS,
+        },
+        "description": "Semantic grouping with OIE enrichment"
+    },
+    {
+        "name": "semantic_splitter_with_OIE",
+        "method_choice": "2",
+        "params": {
+            "chunk_overlap": 0,
+            "semantic_threshold": 0.3,
+            "include_oie": True,
+            **_CHUNK_DEFAULTS,
+        },
+        "description": "Semantic sentence splitter with OIE"
+    },
+    # High quality configurations
+    {
+        "name": "semantic_grouping_high_quality",
+        "method_choice": "1",
+        "params": {
+            "initial_threshold": 0.8,
+            "decay_factor": 0.9,
+            "min_threshold": 0.6,
+            "min_sentences_per_chunk": 2,
+        },
+        "description": "High-quality semantic grouping (stricter thresholds)"
+    },
+    {
+        "name": "semantic_grouping_relaxed",
+        "method_choice": "1",
+        "params": {
+            "initial_threshold": 0.5,
+            "decay_factor": 0.8,
+            "min_threshold": 0.3,
+            "min_sentences_per_chunk": 1,
+        },
+        "description": "Relaxed semantic grouping (more inclusive)"
     },
 ]
 
@@ -280,12 +365,41 @@ def interactive_ui():
 
     # ----- Config selection -----
     print("\nAvailable configurations:")
-    for cfg in RUN_CONFIGURATIONS:
-        print(f"  - {cfg['name']}")
-    cfg_input = input("Enter config names (comma) or ENTER for ALL: ").strip()
-    cfg_names = {n.strip() for n in cfg_input.split(',') if n.strip()} if cfg_input else set()
-
-    selected_cfgs = [c for c in RUN_CONFIGURATIONS if not cfg_names or c["name"] in cfg_names]
+    for i, cfg in enumerate(RUN_CONFIGURATIONS, 1):
+        desc = cfg.get('description', 'No description')
+        params_info = []
+        
+        # Extract key parameters for display
+        params = cfg.get('params', {})
+        if 'min_sentences_per_chunk' in params:
+            params_info.append(f"min_sentences={params['min_sentences_per_chunk']}")
+        if 'include_oie' in params and params['include_oie']:
+            params_info.append("OIE=Yes")
+        if 'semantic_threshold' in params:
+            params_info.append(f"threshold={params['semantic_threshold']}")
+        if 'initial_threshold' in params and params['initial_threshold'] != 'auto':
+            params_info.append(f"init_th={params['initial_threshold']}")
+            
+        param_str = f" ({', '.join(params_info)})" if params_info else ""
+        print(f"  {i:2d}. {cfg['name']}{param_str}")
+        print(f"      {desc}")
+    
+    cfg_input = input("\nEnter config numbers (comma-separated) or names or ENTER for ALL: ").strip()
+    
+    if cfg_input:
+        # Handle both numbers and names
+        selected_cfgs = []
+        for item in cfg_input.split(','):
+            item = item.strip()
+            if item.isdigit() and 1 <= int(item) <= len(RUN_CONFIGURATIONS):
+                selected_cfgs.append(RUN_CONFIGURATIONS[int(item) - 1])
+            else:
+                # Try to match by name
+                matching = [c for c in RUN_CONFIGURATIONS if c["name"] == item]
+                selected_cfgs.extend(matching)
+    else:
+        selected_cfgs = RUN_CONFIGURATIONS
+    
     if not selected_cfgs:
         print("No configuration selected – aborting.")
         return
@@ -297,22 +411,41 @@ def interactive_ui():
     print(f"Input        : {input_path}")
     print(f"Output dir   : {out_dir}")
     print(f"Embedding    : {COMMON_DEFAULTS['embedding_model']}")
-    print(f"Config       : {selected_cfgs[0]['name']}")
+    print(f"Configurations: {len(selected_cfgs)} selected")
+    for cfg in selected_cfgs:
+        params_summary = []
+        params = cfg.get('params', {})
+        if 'min_sentences_per_chunk' in params:
+            params_summary.append(f"min_sentences={params['min_sentences_per_chunk']}")
+        if 'include_oie' in params and params['include_oie']:
+            params_summary.append("OIE")
+        param_str = f" ({', '.join(params_summary)})" if params_summary else ""
+        print(f"  - {cfg['name']}{param_str}")
     print(f"Workers      : per-config={cfg_workers}\n")
 
     # spawn start-method
     mp.set_start_method("spawn", force=True)
 
-    # Luôn chạy 1 config một lần (workers=1)
-    run_config(selected_cfgs[0], input_path, out_dir, cfg_workers)
+    # Chạy tất cả configs được chọn
+    for i, cfg in enumerate(selected_cfgs, 1):
+        print(f"\n[CONFIG {i}/{len(selected_cfgs)}] Starting {cfg['name']}...")
+        run_config(cfg, input_path, out_dir, cfg_workers)
 
-    print("\nChunking completed! Output in", out_dir)
+    print(f"\nAll {len(selected_cfgs)} configuration(s) completed! Output in", out_dir)
 
 
 # ==== CLI ====================================================================
 
 def main():
-    ap = argparse.ArgumentParser(description="Simple multi-config chunking controller")
+    # Display available configurations in help
+    config_list = "\n".join([f"    {i+1}. {cfg['name']} - {cfg.get('description', 'No description')}" 
+                             for i, cfg in enumerate(RUN_CONFIGURATIONS)])
+    
+    ap = argparse.ArgumentParser(
+        description="Simple multi-config chunking controller",
+        epilog=f"Available configurations:\n{config_list}",
+        formatter_class=argparse.RawDescriptionHelpFormatter
+    )
     ap.add_argument("-i", "--input", required=True, help="Input TSV path")
     ap.add_argument("-o", "--output-dir", default="training_datasets", help="Output directory")
     ap.add_argument("-w", "--workers", type=int, default=1, help="Parallel configs workers")
@@ -321,7 +454,7 @@ def main():
     ap.add_argument("--device", default=COMMON_DEFAULTS["device_preference"], help="cpu | cuda | dml")
     ap.add_argument(
         "--configs",
-        help="Comma separated config names to run (default all)",
+        help="Comma separated config names or numbers to run (default all)",
     )
     args = ap.parse_args()
 
@@ -332,12 +465,25 @@ def main():
     out_dir = Path(args.output_dir)
     out_dir.mkdir(exist_ok=True)
 
-    # filter configs
-    cfg_names = {n.strip() for n in (args.configs.split(",") if args.configs else []) if n.strip()}
-    configs = [c for c in RUN_CONFIGURATIONS if not cfg_names or c["name"] in cfg_names]
+    # filter configs - support both names and numbers
+    if args.configs:
+        configs = []
+        for item in args.configs.split(","):
+            item = item.strip()
+            if item.isdigit() and 1 <= int(item) <= len(RUN_CONFIGURATIONS):
+                configs.append(RUN_CONFIGURATIONS[int(item) - 1])
+            else:
+                # Try to match by name
+                matching = [c for c in RUN_CONFIGURATIONS if c["name"] == item]
+                configs.extend(matching)
+    else:
+        configs = RUN_CONFIGURATIONS
 
     if not configs:
         print("No configurations selected – exiting.")
+        print("Available configurations:")
+        for i, cfg in enumerate(RUN_CONFIGURATIONS, 1):
+            print(f"  {i}. {cfg['name']} - {cfg.get('description', 'No description')}")
         return
 
     # pool cho configs

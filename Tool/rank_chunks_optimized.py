@@ -6,11 +6,19 @@ import pandas as pd
 import numpy as np
 import gc
 import os
+import sys
+import csv
 from typing import Dict, List, Tuple, Optional
 from pathlib import Path
 import hashlib
 from sklearn.metrics.pairwise import cosine_similarity
 from rank_bm25 import BM25Okapi
+
+# Fix CSV field size limit for Windows
+try:
+    csv.field_size_limit(2147483647)  # Use max 32-bit int instead of sys.maxsize
+except OverflowError:
+    csv.field_size_limit(2**31 - 1)  # Fallback to safe value
 
 # ---------------------------------------------------------------------------
 # Quick helper: estimate file size & memory usage (was removed earlier)
@@ -267,7 +275,14 @@ def rank_and_filter_chunks_optimized(chunks_tsv: str, output_dir: Path,
     # Load mapping query_id → query_text từ file original
     # ------------------------------------------------------------
     try:
-        mapping_df = pd.read_csv(original_tsv, sep='\t', usecols=['query_id', 'query_text'], engine='python')
+        mapping_df = pd.read_csv(
+        original_tsv,
+        sep='\t',
+        usecols=['query_id', 'query_text'],
+        quoting=csv.QUOTE_NONE,
+        engine='python',
+        on_bad_lines='warn'
+        )
         query_map = dict(mapping_df.groupby('query_id')['query_text'].first())
         del mapping_df
     except Exception as e:
@@ -422,14 +437,16 @@ def rank_and_filter_chunks_optimized(chunks_tsv: str, output_dir: Path,
     final_df.to_csv(save_path, sep='\t', index=False)
     
     # Save 3-column version
+# Duy nhất 1 file 3 cột: query_id, chunk_text, label
+
     try:
-        simple_df = final_df[['query_text', 'chunk_text', 'label']].copy()
-        simple_df.columns = ['query', 'passage', 'label']
-        simple_path = output_dir / f"{Path(chunks_tsv).stem}_rrf_filtered_3col.tsv"
+        simple_df = final_df[['query_id', 'chunk_text', 'label']].copy()
+        simple_path = output_dir / f"{Path(chunks_tsv).stem}_rrf_filtered.tsv"
         simple_df.to_csv(simple_path, sep='\t', index=False)
-        del simple_df  # Free memory immediately
+        del simple_df # Free memory immediately
+        print(f"Memory-optimized ranking complete. Saved {len(final_df):,} filtered chunks to {simple_path}")
     except Exception as e:
-        print(f"Warning: Could not create 3-column file: {e}")
+        print(f"Error: Could not create 3-column file: {e}")
     
     print(f"Memory-optimized ranking complete. Saved {len(final_df):,} filtered chunks to {save_path}")
     
