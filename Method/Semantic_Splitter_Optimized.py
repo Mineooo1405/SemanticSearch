@@ -21,16 +21,13 @@ def process_sentence_splitting_with_semantics(
     text: str, 
     chunk_size: Optional[int] = None,  # None = không giới hạn kích thước dựa ký tự
     chunk_overlap: int = 0,
-    target_tokens: Optional[int] = None,
-    tolerance: float = 0.25,
-    enable_adaptive: bool = False,
     semantic_threshold: Optional[float] = None,
     min_sentences_per_chunk: int = 1,  # Số câu tối thiểu mỗi chunk
     embedding_model: str = "all-MiniLM-L6-v2",
     device: Optional[object] = None,
 ) -> Tuple[List[str], List[str], List[List[int]]]:
     """
-    Optimized sentence-based text splitting with adaptive token control.
+    Optimized sentence-based text splitting with semantic control.
     
     Returns:
         - chunks: List of chunk texts
@@ -71,17 +68,6 @@ def process_sentence_splitting_with_semantics(
     if chunk_size is not None and len(text) <= chunk_size:
         sentence_indices = list(range(len(sentences)))
         return [text], sentences, [sentence_indices]
-    
-    # Adaptive chunking parameters – vẫn hoạt động nếu chunk_size None (cho phép chia tự nhiên)
-    if enable_adaptive and target_tokens and chunk_size is not None:
-        # Convert target tokens to approximate character count
-        # Rough estimate: 1 token ≈ 4.5 characters (including spaces)
-        target_chars = int(target_tokens * 4.5)
-        min_chars = int(target_chars * (1 - tolerance))
-        max_chars = int(target_chars * (1 + tolerance))
-        
-        # Use adaptive targets instead of fixed chunk_size
-        chunk_size = target_chars
     
     # Calculate sentence lengths
     sentence_lengths = [len(s) for s in sentences]
@@ -142,16 +128,9 @@ def process_sentence_splitting_with_semantics(
                 current_group_indices = []
                 current_size = 0
             
-            # Split long sentence if adaptive mode is enabled
-            if enable_adaptive and target_tokens:
-                sub_chunks = helper_split_long_sentence(sentence, target_chars, max_chars)
-                for j, sub_chunk in enumerate(sub_chunks):
-                    chunks.append(sub_chunk)
-                    sentence_groups.append([f"{i}_split_{j}"])
-            else:
-                # Keep as single chunk (original behavior)
-                chunks.append(sentence)
-                sentence_groups.append([i])
+            # Keep as single chunk (original behavior)
+            chunks.append(sentence)
+            sentence_groups.append([i])
             continue
         
         # Check if adding this sentence would exceed chunk size
@@ -447,9 +426,6 @@ def semantic_splitter_main(
     save_raw_oie: bool = False,
     output_dir: str = "./output",
     device: Optional[object] = None,
-    target_tokens: int = 120,
-    tolerance: float = 0.25,
-    enable_adaptive: bool = True,
     semantic_threshold: float = 0.30,
     min_sentences_per_chunk: int = 1,  # Số câu tối thiểu mỗi chunk
     embedding_model: str = "all-MiniLM-L6-v2",
@@ -457,7 +433,7 @@ def semantic_splitter_main(
     **kwargs 
 ) -> List[Tuple[str, str, Optional[str]]]:
     """
-    Enhanced Text Splitter with adaptive token control and improved OIE integration.
+    Enhanced Text Splitter with improved OIE integration.
     
     Returns:
         List of tuples: (chunk_id, chunk_text_with_oie, oie_string_only)
@@ -466,33 +442,11 @@ def semantic_splitter_main(
     if not silent:
         print(f"    Processing passage {doc_id} with Enhanced Text Splitter")
         print(f"   Chunk size: {chunk_size} chars, Overlap: {chunk_overlap} chars")
-        print(f"   Target tokens: {target_tokens} ±{tolerance*100:.0f}%")
         print(f"   Min sentences per chunk: {min_sentences_per_chunk}")
         print(f"   Semantic threshold: {semantic_threshold}")
         print(f"   OIE enabled: {include_oie}")
-        print(f"   Adaptive mode: {enable_adaptive}")
 
     try:
-        # Check if passage is small enough to keep as single chunk
-        total_tokens = _count_tokens_accurate(passage_text)
-        
-        if enable_adaptive and target_tokens:
-            max_tokens = int(target_tokens * (1 + tolerance))
-            if total_tokens <= max_tokens:
-                if not silent:
-                    print(f"   Passage fits in single chunk ({total_tokens} tokens)")
-                
-                # Process as single chunk with OIE
-                oie_string = None
-                final_text = passage_text
-                
-                if include_oie:
-                    oie_string = process_oie_extraction(passage_text, silent=silent)
-                    if oie_string:
-                        final_text = f"{passage_text} {oie_string}"
-                
-                return [(f"{doc_id}_single_complete", final_text, oie_string)]
-        
         # Split text into chunks using optimized algorithm
         if not silent:
             print(f"   Splitting into chunks...")
@@ -501,9 +455,6 @@ def semantic_splitter_main(
             text=passage_text,
             chunk_size=chunk_size,
             chunk_overlap=chunk_overlap,
-            target_tokens=target_tokens,
-            tolerance=tolerance,
-            enable_adaptive=enable_adaptive,
             semantic_threshold=semantic_threshold,
             min_sentences_per_chunk=min_sentences_per_chunk,
             embedding_model=embedding_model,
@@ -608,13 +559,6 @@ def semantic_splitter_main(
             token_counts = [_count_tokens_accurate(chunk[1]) for chunk in chunks_with_oie]
             print(f"   Created {len(chunks_with_oie)} chunks")
             print(f"   Token distribution: {min(token_counts)}-{max(token_counts)} (avg: {sum(token_counts)/len(token_counts):.1f})")
-            
-            if enable_adaptive and target_tokens:
-                min_target = int(target_tokens * (1 - tolerance))
-                max_target = int(target_tokens * (1 + tolerance))
-                in_range = sum(1 for t in token_counts if min_target <= t <= max_target)
-                compliance = in_range / len(token_counts) * 100
-                print(f"   Target compliance: {in_range}/{len(token_counts)} ({compliance:.1f}%)")
         
         return chunks_with_oie
 
@@ -646,9 +590,6 @@ def chunk_passage_text_splitter(
     save_raw_oie: bool = False,
     output_dir: str = "./output",
     device: Optional[object] = None,
-    target_tokens: int = 120,
-    tolerance: float = 0.25,
-    enable_adaptive: bool = True,
     semantic_threshold: float = 0.5,
     min_sentences_per_chunk: int = 1,  # Số câu tối thiểu mỗi chunk
     embedding_model: str = "all-MiniLM-L6-v2",
@@ -669,9 +610,6 @@ def chunk_passage_text_splitter(
         save_raw_oie=save_raw_oie,
         output_dir=output_dir,
         device=device,
-        target_tokens=target_tokens,
-        tolerance=tolerance,
-        enable_adaptive=enable_adaptive,
         semantic_threshold=semantic_threshold,
         min_sentences_per_chunk=min_sentences_per_chunk,
         embedding_model=embedding_model,

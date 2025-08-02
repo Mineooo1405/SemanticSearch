@@ -39,6 +39,7 @@ from typing import Any, List, Tuple, Optional, Dict
 import pandas as pd
 
 # ==== Import optimized chunking methods ====
+# Note: Semantic Splitter has been optimized - removed adaptive parameters (target_tokens, tolerance, enable_adaptive)
 from Method.Semantic_Grouping_Optimized import (
     semantic_chunk_passage_from_grouping_logic as semantic_grouping,
 )
@@ -105,6 +106,8 @@ def _process_batch(
     batch_df: pd.DataFrame,
     config: Dict[str, Any],
     batch_idx: int,
+    embedding_model: str,
+    device_preference: str,
 ) -> List[List[Any]]:
     """Chunk các dòng trong batch và trả về list row cho TSV output."""
     results: List[List[Any]] = []
@@ -146,8 +149,8 @@ def _process_batch(
 
         if method_choice in {"1", "2"}:  # semantic methods yêu cầu embedding
             extra = {
-                "embedding_model": COMMON_DEFAULTS["embedding_model"],
-                "device": COMMON_DEFAULTS["device_preference"],
+                "embedding_model": embedding_model,
+                "device": device_preference,
             }
         else:
             extra = {}
@@ -175,9 +178,15 @@ def run_config(
     output_dir: Path,
     config_workers: int = 1,
     batch_size: int = BATCH_SIZE,
+    embedding_model: Optional[str] = None,
+    device_preference: Optional[str] = None,
 ):
     """Chạy chunking cho 1 cấu hình."""
     import time
+
+    # Use provided models or fall back to defaults
+    actual_embedding_model = embedding_model or COMMON_DEFAULTS["embedding_model"]
+    actual_device_preference = device_preference or COMMON_DEFAULTS["device_preference"]
 
     start = time.time()
     outfile = output_dir / f"{config['name']}_chunks.tsv"
@@ -201,10 +210,11 @@ def run_config(
         with ProcessPoolExecutor(
             max_workers=config_workers,
             initializer=_worker_init,
-            initargs=(COMMON_DEFAULTS["embedding_model"], COMMON_DEFAULTS["device_preference"]),
+            initargs=(actual_embedding_model, actual_device_preference),
         ) as exe:
             futures = {
-                exe.submit(_process_batch, df, config, idx): idx for idx, df in all_batches
+                exe.submit(_process_batch, df, config, idx, actual_embedding_model, actual_device_preference): idx 
+                for idx, df in all_batches
             }
             batch_results = []
             for fut in as_completed(futures):
@@ -212,7 +222,7 @@ def run_config(
     else:
         batch_results = []
         for idx, df in all_batches:
-            batch_results.extend(_process_batch(df, config, idx))
+            batch_results.extend(_process_batch(df, config, idx, actual_embedding_model, actual_device_preference))
 
     # ghi file
     outfile.parent.mkdir(exist_ok=True)
@@ -227,88 +237,29 @@ def run_config(
 
 # ==== RUN_CONFIGURATIONS =====================================================
 
-_CHUNK_DEFAULTS = {
-    "min_sentences_per_chunk": 3,  # Minimum sentences per chunk
-}
 
 RUN_CONFIGURATIONS: List[Dict[str, Any]] = [
     {
-        "name": "text_splitter_without_OIE",
-        "method_choice": "3",
-        "params": {
-            "chunk_size": 800,
-            "chunk_overlap": 0,
-            **_CHUNK_DEFAULTS,
-        },
-        "description": "Rule-based splitter (sentence-based)"
-    },
-    {
-        "name": "semantic_splitter_without_OIE",
+        "name": "semantic_splitter_no_limit",
         "method_choice": "2",
         "params": {
+            "chunk_size": None,  # No character limit
             "chunk_overlap": 0,
-            "semantic_threshold": 0.3,
-            **_CHUNK_DEFAULTS,
+            "semantic_threshold": 0.35,
+            "min_sentences_per_chunk": 3,
         },
-        "description": "Semantic sentence splitter"
+        "description": "Pure semantic chunking without size limits"
     },
     {
-        "name": "semantic_grouping_without_OIE",
+        "name": "semantic_grouping_no_limit",
         "method_choice": "1",
         "params": {
-            "initial_threshold": "auto",
+            "initial_threshold": 1,
             "decay_factor": 0.85,
-            "min_threshold": "auto",
-            **_CHUNK_DEFAULTS,
+            "min_threshold": 0.1, 
+            "min_sentences_per_chunk": 2,  # Lowered to allow smaller but coherent chunks
         },
-        "description": "Semantic grouping"
-    },
-    # With OIE configurations
-    {
-        "name": "semantic_grouping_with_OIE",
-        "method_choice": "1",
-        "params": {
-            "initial_threshold": "auto",
-            "decay_factor": 0.85,
-            "min_threshold": "auto",
-            "include_oie": True,
-            **_CHUNK_DEFAULTS,
-        },
-        "description": "Semantic grouping with OIE enrichment"
-    },
-    {
-        "name": "semantic_splitter_with_OIE",
-        "method_choice": "2",
-        "params": {
-            "chunk_overlap": 0,
-            "semantic_threshold": 0.3,
-            "include_oie": True,
-            **_CHUNK_DEFAULTS,
-        },
-        "description": "Semantic sentence splitter with OIE"
-    },
-    # High quality configurations
-    {
-        "name": "semantic_grouping_high_quality",
-        "method_choice": "1",
-        "params": {
-            "initial_threshold": 0.8,
-            "decay_factor": 0.9,
-            "min_threshold": 0.6,
-            "min_sentences_per_chunk": 2,
-        },
-        "description": "High-quality semantic grouping (stricter thresholds)"
-    },
-    {
-        "name": "semantic_grouping_relaxed",
-        "method_choice": "1",
-        "params": {
-            "initial_threshold": 0.5,
-            "decay_factor": 0.8,
-            "min_threshold": 0.3,
-            "min_sentences_per_chunk": 1,
-        },
-        "description": "Relaxed semantic grouping (more inclusive)"
+        "description": "Semantic grouping with threshold ranges - no size constraints"
     },
 ]
 
@@ -429,7 +380,14 @@ def interactive_ui():
     # Chạy tất cả configs được chọn
     for i, cfg in enumerate(selected_cfgs, 1):
         print(f"\n[CONFIG {i}/{len(selected_cfgs)}] Starting {cfg['name']}...")
-        run_config(cfg, input_path, out_dir, cfg_workers)
+        run_config(
+            cfg, 
+            input_path, 
+            out_dir, 
+            cfg_workers,
+            embedding_model=COMMON_DEFAULTS["embedding_model"],
+            device_preference=COMMON_DEFAULTS["device_preference"]
+        )
 
     print(f"\nAll {len(selected_cfgs)} configuration(s) completed! Output in", out_dir)
 
@@ -494,14 +452,29 @@ def main():
             initargs=(COMMON_DEFAULTS["embedding_model"], COMMON_DEFAULTS["device_preference"]),
         ) as exe:
             futs = {
-                exe.submit(run_config, cfg, input_path, out_dir, args.config_workers): cfg["name"]
+                exe.submit(
+                    run_config, 
+                    cfg, 
+                    input_path, 
+                    out_dir, 
+                    args.config_workers,
+                    COMMON_DEFAULTS["embedding_model"],
+                    COMMON_DEFAULTS["device_preference"]
+                ): cfg["name"]
                 for cfg in configs
             }
             for fut in as_completed(futs):
                 fut.result()
     else:
         for cfg in configs:
-            run_config(cfg, input_path, out_dir, args.config_workers)
+            run_config(
+                cfg, 
+                input_path, 
+                out_dir, 
+                args.config_workers,
+                embedding_model=COMMON_DEFAULTS["embedding_model"],
+                device_preference=COMMON_DEFAULTS["device_preference"]
+            )
 
     print("All configurations completed!")
 

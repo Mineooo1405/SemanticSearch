@@ -310,87 +310,191 @@ def helper_handle_remaining_sentences(remaining_indices, sentences, silent):
     
     return groups
 
-def process_semantic_grouping_optimized(sim_matrix, sentences, initial_threshold, decay_factor, min_threshold, silent=True):
-    """Optimized semantic grouping algorithm with early termination and fast path for small documents"""
+def process_semantic_grouping_with_threshold_ranges(sim_matrix, sentences, initial_threshold, decay_factor, min_threshold, silent=True):
+    """
+    New semantic grouping algorithm using threshold ranges.
+    
+    Process chunks in descending threshold ranges:
+    - Range 1: [initial_threshold, initial_threshold*decay_factor] 
+    - Range 2: [initial_threshold*decay_factor, initial_threshold*decay_factor^2]
+    - Range 3: [initial_threshold*decay_factor^2, initial_threshold*decay_factor^3]
+    - ... until min_threshold or no sentences left
+    """
     num_sentences = sim_matrix.shape[0]
     
     # Fast path for very small documents (≤6 sentences)
     if num_sentences <= 6:
         if not silent:
             print(f"Fast path for small document ({num_sentences} sentences)")
-        
-        # For small documents, try to group all sentences
-        if not silent:
             print(f"  Single group: {num_sentences} sentences ✓")
         return [list(range(num_sentences))]
     
-    # Standard processing for larger documents
     ungrouped_indices = set(range(num_sentences))
     groups = []
-    current_threshold = initial_threshold
-    iteration = 0
-    max_iterations = num_sentences * 2
-    consecutive_empty_iterations = 0  # Track empty iterations for early exit
-
+    
+    # Calculate threshold ranges
+    threshold_ranges = []
+    current_upper = initial_threshold
+    range_index = 0
+    
+    while current_upper >= min_threshold and range_index < 20:  # Max 20 ranges to prevent infinite loop
+        current_lower = max(min_threshold, current_upper * decay_factor)
+        threshold_ranges.append((current_upper, current_lower))
+        current_upper = current_lower
+        range_index += 1
+        
+        # Stop if we've reached min_threshold
+        if current_lower <= min_threshold:
+            break
+    
     if not silent:
-        print(f"Starting semantic grouping with {num_sentences} sentences")
-        print(f"Thresholds: initial={initial_threshold:.3f}, decay={decay_factor}, min={min_threshold:.3f}")
-
-    while len(ungrouped_indices) > 0 and iteration < max_iterations:
-        iteration += 1
-        
-        best_pairs = helper_find_best_similarity_pairs(
-            sim_matrix, list(ungrouped_indices), sentences, 
-            current_threshold, silent
-        )
-        
-        if not best_pairs:
-            consecutive_empty_iterations += 1
-            new_threshold = max(min_threshold, current_threshold * decay_factor)
-            if new_threshold == current_threshold or consecutive_empty_iterations >= 3:
-                # Early termination if threshold can't decay or too many empty iterations
-                if not silent:
-                    print(f"  Early termination: threshold={current_threshold:.4f}, empty_iterations={consecutive_empty_iterations}")
-                break
-            current_threshold = new_threshold
-            if not silent:
-                print(f"  No valid pairs found. Decaying threshold to {current_threshold:.4f}")
-            continue
-        
-        # Reset empty iteration counter when we find pairs
-        consecutive_empty_iterations = 0
-
-        best_pair, similarity_score = best_pairs[0]
-        idx1, idx2 = best_pair
-        
-        current_group = [idx1, idx2]
-        ungrouped_indices.discard(idx1)
-        ungrouped_indices.discard(idx2)
-        
-        current_group = helper_expand_group_with_constraints(
-            sim_matrix, sentences, current_group, list(ungrouped_indices),
-            current_threshold, silent
-        )
-        
-        for idx in current_group:
-            ungrouped_indices.discard(idx)
-        
-        groups.append(sorted(current_group))
+        print(f"Starting threshold range grouping with {num_sentences} sentences")
+        print(f"Threshold ranges: {len(threshold_ranges)} ranges from {initial_threshold:.3f} to {min_threshold:.3f}")
+        for i, (upper, lower) in enumerate(threshold_ranges):
+            print(f"  Range {i+1}: [{upper:.3f}, {lower:.3f})")
+    
+    # Process each threshold range
+    for range_idx, (upper_threshold, lower_threshold) in enumerate(threshold_ranges):
+        if len(ungrouped_indices) == 0:
+            break  # Early exit if no sentences left
+            
         if not silent:
-            print(f"  Group {len(groups)}: {len(current_group)} sentences ✓")
-
-        current_threshold = max(min_threshold, initial_threshold * (decay_factor ** len(groups)))
-
+            print(f"\n--- Processing Range {range_idx + 1}: [{upper_threshold:.3f}, {lower_threshold:.3f}) ---")
+        
+        range_groups = process_range_grouping(
+            sim_matrix, 
+            sentences, 
+            list(ungrouped_indices),
+            upper_threshold, 
+            lower_threshold, 
+            silent
+        )
+        
+        # Add valid groups and remove grouped sentences
+        for group in range_groups:
+            if group:  # Only add non-empty groups
+                groups.append(sorted(group))
+                for idx in group:
+                    ungrouped_indices.discard(idx)
+                    
+                if not silent:
+                    print(f"  ✓ Group {len(groups)}: {len(group)} sentences (range {range_idx + 1})")
+    
+    # Handle remaining ungrouped sentences
     if ungrouped_indices:
+        if not silent:
+            print(f"\n--- Handling {len(ungrouped_indices)} remaining sentences ---")
+        
         remaining_groups = helper_handle_remaining_sentences(
             list(ungrouped_indices), sentences, silent
         )
         groups.extend(remaining_groups)
-
+    
     if not silent:
-        print(f"Semantic grouping completed: {len(groups)} groups formed in {iteration} iterations")
-
+        print(f"\nThreshold range grouping completed: {len(groups)} groups formed")
+        
     return groups
+
+def process_range_grouping(sim_matrix, sentences, available_indices, upper_threshold, lower_threshold, silent=True):
+    """
+    Process grouping within a specific threshold range.
+    Find all similarity pairs within [lower_threshold, upper_threshold) and group them.
+    """
+    if len(available_indices) < 2:
+        return []
+    
+    # Find all valid pairs within the threshold range
+    valid_pairs = []
+    for i in range(len(available_indices)):
+        for j in range(i + 1, len(available_indices)):
+            idx1, idx2 = available_indices[i], available_indices[j]
+            similarity = sim_matrix[idx1, idx2]
+            
+            # Check if similarity is within the range [lower_threshold, upper_threshold)
+            if lower_threshold <= similarity < upper_threshold:
+                valid_pairs.append(((idx1, idx2), similarity))
+    
+    if not valid_pairs:
+        if not silent:
+            print(f"    No pairs found in range [{upper_threshold:.3f}, {lower_threshold:.3f})")
+        return []
+    
+    # Sort pairs by similarity (highest first)
+    valid_pairs.sort(key=lambda x: x[1], reverse=True)
+    
+    if not silent:
+        print(f"    Found {len(valid_pairs)} valid pairs in range")
+    
+    # Group formation using Union-Find like approach
+    groups = []
+    used_indices = set()
+    
+    # Process pairs from highest to lowest similarity
+    for (idx1, idx2), similarity in valid_pairs:
+        if idx1 in used_indices or idx2 in used_indices:
+            continue  # Skip if either sentence is already grouped
+            
+        # Start new group with this pair
+        current_group = [idx1, idx2]
+        used_indices.add(idx1)
+        used_indices.add(idx2)
+        
+        # Try to expand the group by finding more sentences that fit
+        remaining_available = [idx for idx in available_indices if idx not in used_indices]
+        
+        if remaining_available:
+            expanded_group = expand_group_in_range(
+                sim_matrix, 
+                current_group, 
+                remaining_available, 
+                upper_threshold, 
+                lower_threshold,
+                silent
+            )
+            
+            # Update used indices
+            for idx in expanded_group:
+                if idx not in current_group:
+                    current_group.append(idx)
+                    used_indices.add(idx)
+        
+        groups.append(current_group)
+        
+        if not silent:
+            print(f"    Range group: {len(current_group)} sentences (similarity: {similarity:.3f})")
+    
+    return groups
+
+def expand_group_in_range(sim_matrix, current_group, available_candidates, upper_threshold, lower_threshold, silent=True):
+    """
+    Expand a group by adding sentences that have similarity within the threshold range
+    to at least one member of the current group.
+    """
+    expanded = []
+    
+    for candidate_idx in available_candidates:
+        # Check if candidate has similarity within range to any group member
+        max_similarity_to_group = -1
+        for group_member_idx in current_group:
+            similarity = sim_matrix[candidate_idx, group_member_idx]
+            max_similarity_to_group = max(max_similarity_to_group, similarity)
+        
+        # Add to group if similarity is within the threshold range
+        if lower_threshold <= max_similarity_to_group < upper_threshold:
+            expanded.append(candidate_idx)
+            if not silent:
+                print(f"      Added sentence {candidate_idx} (max similarity: {max_similarity_to_group:.3f})")
+    
+    return expanded
+
+def process_semantic_grouping_optimized(sim_matrix, sentences, initial_threshold, decay_factor, min_threshold, silent=True):
+    """
+    Wrapper function that delegates to the new threshold range algorithm.
+    Maintains backward compatibility while using the new approach.
+    """
+    return process_semantic_grouping_with_threshold_ranges(
+        sim_matrix, sentences, initial_threshold, decay_factor, min_threshold, silent
+    )
 
 def format_oie_triples_to_string(triples_list: List[Dict[str, str]], max_triples: Optional[int] = None) -> Optional[str]:
     """Format OIE triples into a readable string format"""
