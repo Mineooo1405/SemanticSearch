@@ -381,7 +381,7 @@ class ModelEvaluator:
             print(ndcg_df.round(4))
         
         print("\n" + "-"*80)
-        print("📊 DCG@K METRICS:")
+        print("DCG@K METRICS:")
         dcg_metrics = [col for col in df.columns if 'DiscountedCumulativeGain(k=' in col]
         if dcg_metrics:
             dcg_df = df[sorted(dcg_metrics, key=lambda x: int(x.split('k=')[1].split(')')[0]))]
@@ -469,10 +469,10 @@ def parse_arguments():
         description='Đánh giá và so sánh các mô hình MatchZoo',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
-Ví dụ sử dụng:
-  python evaluate_models.py --data-pack F:\\SematicSearch\\[method]semantic_splitter
-  python evaluate_models.py -d F:\\SematicSearch\\[method]semantic_splitter --output results.csv
-  python evaluate_models.py --data-pack F:\\SematicSearch\\[method]semantic_splitter --models Arc-II MatchLSTM
+        Ví dụ sử dụng:
+            python evaluate_models.py --data-pack F:\\SematicSearch\\[method]semantic_splitter
+            python evaluate_models.py -d F:\\SematicSearch\\[method]semantic_splitter --output results.csv
+            python evaluate_models.py --data-pack F:\\SematicSearch\\[method]semantic_splitter --models Arc-II MatchLSTM
         """
     )
     
