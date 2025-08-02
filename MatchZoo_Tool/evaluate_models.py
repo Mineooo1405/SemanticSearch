@@ -11,17 +11,30 @@ import sys
 class ModelEvaluator:
     """Lớp để đánh giá và so sánh các mô hình MatchZoo"""
     
-    def __init__(self, data_pack_dir: str, batch_size: int = 32):
+    def __init__(self, data_pack_dir: str, batch_size: int = 32, device: str = "cpu"):
         """
         Khởi tạo evaluator
         
         Args:
             data_pack_dir: Đường dẫn đến thư mục chứa test_pack.dam
             batch_size: Batch size cho evaluation
+            device: Device để chạy evaluation ('cpu' hoặc 'cuda')
         """
         self.data_pack_dir = data_pack_dir
         self.batch_size = batch_size
-        self.device = torch.device("cpu")
+        
+        # Kiểm tra và thiết lập device
+        if device == "cuda":
+            if torch.cuda.is_available():
+                self.device = torch.device("cuda")
+                print(f"CUDA available. Using GPU: {torch.cuda.get_device_name(0)}")
+            else:
+                print("Fallback sang CPU.")
+                self.device = torch.device("cpu")
+        else:
+            self.device = torch.device("cpu")
+            print(f"🖥️ Using CPU device")
+        
         self.test_pack_raw = None
         self.results = {}
         
@@ -40,6 +53,7 @@ class ModelEvaluator:
     def evaluate_model(self, model_dir: str, model_name: str) -> Dict:
 
         print(f"\n--- Đánh giá mô hình: {model_name} ---")
+        print(f"Device: {self.device}")
         
         # Kiểm tra file tồn tại
         model_path = os.path.join(model_dir, 'model.pt')
@@ -93,32 +107,31 @@ class ModelEvaluator:
             # Tạo ranking task với metrics được hỗ trợ bởi MatchZoo
             ranking_task = mz.tasks.Ranking()
             ranking_task.metrics = [
-                # Core IR Metrics - Các metric chính được hỗ trợ
                 mz.metrics.MeanAveragePrecision(),  # MAP - Mean Average Precision
                 mz.metrics.MeanReciprocalRank(),    # MRR - Mean Reciprocal Rank
                 
-                # Precision at K (P@K) - Độ chính xác tại K
+                # Precision at K (P@K) 
                 mz.metrics.Precision(k=1),         # P@1
                 mz.metrics.Precision(k=3),         # P@3  
                 mz.metrics.Precision(k=5),         # P@5
                 mz.metrics.Precision(k=10),        # P@10
                 mz.metrics.Precision(k=20),        # P@20
                 
-                # Normalized Discounted Cumulative Gain (NDCG) - Độ lợi tích lũy chuẩn hóa
+                # Normalized Discounted Cumulative Gain (NDCG) 
                 mz.metrics.NormalizedDiscountedCumulativeGain(k=1),   # NDCG@1
                 mz.metrics.NormalizedDiscountedCumulativeGain(k=3),   # NDCG@3
                 mz.metrics.NormalizedDiscountedCumulativeGain(k=5),   # NDCG@5
                 mz.metrics.NormalizedDiscountedCumulativeGain(k=10),  # NDCG@10
                 mz.metrics.NormalizedDiscountedCumulativeGain(k=20),  # NDCG@20
                 
-                # Discounted Cumulative Gain (DCG) - Độ lợi tích lũy có giảm giá
+                # Discounted Cumulative Gain (DCG) 
                 mz.metrics.DiscountedCumulativeGain(k=1),    # DCG@1
                 mz.metrics.DiscountedCumulativeGain(k=3),    # DCG@3
                 mz.metrics.DiscountedCumulativeGain(k=5),    # DCG@5
                 mz.metrics.DiscountedCumulativeGain(k=10),   # DCG@10
                 mz.metrics.DiscountedCumulativeGain(k=20),   # DCG@20
                 
-                # Average Precision - Độ chính xác trung bình (per query)
+                # Average Precision 
                 mz.metrics.AveragePrecision(),
             ]
             
@@ -186,6 +199,11 @@ class ModelEvaluator:
             
             model.to(self.device)
             model.eval()
+            
+            # Hiển thị thông tin GPU nếu sử dụng CUDA
+            if self.device.type == "cuda":
+                gpu_memory_allocated = torch.cuda.memory_allocated() / 1024**3  # GB
+                gpu_memory_reserved = torch.cuda.memory_reserved() / 1024**3   # GB
             
             optimizer = torch.optim.Adam(model.parameters())
             trainer = mz.trainers.Trainer(
@@ -529,9 +547,8 @@ def main():
         print(f"Lỗi: Không tìm thấy test_pack.dam trong {data_pack_dir}")
         sys.exit(1)
     
-    # Tạo evaluator
-    evaluator = ModelEvaluator(data_pack_dir, batch_size=args.batch_size)
-    evaluator.device = torch.device(args.device)
+    # Tạo evaluator với device từ CLI args
+    evaluator = ModelEvaluator(data_pack_dir, batch_size=args.batch_size, device=args.device)
     
     # Cấu hình các mô hình cần đánh giá
     model_configs = []
