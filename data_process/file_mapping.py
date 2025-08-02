@@ -21,8 +21,8 @@ def parse_topics(topics_file_path):
     return topics_data
 
 def main():
-    file_final_path = "F:/SematicSearch/semantic_splitter_without_OIE_chunks_rrf_filtered.tsv"                # Đổi thành file của bạn
-    file_topics_path = "F:/SematicSearch/robustirdata/topics.robust04.txt"          # Đổi đường dẫn
+    file_final_path = input("Nhập đường dẫn đến file đã filter: ")               # Đổi thành file của bạn
+    file_topics_path = input("Nhập đường dẫn đến file topics: ")          # Đổi đường dẫn
     output_path = "final_with_querytext.tsv"                       # File đầu ra
 
     # Bước 1: Lấy dict mapping {query_id: query_text}

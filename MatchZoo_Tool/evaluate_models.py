@@ -8,10 +8,14 @@ import argparse
 import sys
 
 """ 
-CLI for Cross-Validation 
-python evaluate_models.py --data-pack F:\SematicSearch\[method]semantic_splitter --use-cv-folds 
-CLI for multiple models
+CLI for Cross-Validation (uses default model paths)
+python evaluate_models.py --data-pack F:\SematicSearch\[method]semantic_splitter --use-cv-folds --models Arc-II
+CLI for multiple models with default paths
 python evaluate_models.py -d F:\SematicSearch\[method]semantic_splitter --use-cv-folds --models Arc-II MatchLSTM ESIM
+CLI with custom model paths
+python evaluate_models.py --data-pack F:\SematicSearch\[method]semantic_splitter --use-cv-folds --models Arc-II MatchLSTM --model-paths F:\path\to\arcii F:\path\to\matchlstm
+CLI for single test evaluation
+python evaluate_models.py --data-pack F:\SematicSearch\[method]semantic_splitter --models Arc-II --model-paths F:\SematicSearch\my_model\my_model
 """
 
 class ModelEvaluator:
@@ -690,10 +694,27 @@ def parse_arguments():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
         Ví dụ sử dụng:
-            python evaluate_models.py --data-pack F:\\SematicSearch\\[method]semantic_splitter
+            # Sử dụng đường dẫn mặc định cho model
+            python evaluate_models.py --data-pack F:\\SematicSearch\\[method]semantic_splitter --models Arc-II
             python evaluate_models.py -d F:\\SematicSearch\\[method]semantic_splitter --output results.csv
-            python evaluate_models.py --data-pack F:\\SematicSearch\\[method]semantic_splitter --models Arc-II MatchLSTM
-            python evaluate_models.py --data-pack F:\\SematicSearch\\[method]semantic_splitter --use-cv-folds
+            
+            # Cross-validation với đường dẫn mặc định
+            python evaluate_models.py --data-pack F:\\SematicSearch\\[method]semantic_splitter --use-cv-folds --models Arc-II MatchLSTM
+            
+            # Sử dụng đường dẫn model tùy chỉnh
+            python evaluate_models.py --data-pack F:\\SematicSearch\\[method]semantic_splitter --models Arc-II --model-paths F:\\path\\to\\arcii_model
+            
+            # Cross-validation với nhiều models và đường dẫn tùy chỉnh
+            python evaluate_models.py --data-pack F:\\SematicSearch\\[method]semantic_splitter --use-cv-folds --models Arc-II MatchLSTM --model-paths F:\\path\\to\\arcii F:\\path\\to\\matchlstm
+            
+        Đường dẫn mặc định cho models:
+            Arc-II: F:\\SematicSearch\\my_model\\my_model
+            MatchLSTM: F:\\SematicSearch\\matchlstm_model
+            ESIM: F:\\SematicSearch\\esim_model
+            Conv-KNRM: F:\\SematicSearch\\conv_knrm_model
+            KNRM: F:\\SematicSearch\\knrm_model
+            Match-Pyramid: F:\\SematicSearch\\match_pyramid_model
+            MVLSTM: F:\\SematicSearch\\mvlstm_model
         """
     )
     
@@ -829,11 +850,14 @@ def main():
     print(f"   Device: {args.device}")
     print(f"   Batch size: {args.batch_size}")
     print(f"   Models: {', '.join([config['name'] for config in model_configs])}")
+    print(f"   Model paths: {'Custom' if args.model_paths else 'Default'}")
     
-    if args.verbose:
+    if args.verbose or args.model_paths:
         print(f"\nChi tiết đường dẫn mô hình:")
         for config in model_configs:
             print(f"   {config['name']}: {config['path']}")
+    else:
+        print("\n💡 Tip: Sử dụng --verbose để xem chi tiết đường dẫn model, hoặc --model-paths để chỉ định đường dẫn tùy chỉnh")
     
     # Thực hiện đánh giá
     results_df = evaluator.evaluate_all_models(model_configs)
