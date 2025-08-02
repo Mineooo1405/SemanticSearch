@@ -7,9 +7,16 @@ from pathlib import Path
 from typing import List, Dict, Optional
 from pyopenie import OpenIE5  # type: ignore
 
-# Suppress CoreNLP and Java startup logging
-logging.getLogger("stanford").setLevel(logging.WARNING)
-logging.getLogger("corenlp").setLevel(logging.WARNING)
+"""CLI:
+# Cơ bản
+python Tool/OIE.py input_chunks.tsv output_with_oie.tsv
+
+# Với các tùy chọn
+python Tool/OIE.py input_chunks.tsv output_with_oie.tsv --batch-size 50 --port 9001
+
+# Với JSON format
+python Tool/OIE.py input_chunks.tsv output_with_oie.tsv --json-format
+"""
 
 # -------------------- Singleton OpenIE5 client ---------------------------
 _GLOBAL_CLIENT: Optional[OpenIE5] = None
@@ -240,3 +247,301 @@ def extract_relations_from_paragraph(
             seen.add(key)
             unique.append(r)
     return unique
+
+
+# -------------------- TSV Processing Functions ---------------------------
+
+def format_oie_triples_as_text(triples: List[Dict[str, str]]) -> str:
+    """
+    Format OIE triples as readable text for the raw_oie_data column.
+    Each triple becomes: "(subject; relation; object)"
+    """
+    if not triples:
+        return ""
+    
+    formatted_triples = []
+    for triple in triples:
+        subject = triple.get("subject", "").strip()
+        relation = triple.get("relation", "").strip() 
+        obj = triple.get("object", "").strip()
+        
+        if subject and relation and obj:
+            formatted_triples.append(f"({subject}; {relation}; {obj})")
+    
+    return " ".join(formatted_triples)
+
+
+def process_chunk_tsv_with_oie(
+    input_tsv_path: str,
+    output_tsv_path: str,
+    chunk_text_column: str = "chunk_text",
+    port: int = 9000,
+    silent: bool = True,
+    batch_size: int = 100
+) -> None:
+    """
+    Process a TSV file with chunked data and add OIE extraction results.
+    
+    Args:
+        input_tsv_path: Path to input TSV file with headers: query_id, document_id, chunk_text, label
+        output_tsv_path: Path to output TSV file (will add raw_oie_data and raw_oie_data_plus_chunk_text columns)
+        chunk_text_column: Name of column containing text to process with OIE
+        port: Port for OpenIE5 server
+        silent: Whether to suppress logging output
+        batch_size: Number of rows to process at once
+    """
+    import pandas as pd
+    import csv
+    from tqdm import tqdm
+    
+    if not silent:
+        print(f"Processing TSV file: {input_tsv_path}")
+        print(f"Output will be saved to: {output_tsv_path}")
+    
+    # Read input TSV
+    try:
+        df = pd.read_csv(input_tsv_path, sep='\t', dtype=str)
+    except Exception as e:
+        raise ValueError(f"Error reading input TSV file: {e}")
+    
+    # Validate required columns
+    required_columns = ["query_id", "document_id", chunk_text_column, "label"]
+    missing_columns = [col for col in required_columns if col not in df.columns]
+    if missing_columns:
+        raise ValueError(f"Missing required columns: {missing_columns}")
+    
+    if not silent:
+        print(f"Input file contains {len(df)} rows")
+        print(f"Processing column: {chunk_text_column}")
+    
+    # Initialize new columns
+    df["raw_oie_data"] = ""
+    df["raw_oie_data_plus_chunk_text"] = ""
+    
+    # Process in batches to avoid memory issues and show progress
+    total_batches = (len(df) + batch_size - 1) // batch_size
+    
+    if not silent:
+        print(f"Processing in {total_batches} batches of {batch_size} rows each...")
+    
+    for batch_idx in tqdm(range(total_batches), desc="Processing batches", disable=silent):
+        start_idx = batch_idx * batch_size
+        end_idx = min((batch_idx + 1) * batch_size, len(df))
+        
+        for idx in range(start_idx, end_idx):
+            chunk_text = df.loc[idx, chunk_text_column]
+            
+            # Skip empty or null text
+            if pd.isna(chunk_text) or not str(chunk_text).strip():
+                df.loc[idx, "raw_oie_data"] = ""
+                df.loc[idx, "raw_oie_data_plus_chunk_text"] = str(chunk_text) if not pd.isna(chunk_text) else ""
+                continue
+            
+            try:
+                # Extract OIE triples
+                triples = extract_relations_from_paragraph(
+                    str(chunk_text), 
+                    port=port, 
+                    silent=True
+                )
+                
+                # Format OIE data as text
+                oie_text = format_oie_triples_as_text(triples)
+                
+                # Set raw_oie_data column
+                df.loc[idx, "raw_oie_data"] = oie_text
+                
+                # Set raw_oie_data_plus_chunk_text column (chunk + OIE)
+                if oie_text.strip():
+                    combined_text = f"{chunk_text} {oie_text}"
+                else:
+                    combined_text = str(chunk_text)
+                
+                df.loc[idx, "raw_oie_data_plus_chunk_text"] = combined_text
+                
+            except Exception as e:
+                if not silent:
+                    print(f"Error processing row {idx}: {e}")
+                # Keep original text if OIE fails
+                df.loc[idx, "raw_oie_data"] = ""
+                df.loc[idx, "raw_oie_data_plus_chunk_text"] = str(chunk_text)
+    
+    # Save output TSV
+    try:
+        df.to_csv(output_tsv_path, sep='\t', index=False, quoting=csv.QUOTE_NONE, escapechar='\\')
+        if not silent:
+            print(f"Successfully saved output to: {output_tsv_path}")
+            print(f"Output contains {len(df)} rows with {len(df.columns)} columns")
+            print(f"New columns added: raw_oie_data, raw_oie_data_plus_chunk_text")
+    except Exception as e:
+        raise ValueError(f"Error saving output TSV file: {e}")
+
+
+def process_chunk_tsv_with_oie_json_format(
+    input_tsv_path: str,
+    output_tsv_path: str,
+    chunk_text_column: str = "chunk_text",
+    port: int = 9000,
+    silent: bool = True,
+    batch_size: int = 100
+) -> None:
+    """
+    Alternative version that stores OIE data as JSON format for structured access.
+    
+    Args:
+        input_tsv_path: Path to input TSV file
+        output_tsv_path: Path to output TSV file  
+        chunk_text_column: Name of column containing text to process
+        port: Port for OpenIE5 server
+        silent: Whether to suppress logging
+        batch_size: Batch size for processing
+    """
+    import pandas as pd
+    import csv
+    import json
+    from tqdm import tqdm
+    
+    if not silent:
+        print(f"Processing TSV file with JSON OIE format: {input_tsv_path}")
+    
+    # Read input TSV
+    try:
+        df = pd.read_csv(input_tsv_path, sep='\t', dtype=str)
+    except Exception as e:
+        raise ValueError(f"Error reading input TSV file: {e}")
+    
+    # Validate required columns
+    required_columns = ["query_id", "document_id", chunk_text_column, "label"]
+    missing_columns = [col for col in required_columns if col not in df.columns]
+    if missing_columns:
+        raise ValueError(f"Missing required columns: {missing_columns}")
+    
+    # Initialize new columns
+    df["raw_oie_data_json"] = ""
+    df["raw_oie_data_plus_chunk_text"] = ""
+    
+    # Process in batches
+    total_batches = (len(df) + batch_size - 1) // batch_size
+    
+    for batch_idx in tqdm(range(total_batches), desc="Processing batches", disable=silent):
+        start_idx = batch_idx * batch_size
+        end_idx = min((batch_idx + 1) * batch_size, len(df))
+        
+        for idx in range(start_idx, end_idx):
+            chunk_text = df.loc[idx, chunk_text_column]
+            
+            # Skip empty or null text
+            if pd.isna(chunk_text) or not str(chunk_text).strip():
+                df.loc[idx, "raw_oie_data_json"] = "[]"
+                df.loc[idx, "raw_oie_data_plus_chunk_text"] = str(chunk_text) if not pd.isna(chunk_text) else ""
+                continue
+            
+            try:
+                # Extract OIE triples
+                triples = extract_relations_from_paragraph(
+                    str(chunk_text), 
+                    port=port, 
+                    silent=True
+                )
+                
+                # Store as JSON
+                oie_json = json.dumps(triples, ensure_ascii=False)
+                df.loc[idx, "raw_oie_data_json"] = oie_json
+                
+                # Create combined text with formatted triples
+                oie_text = format_oie_triples_as_text(triples)
+                if oie_text.strip():
+                    combined_text = f"{chunk_text} {oie_text}"
+                else:
+                    combined_text = str(chunk_text)
+                
+                df.loc[idx, "raw_oie_data_plus_chunk_text"] = combined_text
+                
+            except Exception as e:
+                if not silent:
+                    print(f"Error processing row {idx}: {e}")
+                df.loc[idx, "raw_oie_data_json"] = "[]"
+                df.loc[idx, "raw_oie_data_plus_chunk_text"] = str(chunk_text)
+    
+    # Save output
+    try:
+        df.to_csv(output_tsv_path, sep='\t', index=False, quoting=csv.QUOTE_NONE, escapechar='\\')
+        if not silent:
+            print(f"Successfully saved JSON format output to: {output_tsv_path}")
+    except Exception as e:
+        raise ValueError(f"Error saving output TSV file: {e}")
+
+
+# -------------------- CLI Interface ---------------------------
+
+def main():
+    """Command line interface for OIE TSV processing."""
+    import argparse
+    
+    parser = argparse.ArgumentParser(
+        description="Process chunked TSV files with OpenIE extraction",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  python OIE.py input_chunks.tsv output_with_oie.tsv
+  python OIE.py input_chunks.tsv output_with_oie.tsv --chunk-column chunk_text --batch-size 50
+  python OIE.py input_chunks.tsv output_with_oie.tsv --json-format --port 9001
+        """
+    )
+    
+    parser.add_argument("input_tsv", help="Input TSV file path")
+    parser.add_argument("output_tsv", help="Output TSV file path")
+    parser.add_argument("--chunk-column", default="chunk_text", 
+                       help="Name of column containing text to process (default: chunk_text)")
+    parser.add_argument("--port", type=int, default=9000,
+                       help="OpenIE5 server port (default: 9000)")
+    parser.add_argument("--batch-size", type=int, default=100,
+                       help="Batch size for processing (default: 100)")
+    parser.add_argument("--json-format", action="store_true",
+                       help="Store OIE data as JSON instead of formatted text")
+    parser.add_argument("--silent", action="store_true",
+                       help="Suppress progress output")
+    
+    args = parser.parse_args()
+    
+    # Validate input file exists
+    input_path = Path(args.input_tsv)
+    if not input_path.exists():
+        print(f"Error: Input file '{args.input_tsv}' does not exist.")
+        return 1
+    
+    # Create output directory if needed
+    output_path = Path(args.output_tsv)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    
+    try:
+        if args.json_format:
+            process_chunk_tsv_with_oie_json_format(
+                input_tsv_path=args.input_tsv,
+                output_tsv_path=args.output_tsv,
+                chunk_text_column=args.chunk_column,
+                port=args.port,
+                silent=args.silent,
+                batch_size=args.batch_size
+            )
+        else:
+            process_chunk_tsv_with_oie(
+                input_tsv_path=args.input_tsv,
+                output_tsv_path=args.output_tsv,
+                chunk_text_column=args.chunk_column,
+                port=args.port,
+                silent=args.silent,
+                batch_size=args.batch_size
+            )
+        
+        if not args.silent:
+            print("Processing completed successfully!")
+        return 0
+        
+    except Exception as e:
+        print(f"Error during processing: {e}")
+        return 1
+
+
+if __name__ == "__main__":
+    exit(main())
