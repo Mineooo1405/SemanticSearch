@@ -112,11 +112,35 @@ def _process_batch(
     """Chunk các dòng trong batch và trả về list row cho TSV output."""
     results: List[List[Any]] = []
 
-    global _GLOBALS  # type: ignore
-    nlp = _GLOBALS.get("nlp")
-    model = _GLOBALS.get("model")
-    if model is None:
-        raise RuntimeError("_worker_init chưa chạy – model None")
+    # Handle both multiprocessing and single-threaded execution
+    try:
+        global _GLOBALS  # type: ignore
+        nlp = _GLOBALS.get("nlp")
+        model = _GLOBALS.get("model")
+        if model is None:
+            raise RuntimeError("_worker_init chưa chạy – model None")
+    except (NameError, AttributeError):
+        # Single-threaded execution - initialize locally
+        import spacy
+        from sentence_transformers import SentenceTransformer
+        import torch
+        
+        nlp = spacy.blank("en").add_pipe("sentencizer")
+        
+        # Resolve device for single-threaded execution
+        if device_preference.lower() in {"dml", "directml"}:
+            try:
+                import torch_directml
+                device_obj = torch_directml.device() if torch_directml.is_available() else "cpu"
+            except Exception:
+                device_obj = "cpu"
+        elif device_preference.lower() == "cuda":
+            device_obj = "cuda" if torch.cuda.is_available() else "cpu"
+        else:
+            device_obj = device_preference.lower()
+        
+        print(f"[Single-threaded] Using device: {device_obj}")
+        model = SentenceTransformer(embedding_model, device=device_obj)
 
     method_choice = config["method_choice"]
     params = dict(config["params"])  # shallow copy
@@ -260,6 +284,20 @@ RUN_CONFIGURATIONS: List[Dict[str, Any]] = [
             "min_sentences_per_chunk": 2,  # Lowered to allow smaller but coherent chunks
         },
         "description": "Semantic grouping with threshold ranges - no size constraints"
+    },
+    {
+        "name": "semantic_grouping_balanced",
+        "method_choice": "1",
+        "params": {
+            "initial_threshold": 0.9,
+            "decay_factor": 0.75,
+            "min_threshold": 0.3,
+            "min_sentences_per_chunk": 2,
+            "target_chunk_size": 150,      # Target character count per chunk
+            "size_tolerance": 0.5,         # ±50% tolerance for chunk size
+            "enable_balanced_chunking": True,  # Enable the new balanced algorithm
+        },
+        "description": "Balanced semantic grouping - balances semantic coherence with chunk size consistency"
     },
 ]
 

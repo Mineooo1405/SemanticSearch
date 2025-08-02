@@ -65,7 +65,7 @@ testset = mz.dataloader.Dataset(
 
 padding_callback = mz.models.ArcII.get_default_padding_callback(
     fixed_length_left=10,
-    fixed_length_right=100,
+    fixed_length_right=256,  
     pad_word_value=0,
     pad_word_mode='pre'
 )
@@ -89,7 +89,7 @@ model = mz.models.ArcII()
 model.params['task'] = ranking_task
 model.params['embedding'] = embedding_matrix
 model.params['left_length'] = 10
-model.params['right_length'] = 100
+model.params['right_length'] = 256  
 model.params['kernel_1d_count'] = 32
 model.params['kernel_1d_size'] = 3
 model.params['kernel_2d_count'] = [64, 64]
