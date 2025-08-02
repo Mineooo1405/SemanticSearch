@@ -7,21 +7,29 @@ import numpy as np
 import argparse
 import sys
 
+""" 
+CLI for Cross-Validation 
+python evaluate_models.py --data-pack F:\SematicSearch\[method]semantic_splitter --use-cv-folds 
+CLI for multiple models
+python evaluate_models.py -d F:\SematicSearch\[method]semantic_splitter --use-cv-folds --models Arc-II MatchLSTM ESIM
+"""
 
 class ModelEvaluator:
     """Lớp để đánh giá và so sánh các mô hình MatchZoo"""
     
-    def __init__(self, data_pack_dir: str, batch_size: int = 32, device: str = "cpu"):
+    def __init__(self, data_pack_dir: str, batch_size: int = 32, device: str = "cpu", use_cv_folds: bool = False):
         """
         Khởi tạo evaluator
         
         Args:
-            data_pack_dir: Đường dẫn đến thư mục chứa test_pack.dam
+            data_pack_dir: Đường dẫn đến thư mục chứa test_pack.dam hoặc cv_folds/
             batch_size: Batch size cho evaluation
             device: Device để chạy evaluation ('cpu' hoặc 'cuda')
+            use_cv_folds: True nếu sử dụng Cross-Validation folds
         """
         self.data_pack_dir = data_pack_dir
         self.batch_size = batch_size
+        self.use_cv_folds = use_cv_folds
         
         # Kiểm tra và thiết lập device
         if device == "cuda":
@@ -33,16 +41,20 @@ class ModelEvaluator:
                 self.device = torch.device("cpu")
         else:
             self.device = torch.device("cpu")
-            print(f"🖥️ Using CPU device")
+            print(f"Using CPU device")
         
         self.test_pack_raw = None
+        self.cv_folds_data = {}  # Store CV fold data
         self.results = {}
         
-        # Tải test pack
-        self._load_test_data()
+        # Tải test pack hoặc CV folds
+        if self.use_cv_folds:
+            self._load_cv_folds()
+        else:
+            self._load_test_data()
     
     def _load_test_data(self):
-        """Tải dữ liệu test"""
+        """Tải dữ liệu test từ test_pack.dam"""
         test_pack_path = os.path.join(self.data_pack_dir, 'test_pack.dam')
         if not os.path.exists(test_pack_path):
             raise FileNotFoundError(f"Không tìm thấy test_pack.dam trong {self.data_pack_dir}")
@@ -50,10 +62,57 @@ class ModelEvaluator:
         self.test_pack_raw = mz.load_data_pack(test_pack_path)
         print(f"Đã tải test data: {len(self.test_pack_raw)} samples")
     
-    def evaluate_model(self, model_dir: str, model_name: str) -> Dict:
-
-        print(f"\n--- Đánh giá mô hình: {model_name} ---")
+    def _load_cv_folds(self):
+        """Tải dữ liệu từ CV folds"""
+        cv_folds_dir = os.path.join(self.data_pack_dir, 'cv_folds')
+        if not os.path.exists(cv_folds_dir):
+            raise FileNotFoundError(f"Không tìm thấy thư mục cv_folds trong {self.data_pack_dir}")
+        
+        # Tìm tất cả các fold test files
+        fold_files = []
+        for filename in os.listdir(cv_folds_dir):
+            if filename.startswith('fold_') and filename.endswith('_test.dam'):
+                fold_number = int(filename.split('_')[1])
+                fold_files.append((fold_number, filename))
+        
+        if not fold_files:
+            raise FileNotFoundError(f"Không tìm thấy file fold test nào trong {cv_folds_dir}")
+        
+        # Sắp xếp theo số fold
+        fold_files.sort(key=lambda x: x[0])
+        
+        # Load tất cả các folds
+        for fold_num, filename in fold_files:
+            fold_path = os.path.join(cv_folds_dir, filename)
+            try:
+                fold_data = mz.load_data_pack(fold_path)
+                self.cv_folds_data[fold_num] = fold_data
+                print(f"Đã tải fold {fold_num}: {len(fold_data)} samples")
+            except Exception as e:
+                print(f"Lỗi khi tải fold {fold_num}: {e}")
+        
+        print(f"Tổng cộng đã tải {len(self.cv_folds_data)} folds")
+    
+    def evaluate_model(self, model_dir: str, model_name: str, test_data: Optional[object] = None, fold_num: Optional[int] = None) -> Dict:
+        """
+        Đánh giá một mô hình trên dữ liệu test
+        
+        Args:
+            model_dir: Đường dẫn đến thư mục chứa mô hình
+            model_name: Tên mô hình
+            test_data: Dữ liệu test (nếu None sẽ dùng self.test_pack_raw)
+            fold_num: Số fold (dùng cho CV evaluation)
+        """
+        fold_suffix = f" (Fold {fold_num})" if fold_num is not None else ""
+        print(f"\n--- Đánh giá mô hình: {model_name}{fold_suffix} ---")
         print(f"Device: {self.device}")
+        
+        # Sử dụng dữ liệu test được cung cấp hoặc mặc định
+        test_pack_raw = test_data if test_data is not None else self.test_pack_raw
+        
+        if test_pack_raw is None:
+            print("Không có dữ liệu test để đánh giá")
+            return None
         
         # Kiểm tra file tồn tại
         model_path = os.path.join(model_dir, 'model.pt')
@@ -81,7 +140,7 @@ class ModelEvaluator:
             vocab_size = state_dict['embedding.weight'].shape[0]
             
             # Tiền xử lý dữ liệu test
-            test_pack_processed = preprocessor.transform(self.test_pack_raw)
+            test_pack_processed = preprocessor.transform(test_pack_raw)
             print("Đã tiền xử lý dữ liệu test")
             
             # Tạo test dataset
@@ -305,32 +364,137 @@ class ModelEvaluator:
             DataFrame chứa kết quả so sánh
         """
         print("\n" + "="*60)
-        print("BẮT ĐẦU ĐÁNH GIÁ TẤT CẢ CÁC MÔ HÌNH")
+        if self.use_cv_folds:
+            print("BẮT ĐẦU ĐÁNH GIÁ TẤT CẢ CÁC MÔ HÌNH - CROSS VALIDATION")
+        else:
+            print("BẮT ĐẦU ĐÁNH GIÁ TẤT CẢ CÁC MÔ HÌNH")
         print("="*60)
         
         all_results = {}
         
+        if self.use_cv_folds:
+            # Cross-validation evaluation
+            return self._evaluate_with_cv_folds(model_configs)
+        else:
+            # Single test evaluation
+            for config in model_configs:
+                name = config['name']
+                path = config['path']
+                
+                if os.path.exists(path):
+                    result = self.evaluate_model(path, name)
+                    if result:
+                        all_results[name] = result
+                else:
+                    print(f"Bỏ qua {name}: Không tìm thấy thư mục {path}")
+            
+            if not all_results:
+                print("Không có mô hình nào được đánh giá thành công!")
+                return pd.DataFrame()
+            
+            # Tạo DataFrame để so sánh
+            df = pd.DataFrame(all_results).T
+            
+            # Sắp xếp theo MAP (Mean Average Precision)
+            if 'MeanAveragePrecision' in df.columns:
+                df = df.sort_values('MeanAveragePrecision', ascending=False)
+            
+            return df
+    
+    def _evaluate_with_cv_folds(self, model_configs: List[Dict]) -> pd.DataFrame:
+        """Đánh giá các mô hình sử dụng Cross-Validation folds"""
+        all_fold_results = {}
+        
         for config in model_configs:
             name = config['name']
-            path =config['path']
+            path = config['path']
             
-            if os.path.exists(path):
-                result = self.evaluate_model(path, name)
-                if result:
-                    all_results[name] = result
-            else:
+            if not os.path.exists(path):
                 print(f"Bỏ qua {name}: Không tìm thấy thư mục {path}")
+                continue
+            
+            print(f"\n{'='*50}")
+            print(f"Đánh giá mô hình {name} trên {len(self.cv_folds_data)} folds")
+            print(f"{'='*50}")
+            
+            model_fold_results = []
+            
+            # Đánh giá trên từng fold
+            for fold_num in sorted(self.cv_folds_data.keys()):
+                fold_test_data = self.cv_folds_data[fold_num]
+                
+                print(f"\n--- Fold {fold_num} ---")
+                result = self.evaluate_model(path, name, test_data=fold_test_data, fold_num=fold_num)
+                
+                if result:
+                    # Thêm fold number vào kết quả
+                    result['fold'] = fold_num
+                    model_fold_results.append(result)
+                else:
+                    print(f"Lỗi trong fold {fold_num}")
+            
+            if model_fold_results:
+                all_fold_results[name] = model_fold_results
+                
+                # Tính trung bình và std cho mô hình này
+                print(f"\nKết quả tổng hợp cho {name}:")
+                self._print_cv_summary(model_fold_results, name)
         
-        if not all_results:
+        if not all_fold_results:
             print("Không có mô hình nào được đánh giá thành công!")
             return pd.DataFrame()
         
-        # Tạo DataFrame để so sánh
-        df = pd.DataFrame(all_results).T
+        # Tạo DataFrame tổng hợp kết quả CV
+        cv_summary_df = self._create_cv_summary_dataframe(all_fold_results)
+        return cv_summary_df
+    
+    def _print_cv_summary(self, fold_results: List[Dict], model_name: str):
+        """In tóm tắt kết quả CV cho một mô hình"""
+        if not fold_results:
+            return
         
-        # Sắp xếp theo MAP (Mean Average Precision)
-        if 'MeanAveragePrecision' in df.columns:
-            df = df.sort_values('MeanAveragePrecision', ascending=False)
+        # Lấy các metrics từ fold đầu tiên
+        metrics = [key for key in fold_results[0].keys() if key != 'fold']
+        
+        print(f"  Cross-Validation Summary cho {model_name}:")
+        print(f"  {'Metric':<40} {'Mean':<10} {'Std':<10}")
+        print(f"  {'-'*60}")
+        
+        for metric in metrics:
+            values = [result[metric] for result in fold_results if metric in result]
+            if values:
+                mean_val = np.mean(values)
+                std_val = np.std(values)
+                print(f"  {metric:<40} {mean_val:<10.4f} {std_val:<10.4f}")
+    
+    def _create_cv_summary_dataframe(self, all_fold_results: Dict) -> pd.DataFrame:
+        """Tạo DataFrame tổng hợp kết quả CV"""
+        summary_data = {}
+        
+        for model_name, fold_results in all_fold_results.items():
+            if not fold_results:
+                continue
+            
+            # Lấy các metrics
+            metrics = [key for key in fold_results[0].keys() if key != 'fold']
+            
+            model_summary = {}
+            for metric in metrics:
+                values = [result[metric] for result in fold_results if metric in result]
+                if values:
+                    model_summary[f"{metric}_mean"] = np.mean(values)
+                    model_summary[f"{metric}_std"] = np.std(values)
+            
+            summary_data[model_name] = model_summary
+        
+        if not summary_data:
+            return pd.DataFrame()
+        
+        df = pd.DataFrame(summary_data).T
+        
+        # Sắp xếp theo MAP mean
+        if 'MeanAveragePrecision_mean' in df.columns:
+            df = df.sort_values('MeanAveragePrecision_mean', ascending=False)
         
         return df
     
@@ -341,9 +505,65 @@ class ModelEvaluator:
             return
         
         print("\n" + "="*80)
-        print("KẾT QUẢ ĐÁNH GIÁ MÔ HÌNH - CORE INFORMATION RETRIEVAL METRICS")
+        if self.use_cv_folds:
+            print("KẾT QUẢ ĐÁNH GIÁ MÔ HÌNH - CROSS VALIDATION SUMMARY")
+        else:
+            print("KẾT QUẢ ĐÁNH GIÁ MÔ HÌNH - CORE INFORMATION RETRIEVAL METRICS")
         print("="*80)
         
+        if self.use_cv_folds:
+            self._print_cv_comparison_table(df)
+        else:
+            self._print_single_test_comparison_table(df)
+    
+    def _print_cv_comparison_table(self, df: pd.DataFrame):
+        """In bảng so sánh cho Cross-Validation results"""
+        # Core IR metrics với mean và std
+        core_metrics_base = [
+            'MeanAveragePrecision',     # MAP
+            'MeanReciprocalRank',       # MRR
+            'Precision(k=1)',           # P@1
+            'Precision(k=5)',           # P@5
+            'Precision(k=10)',          # P@10
+            'NormalizedDiscountedCumulativeGain(k=5)',   # NDCG@5
+            'NormalizedDiscountedCumulativeGain(k=10)',  # NDCG@10
+            'AveragePrecision'          # AP
+        ]
+        
+        print("CROSS-VALIDATION RESULTS (Mean ± Std):")
+        print("="*80)
+        
+        for base_metric in core_metrics_base:
+            mean_col = f"{base_metric}_mean"
+            std_col = f"{base_metric}_std"
+            
+            if mean_col in df.columns and std_col in df.columns:
+                print(f"\n{base_metric}:")
+                print(f"{'Model':<20} {'Mean':<12} {'Std':<12} {'Mean±Std':<20}")
+                print("-" * 64)
+                
+                for model in df.index:
+                    mean_val = df.loc[model, mean_col]
+                    std_val = df.loc[model, std_col]
+                    combined = f"{mean_val:.4f}±{std_val:.4f}"
+                    print(f"{model:<20} {mean_val:<12.4f} {std_val:<12.4f} {combined:<20}")
+        
+        # Model ranking based on MAP
+        if 'MeanAveragePrecision_mean' in df.columns:
+            print("\n" + "="*80)
+            print("MODEL RANKING (based on Mean Average Precision):")
+            print("-" * 80)
+            
+            sorted_models = df.sort_values('MeanAveragePrecision_mean', ascending=False)
+            for i, (model, row) in enumerate(sorted_models.iterrows(), 1):
+                map_mean = row['MeanAveragePrecision_mean']
+                map_std = row.get('MeanAveragePrecision_std', 0)
+                print(f"{i:2d}. {model:<25} MAP: {map_mean:.4f} ± {map_std:.4f}")
+        
+        print("="*80)
+    
+    def _print_single_test_comparison_table(self, df: pd.DataFrame):
+        """In bảng so sánh cho single test evaluation (code gốc)"""
         # Core IR metrics theo thứ tự ưu tiên
         core_metrics = [
             'MeanAveragePrecision',     # MAP - Most important overall metric
@@ -473,6 +693,7 @@ def parse_arguments():
             python evaluate_models.py --data-pack F:\\SematicSearch\\[method]semantic_splitter
             python evaluate_models.py -d F:\\SematicSearch\\[method]semantic_splitter --output results.csv
             python evaluate_models.py --data-pack F:\\SematicSearch\\[method]semantic_splitter --models Arc-II MatchLSTM
+            python evaluate_models.py --data-pack F:\\SematicSearch\\[method]semantic_splitter --use-cv-folds
         """
     )
     
@@ -480,7 +701,13 @@ def parse_arguments():
         '--data-pack', '-d',
         type=str,
         required=False,
-        help='Đường dẫn đến thư mục chứa test_pack.dam'
+        help='Đường dẫn đến thư mục chứa test_pack.dam hoặc cv_folds/'
+    )
+    
+    parser.add_argument(
+        '--use-cv-folds',
+        action='store_true',
+        help='Sử dụng Cross-Validation folds thay vì test_pack.dam'
     )
     
     parser.add_argument(
@@ -542,13 +769,23 @@ def main():
         print(f"Lỗi: Không tìm thấy thư mục {data_pack_dir}")
         sys.exit(1)
     
-    test_pack_path = os.path.join(data_pack_dir, 'test_pack.dam')
-    if not os.path.exists(test_pack_path):
-        print(f"Lỗi: Không tìm thấy test_pack.dam trong {data_pack_dir}")
-        sys.exit(1)
+    # Kiểm tra loại evaluation
+    if args.use_cv_folds:
+        cv_folds_dir = os.path.join(data_pack_dir, 'cv_folds')
+        if not os.path.exists(cv_folds_dir):
+            print(f"Lỗi: Không tìm thấy thư mục cv_folds trong {data_pack_dir}")
+            print("Hint: Sử dụng --use-cv-folds chỉ khi có thư mục cv_folds/")
+            sys.exit(1)
+        print(f"Sử dụng Cross-Validation folds từ: {cv_folds_dir}")
+    else:
+        test_pack_path = os.path.join(data_pack_dir, 'test_pack.dam')
+        if not os.path.exists(test_pack_path):
+            print(f"Lỗi: Không tìm thấy test_pack.dam trong {data_pack_dir}")
+            print("Hint: Sử dụng --use-cv-folds nếu bạn muốn đánh giá với CV folds")
+            sys.exit(1)
     
     # Tạo evaluator với device từ CLI args
-    evaluator = ModelEvaluator(data_pack_dir, batch_size=args.batch_size, device=args.device)
+    evaluator = ModelEvaluator(data_pack_dir, batch_size=args.batch_size, device=args.device, use_cv_folds=args.use_cv_folds)
     
     # Cấu hình các mô hình cần đánh giá
     model_configs = []
@@ -587,6 +824,7 @@ def main():
     
     print(f"\nCấu hình đánh giá:")
     print(f"   Data pack: {data_pack_dir}")
+    print(f"   Evaluation mode: {'Cross-Validation' if args.use_cv_folds else 'Single Test'}")
     print(f"   Output file: {args.output}")
     print(f"   Device: {args.device}")
     print(f"   Batch size: {args.batch_size}")
