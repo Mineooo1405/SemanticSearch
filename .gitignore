@@ -34,7 +34,8 @@ env3124/
 *.dam 
 *_model
 *_preprocessor
-
+test_*
+debug_*
 # Dataset và output
 output_data/
 training_datasets/

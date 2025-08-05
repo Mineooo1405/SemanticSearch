@@ -1,9 +1,12 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
-# ---------------------------------------------------------------------------
+# Add parent directory to path for Method imports
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).parent.parent))
+
 # Suppress noisy FutureWarnings & verbose library logs
-# ---------------------------------------------------------------------------
 import os, warnings, logging
 
 # Disable tokenizers parallelism globally (must be before SentenceTransformer import)
@@ -50,12 +53,247 @@ from Method.Text_Splitter_Optimized import (
     chunk_passage_text_splitter as simple_splitter,
 )
 
+
+"""
+# Enable text cleaning (default)
+python simple_chunk_controller.py -i input.tsv -o output --configs semantic_grouping_balanced
+
+# Disable text cleaning (raw documents)
+python simple_chunk_controller.py -i input.tsv -o output --configs semantic_grouping_balanced --disable-text-cleaning
+"""
 # ==== Default constants ====
 BATCH_SIZE = 600  # dòng/đợt đọc pandas
 COMMON_DEFAULTS = {
     "embedding_model": "sentence-transformers/all-MiniLM-L6-v2",
     "device_preference": "dml",  # "cuda", "dml", hoặc "cpu"
+    "enable_text_cleaning": True,  # Enable text cleaning by default
 }
+
+# ==== Text Cleaning for SpaCy Sentence Segmentation ========================
+
+def preprocess_interview_format(text: str) -> str:
+    """
+    Tiền xử lý format interview/transcript để SpaCy có thể tách câu đúng.
+    
+    Args:
+        text: Raw text potentially in interview format
+        
+    Returns:
+        Preprocessed text with better sentence boundaries for SpaCy
+    """
+    import re
+    
+    if not isinstance(text, str):
+        return ""
+    
+    # 1. Handle speaker attribution patterns: (Name) content -> Name said: "content"
+    # This converts interview format to narrative format that SpaCy understands better
+    
+    # Pattern: (Speaker Name) followed by content with sentence ending
+    # Example: (Gutierrez) The situation is complex. -> Gutierrez said: "The situation is complex."
+    text = re.sub(r'\(([^)]+)\)\s+([A-Z][^.!?]*[.!?])', r'\1 said: "\2"', text)
+    
+    # 2. Handle speaker attribution without clear sentence ending
+    # Pattern: (Name) content that continues... -> Name said: "content."
+    text = re.sub(r'\(([^)]+)\)\s+([A-Z][^.!?]+?)(?=\s+\([^)]+\)|$)', r'\1 said: "\2."', text)
+    
+    # 3. Handle reporter attributions specifically
+    # (Unidentified reporter) -> Reporter said:
+    text = re.sub(r'\(Unidentified reporter\)\s+', 'Reporter said: "', text)
+    text = re.sub(r'\(Reporter\)\s+', 'Reporter said: "', text)
+    
+    # 4. Handle "Here is a report by X:" patterns
+    # Here is a report by Alvaro Ayala: (Ayala) content -> Here is a report by Alvaro Ayala: "content"
+    text = re.sub(r'Here is a report by ([^:]+):\s+\([^)]+\)\s+', r'Here is a report by \1: "', text)
+    
+    # 5. CRITICAL: Remove empty speaker patterns that create meaningless chunks
+    # Pattern: (Name). or (Name). (Name). etc.
+    # This handles the problematic "(Unidentified reporter). (Reporter). (Reporter)." format
+    text = re.sub(r'\([^)]+\)\.\s*', '', text)
+    
+    # 6. Close quotes that were opened but not closed
+    # Count quotes and add closing quote if needed
+    quote_count = text.count('"')
+    if quote_count % 2 == 1:  # Odd number of quotes, need to close
+        text += '"'
+    
+    # 7. Fix multiple spaces and clean up
+    text = re.sub(r'\s+', ' ', text)
+    text = text.strip()
+    
+    return text
+
+def clean_document_for_spacy(text: str) -> str:
+    """
+    Làm sạch document để tránh SpaCy tách câu sai.
+    Xử lý các vấn đề phổ biến: metadata, nested punctuation, quotes, dashes, lists.
+    Tối ưu cho Robust04 dataset với patterns cụ thể.
+    
+    Args:
+        text: Raw document text
+        
+    Returns:
+        Cleaned text ready for SpaCy sentence segmentation
+    """
+    import re
+    
+    if not isinstance(text, str):
+        return ""
+    
+    # === ROBUST04 SPECIFIC METADATA CLEANING ===
+    
+    # 1. Loại bỏ header metadata (Language: ... Article Type: ...) - fix cho format không có dấu cách
+    # Pattern phải handle: "Language: Portuguese Article Type:BFN [Text] Sao Paulo --"
+    text = re.sub(r'^Language:\s*\w+\s+Article Type:\s*[^\s\[\]]*\s*\[Text\]\s*', '', text, flags=re.IGNORECASE)
+    
+    # 2. Fallback pattern nếu không có [Text] tag
+    text = re.sub(r'^Language:\s*\w+\s+Article Type:\s*[^\s]*\s*', '', text, flags=re.IGNORECASE)
+    
+    # 3. Loại bỏ các bracket metadata tags phổ biến - cẩn thận với whitespace
+    # Loại bỏ metadata blocks
+    text = re.sub(r'\[Article by[^\]]*\]\s*', '', text)
+    text = re.sub(r'\[Report by[^\]]*\]\s*', '', text)
+    text = re.sub(r'\[From the[^\]]*\]\s*', '', text)
+    text = re.sub(r'\[Excerpts?\]\s*', '', text)
+    text = re.sub(r'\[Text\]\s*', '', text)  # Tag cấu trúc - remove trailing whitespace
+    text = re.sub(r'\[passage omitted\]\s*', '', text)
+    text = re.sub(r'\[words indistinct\]\s*', '', text)
+    
+    # 4. Loại bỏ recording/transcript tags - cẩn thận với whitespace
+    text = re.sub(r'\[Begin[^\]]*recording\]\s*', '', text)
+    text = re.sub(r'\[end recording\]\s*', '', text)
+    text = re.sub(r'\[Begin [^\]]*\]\s*', '', text)  # General begin tags
+    text = re.sub(r'\[Interview with[^\]]*\]\s*', '', text)
+    
+    # 5. Xử lý reference brackets - convert thành contextual info
+    text = re.sub(r'\[reference to[^\]]*\]\s*', '', text)
+    
+    # 6. Giữ lại nhưng normalize short references (< 30 chars) thành ()
+    # Ví dụ: [parliament] -> (parliament), [Independence Day] -> (Independence Day)
+    text = re.sub(r'\[([^\]]{1,30})\]', r'(\1)', text)
+    
+    # 7. Loại bỏ location/date metadata ở đầu nếu có pattern cụ thể
+    # Ví dụ: "Santa Fe de Bogota, 28 Feb (DPA) --" có thể giữ vì là context
+    # Chỉ loại nếu là pure metadata, không phải content
+    
+    # === GENERAL SENTENCE BOUNDARY FIXES ===
+    
+    # 8. Xử lý nested punctuation - Chuẩn hóa ngoặc lồng nhau
+    text = re.sub(r'\(\s*([^()]*)\s*\[([^\]]*)\]\s*([^()]*)\)', r'(\1 \2 \3)', text)
+    
+    # 8. Xử lý abbreviations và capitals để tránh nhầm sentence boundary
+    # CRITICAL: Fix acronym handling - common acronyms should not create sentence boundaries
+    # First, protect common acronyms from being treated as sentence endings
+    
+    # Common political/military acronyms that appear with periods
+    common_acronyms = [
+        'ANC', 'SAP', 'APLA', 'SACP', 'MK', 'AWB', 'IFP', 'PAC', 'UDF',  # South African
+        'FBI', 'CIA', 'DEA', 'ATF', 'NSA', 'DHS', 'DOJ', 'DOD',  # US agencies
+        'NATO', 'UN', 'EU', 'OSCE', 'CSCE', 'CIS', 'CPRF', 'CPSU',  # International
+        'PF', 'DPA', 'BFN', 'CSO', 'FBIS', 'ITAR', 'TASS',  # News/agencies
+        'COCOM', 'DITA', 'QAP', 'KAM', 'SKAT', 'INPEC'  # Other organizations
+    ]
+    
+    # Protect acronyms: Add temporary marker to prevent sentence boundary detection
+    for acronym in common_acronyms:
+        # "ANC. " -> "ANC__TEMP_DOT__ " (at end of sentence)
+        text = re.sub(rf'\b{acronym}\.\s+([A-Z])', rf'{acronym}__TEMP_DOT__ \1', text)
+        # "ANC." at end of text
+        text = re.sub(rf'\b{acronym}\.$', rf'{acronym}__TEMP_DOT__', text)
+        # "ANC. and" -> "ANC__TEMP_DOT__ and" (mid-sentence)
+        text = re.sub(rf'\b{acronym}\.\s+([a-z])', rf'{acronym}__TEMP_DOT__ \1', text)
+    
+    # Handle general 2-4 letter acronyms more conservatively 
+    # Only add periods for long acronyms (5+ letters) before lowercase
+    text = re.sub(r'\b([A-Z]{5,})\b(?=\s+[a-z])', r'\1.', text)
+    
+    # 9. Chuẩn hóa dấu gạch ngang -- thành sentence boundary
+    # NHƯNG KHÔNG áp dụng cho news dateline format "Location -- content"
+    # Chỉ áp dụng khi có complete sentence trước --
+    text = re.sub(r'([.!?])\s+--\s+([a-z])', r'\1 \2', text)  # After sentence ending
+    text = re.sub(r'([.!?])\s+--\s+([A-Z])', r'\1 \2', text)  # After sentence ending
+    
+    # Xử lý -- ở giữa câu (không phải sentence boundary) - convert thành comma hoặc giữ nguyên
+    # "mid-sentence content -- more content" -> "mid-sentence content, more content"  
+    text = re.sub(r'([a-zA-Z])\s+--\s+([a-z])', r'\1, \2', text)
+    # "Location -- Content" -> "Location: Content" cho news dateline format
+    text = re.sub(r'([A-Z][a-zA-Z\s]+)\s+--\s+([A-Z])', r'\1: \2', text)
+    
+    # 10. Xử lý quotes phức tạp - normalize nested quotes
+    text = re.sub(r'""([^"]*?)""', r'"\1"', text)
+    text = re.sub(r'"([^"]*)"([^"]*)"([^"]*)"', r'"\1\2\3"', text)
+    
+    # 11. Xử lý numbered lists để tạo sentence boundaries
+    # "conclusion: 1) Those who" -> "conclusion. Those who"
+    text = re.sub(r':\s*(\d+\))\s*', r'. ', text)
+    text = re.sub(r';\s*(\d+\))\s*', r'. ', text)
+    
+    # 12. Normalize whitespace
+    text = re.sub(r'\s+', ' ', text)
+    
+    # 13. Fix spacing around punctuation
+    text = re.sub(r'\s+([.!?])', r'\1', text)
+    text = re.sub(r'([.!?])\s*([A-Z])', r'\1 \2', text)
+    
+    # 14. Remove empty lines và normalize paragraph breaks
+    lines = [line.strip() for line in text.split('\n') if line.strip()]
+    text = ' '.join(lines)
+    
+    # 15. Fix sentence boundaries - conservative approach
+    # Chỉ thêm dấu chấm khi có khoảng trống lớn
+    text = re.sub(r'([a-z])\s{2,}([A-Z][a-z])', r'\1. \2', text)
+    
+    # 16. Clean up problematic period placements
+    text = re.sub(r'([a-z])\.\s+([a-z])', r'\1 \2', text)
+    text = re.sub(r'\bthe\.\s+([A-Z])', r'the \1', text)
+    text = re.sub(r'\bin\.\s+([A-Z])', r'in \1', text)
+    text = re.sub(r'\bof\.\s+([A-Z])', r'of \1', text)
+    text = re.sub(r'\band\.\s+([A-Z])', r'and \1', text)
+    
+    # 17. Clean up multiple periods
+    text = re.sub(r'\.{2,}', '.', text)
+    
+    # 18. RESTORE protected acronym periods
+    # Convert temporary markers back to periods
+    text = text.replace('__TEMP_DOT__', '.')
+    
+    # 19. Final cleanup
+    text = text.strip()
+    
+    return text
+
+
+def validate_cleaned_text(original: str, cleaned: str, max_length_diff: float = 0.3) -> bool:
+    """
+    Kiểm tra xem text cleaning có quá aggressive không.
+    
+    Args:
+        original: Original text
+        cleaned: Cleaned text  
+        max_length_diff: Maximum allowed length difference ratio
+        
+    Returns:
+        True if cleaning is reasonable, False if too aggressive
+    """
+    if not original or not cleaned:
+        return False
+    
+    # Check length difference
+    length_ratio = abs(len(cleaned) - len(original)) / len(original)
+    if length_ratio > max_length_diff:
+        print(f"Warning: Text cleaning removed {length_ratio:.1%} of content")
+        return False
+    
+    # Check if essential content remains
+    words_original = len(original.split())
+    words_cleaned = len(cleaned.split())
+    word_ratio = abs(words_cleaned - words_original) / words_original
+    
+    if word_ratio > max_length_diff:
+        print(f"Warning: Text cleaning removed {word_ratio:.1%} of words")
+        return False
+    
+    return True
 
 # ==== Worker initializer =====================================================
 
@@ -71,7 +309,7 @@ def _worker_init(model_name: str, device_pref: str):
     global _GLOBALS  # type: ignore
     _GLOBALS = {}
 
-    # spaCy sentencizer tối giản
+    # spaCy sentencizer tối giản với custom preprocessing
     _GLOBALS["nlp"] = spacy.blank("en").add_pipe("sentencizer")
 
     # xác định device
@@ -108,6 +346,7 @@ def _process_batch(
     batch_idx: int,
     embedding_model: str,
     device_preference: str,
+    enable_text_cleaning: bool = True,
 ) -> List[List[Any]]:
     """Chunk các dòng trong batch và trả về list row cho TSV output."""
     results: List[List[Any]] = []
@@ -165,6 +404,25 @@ def _process_batch(
             # fallback positional (cũ) để không vỡ khi file thiếu header mới
             query_id, _qtxt, doc_orig, passage, label = row.iloc[0:5]
 
+        # === TEXT CLEANING FOR SPACY SENTENCE SEGMENTATION ===
+        # Apply cleaning to improve SpaCy sentence detection
+        if enable_text_cleaning:
+            original_passage = passage
+            
+            # Step 1: Clean document metadata and formatting
+            cleaned_passage = clean_document_for_spacy(passage)
+            
+            # Step 2: Preprocess interview/transcript format for better sentence segmentation
+            interview_processed = preprocess_interview_format(cleaned_passage)
+            
+            # Validate cleaning didn't remove too much content
+            if not validate_cleaned_text(original_passage, interview_processed):
+                print(f"Warning: Text cleaning may be too aggressive for doc {doc_orig}, using original")
+                interview_processed = original_passage
+            
+            # Use preprocessed text for processing
+            passage = interview_processed
+
         if not isinstance(passage, str) or not passage.strip():
             continue
 
@@ -204,13 +462,15 @@ def run_config(
     batch_size: int = BATCH_SIZE,
     embedding_model: Optional[str] = None,
     device_preference: Optional[str] = None,
+    enable_text_cleaning: Optional[bool] = None,
 ):
     """Chạy chunking cho 1 cấu hình."""
     import time
 
-    # Use provided models or fall back to defaults
-    actual_embedding_model = embedding_model or COMMON_DEFAULTS["embedding_model"]
-    actual_device_preference = device_preference or COMMON_DEFAULTS["device_preference"]
+    # Use provided parameters or fall back to defaults - USER PARAMETERS TAKE PRIORITY
+    actual_embedding_model = embedding_model if embedding_model is not None else COMMON_DEFAULTS["embedding_model"]
+    actual_device_preference = device_preference if device_preference is not None else COMMON_DEFAULTS["device_preference"]
+    actual_enable_text_cleaning = enable_text_cleaning if enable_text_cleaning is not None else COMMON_DEFAULTS["enable_text_cleaning"]
 
     start = time.time()
     outfile = output_dir / f"{config['name']}_chunks.tsv"
@@ -237,7 +497,7 @@ def run_config(
             initargs=(actual_embedding_model, actual_device_preference),
         ) as exe:
             futures = {
-                exe.submit(_process_batch, df, config, idx, actual_embedding_model, actual_device_preference): idx 
+                exe.submit(_process_batch, df, config, idx, actual_embedding_model, actual_device_preference, actual_enable_text_cleaning): idx 
                 for idx, df in all_batches
             }
             batch_results = []
@@ -246,7 +506,7 @@ def run_config(
     else:
         batch_results = []
         for idx, df in all_batches:
-            batch_results.extend(_process_batch(df, config, idx, actual_embedding_model, actual_device_preference))
+            batch_results.extend(_process_batch(df, config, idx, actual_embedding_model, actual_device_preference, actual_enable_text_cleaning))
 
     # ghi file
     outfile.parent.mkdir(exist_ok=True)
@@ -272,7 +532,7 @@ RUN_CONFIGURATIONS: List[Dict[str, Any]] = [
             "semantic_threshold": 0.35,
             "min_sentences_per_chunk": 3,
         },
-        "description": "Pure semantic chunking without size limits"
+        "description": "Semantic splitter chunking without size limits"
     },
     {
         "name": "semantic_grouping_no_limit",
@@ -283,7 +543,7 @@ RUN_CONFIGURATIONS: List[Dict[str, Any]] = [
             "min_threshold": 0.1, 
             "min_sentences_per_chunk": 2,  # Lowered to allow smaller but coherent chunks
         },
-        "description": "Semantic grouping with threshold ranges - no size constraints"
+        "description": "Semantic grouping chunking with threshold ranges - no size constraints"
     },
     {
         "name": "semantic_grouping_balanced",
@@ -300,10 +560,6 @@ RUN_CONFIGURATIONS: List[Dict[str, Any]] = [
         "description": "Balanced semantic grouping - balances semantic coherence with chunk size consistency"
     },
 ]
-
-# ============================================================
-# INTERACTIVE TEXT-UI (bắt chước data_create_controller.py)
-# ============================================================
 
 _MODEL_PRESETS = {
     "1": ("thenlper/gte-large", "High Quality (yêu cầu ≥4.5GB VRAM)"),
@@ -339,7 +595,8 @@ def interactive_ui():
     out_dir.mkdir(exist_ok=True)
 
     # ----- Model preset -----
-    print(f"\nCurrent embedding model: {COMMON_DEFAULTS['embedding_model']}")
+    current_embedding_model = COMMON_DEFAULTS["embedding_model"]
+    print(f"\nCurrent embedding model: {current_embedding_model}")
     if input("Change model? (y/N): ").strip().lower() == "y":
         print("\nQUICK MODEL PRESETS:")
         for key, (model_name, desc) in _MODEL_PRESETS.items():
@@ -349,7 +606,7 @@ def interactive_ui():
             selected = _MODEL_PRESETS[choice][0]
             if selected == "auto":
                 selected = _recommend_auto_model()
-            COMMON_DEFAULTS["embedding_model"] = selected
+            current_embedding_model = selected
             print(f"Embedding model set to: {selected}")
 
     # ----- Config selection -----
@@ -399,7 +656,7 @@ def interactive_ui():
     print("\n=== SUMMARY ===")
     print(f"Input        : {input_path}")
     print(f"Output dir   : {out_dir}")
-    print(f"Embedding    : {COMMON_DEFAULTS['embedding_model']}")
+    print(f"Embedding    : {current_embedding_model}")
     print(f"Configurations: {len(selected_cfgs)} selected")
     for cfg in selected_cfgs:
         params_summary = []
@@ -415,16 +672,18 @@ def interactive_ui():
     # spawn start-method
     mp.set_start_method("spawn", force=True)
 
-    # Chạy tất cả configs được chọn
+    # Chạy tất cả configs được chọn - use user selections, not COMMON_DEFAULTS
     for i, cfg in enumerate(selected_cfgs, 1):
         print(f"\n[CONFIG {i}/{len(selected_cfgs)}] Starting {cfg['name']}...")
         run_config(
-            cfg, 
-            input_path, 
-            out_dir, 
-            cfg_workers,
-            embedding_model=COMMON_DEFAULTS["embedding_model"],
-            device_preference=COMMON_DEFAULTS["device_preference"]
+            config=cfg, 
+            input_path=input_path, 
+            output_dir=out_dir, 
+            config_workers=cfg_workers,
+            batch_size=BATCH_SIZE,
+            embedding_model=current_embedding_model,
+            device_preference=COMMON_DEFAULTS["device_preference"],
+            enable_text_cleaning=COMMON_DEFAULTS["enable_text_cleaning"]
         )
 
     print(f"\nAll {len(selected_cfgs)} configuration(s) completed! Output in", out_dir)
@@ -448,14 +707,27 @@ def main():
     ap.add_argument("-c", "--config-workers", type=int, default=1, help="Workers per config (process batches)")
     ap.add_argument("--embedding-model", default=COMMON_DEFAULTS["embedding_model"], help="SentenceTransformer model")
     ap.add_argument("--device", default=COMMON_DEFAULTS["device_preference"], help="cpu | cuda | dml")
+    ap.add_argument("--enable-text-cleaning", action="store_true", default=True, 
+                    help="Enable text cleaning for better SpaCy sentence segmentation (default: True)")
+    ap.add_argument("--disable-text-cleaning", action="store_true", 
+                    help="Disable text cleaning, use raw documents (overrides --enable-text-cleaning)")
     ap.add_argument(
         "--configs",
         help="Comma separated config names or numbers to run (default all)",
     )
     args = ap.parse_args()
 
-    COMMON_DEFAULTS["embedding_model"] = args.embedding_model
-    COMMON_DEFAULTS["device_preference"] = args.device.lower()
+    # USER PARAMETERS TAKE PRIORITY - only update defaults if user explicitly provided values
+    user_embedding_model = args.embedding_model
+    user_device_preference = args.device.lower()
+    
+    # Determine text cleaning setting based on user flags
+    enable_text_cleaning = args.enable_text_cleaning and not args.disable_text_cleaning
+    
+    if enable_text_cleaning:
+        print("Text cleaning enabled for better SpaCy sentence segmentation")
+    else:
+        print("Text cleaning disabled - using raw documents")
 
     input_path = Path(args.input)
     out_dir = Path(args.output_dir)
@@ -482,22 +754,24 @@ def main():
             print(f"  {i}. {cfg['name']} - {cfg.get('description', 'No description')}")
         return
 
-    # pool cho configs
+    # pool cho configs - pass user parameters directly, don't modify COMMON_DEFAULTS
     if args.workers > 1:
         with ProcessPoolExecutor(
             max_workers=args.workers,
             initializer=_worker_init,
-            initargs=(COMMON_DEFAULTS["embedding_model"], COMMON_DEFAULTS["device_preference"]),
+            initargs=(user_embedding_model, user_device_preference),
         ) as exe:
             futs = {
                 exe.submit(
                     run_config, 
-                    cfg, 
-                    input_path, 
-                    out_dir, 
-                    args.config_workers,
-                    COMMON_DEFAULTS["embedding_model"],
-                    COMMON_DEFAULTS["device_preference"]
+                    config=cfg, 
+                    input_path=input_path, 
+                    output_dir=out_dir, 
+                    config_workers=args.config_workers,
+                    batch_size=BATCH_SIZE,
+                    embedding_model=user_embedding_model,
+                    device_preference=user_device_preference,
+                    enable_text_cleaning=enable_text_cleaning
                 ): cfg["name"]
                 for cfg in configs
             }
@@ -506,12 +780,14 @@ def main():
     else:
         for cfg in configs:
             run_config(
-                cfg, 
-                input_path, 
-                out_dir, 
-                args.config_workers,
-                embedding_model=COMMON_DEFAULTS["embedding_model"],
-                device_preference=COMMON_DEFAULTS["device_preference"]
+                config=cfg, 
+                input_path=input_path, 
+                output_dir=out_dir, 
+                config_workers=args.config_workers,
+                batch_size=BATCH_SIZE,
+                embedding_model=user_embedding_model,
+                device_preference=user_device_preference,
+                enable_text_cleaning=enable_text_cleaning
             )
 
     print("All configurations completed!")

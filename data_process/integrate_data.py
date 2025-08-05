@@ -77,14 +77,23 @@ def main():
                         continue
 
                     query_text = topic_info.get('query_text', '').replace('\t', ' ')
+                    # Clean query text quotes for TSV consistency
+                    query_text = query_text.replace('""', '"').replace('"', "'")  # Normalize quotes
 
                     actual_data_file_path = os.path.join(data_dir, document_id)
                     document = ""
                     try:
                         with open(actual_data_file_path, 'r', encoding='utf-8', errors='ignore') as df:
                             document = df.read()
+                            # Clean document text for TSV format
                             document = document.replace('\t', ' ').replace('\n', ' ').replace('\r', '').strip()
-                            document = re.sub(r'\s+', ' ', document)  # Loại bỏ khoảng trắng thừa
+                            document = re.sub(r'\s+', ' ', document)  # Remove extra whitespace
+                            
+                            # Fix quotes for TSV format - normalize nested quotes and escape properly
+                            # Replace double quotes with single quotes to avoid TSV parsing issues
+                            document = document.replace('""', '"')  # Fix double-double quotes first
+                            document = document.replace('"', "'")   # Convert all quotes to single quotes
+                            
                     except FileNotFoundError:
                         document = "FILE_NOT_FOUND"
                     except Exception as e:
