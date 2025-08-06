@@ -426,6 +426,11 @@ def _process_batch(
         if not isinstance(passage, str) or not passage.strip():
             continue
 
+        # TREC ROBUST04 FILTER: Skip documents marked as having no information
+        if passage.strip() == "This document has no information.":
+            print(f"[PID {pid}] Skipping document {doc_orig} - marked as having no information")
+            continue
+
         # doc_id duy nhất cho thuật toán chunking (không dùng làm output)
         doc_id = f"{doc_orig}_B{batch_idx}_{local_idx}"
 

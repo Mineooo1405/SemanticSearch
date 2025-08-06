@@ -12,6 +12,7 @@ import numpy as np
 import hashlib 
 from datetime import datetime
 from pathlib import Path
+import torch
 
 load_dotenv()
 
@@ -119,7 +120,10 @@ def process_sentence_embedding_in_batches(sentences, model_name, batch_size=32, 
         return np.array([])
 
 def helper_create_semantic_matrix(sentences: List[str], model_name: str, batch_size_embed: int = 32, device: Optional[str] = "cuda", silent: bool = True) -> Optional[np.ndarray]:
-    """Create semantic similarity matrix between sentences using batched embedding."""
+    """
+    GPU-Optimized semantic similarity matrix creation.
+    Uses PyTorch GPU tensors for faster matrix operations.
+    """
     if len(sentences) < 2:
         return None
 
@@ -167,21 +171,67 @@ def helper_create_semantic_matrix(sentences: List[str], model_name: str, batch_s
         return None
 
     try:
-        # Use float32 for faster computation and less memory
-        if embeddings.dtype != np.float32:
-            embeddings = embeddings.astype(np.float32)
+        # **GPU-ACCELERATED SIMILARITY COMPUTATION**
+        device_obj = torch.device("cuda" if device == "cuda" and torch.cuda.is_available() else "cpu")
         
-        sim_matrix = cosine_similarity(embeddings)
+        if not silent:
+            print(f"   Computing similarity matrix on {device_obj}...")
+        
+        matrix_start = time.time()
+        
+        if device_obj.type == "cuda":
+            # GPU-accelerated computation using PyTorch
+            embeddings_tensor = torch.tensor(embeddings, dtype=torch.float32, device=device_obj)
+            
+            # Normalize embeddings for cosine similarity
+            embeddings_normalized = torch.nn.functional.normalize(embeddings_tensor, p=2, dim=1)
+            
+            # Compute similarity matrix using GPU matrix multiplication (MUCH faster)
+            sim_matrix_tensor = torch.mm(embeddings_normalized, embeddings_normalized.t())
+            
+            # Convert back to numpy for compatibility
+            sim_matrix = sim_matrix_tensor.cpu().numpy()
+            
+            # Clean up GPU memory
+            del embeddings_tensor, embeddings_normalized, sim_matrix_tensor
+            torch.cuda.empty_cache()
+            
+        else:
+            # CPU fallback using sklearn
+            if embeddings.dtype != np.float32:
+                embeddings = embeddings.astype(np.float32)
+            sim_matrix = cosine_similarity(embeddings)
+        
+        matrix_time = time.time() - matrix_start
+        total_time = time.time() - start_time
+        
+        if not silent:
+            print(f"   Similarity matrix computed in {matrix_time:.2f}s on {device_obj}")
+            print(f"   Total time: {total_time:.2f}s | Matrix shape: {sim_matrix.shape}")
+        
         del embeddings
         gc.collect()
         return sim_matrix
+        
     except Exception as e:
         if not silent:
-            print(f"Error calculating similarity matrix: {e}")
-        if 'embeddings' in locals() and embeddings is not None: 
+            print(f"GPU similarity computation failed, falling back to CPU: {e}")
+        
+        # Fallback to original CPU method
+        try:
+            if embeddings.dtype != np.float32:
+                embeddings = embeddings.astype(np.float32)
+            sim_matrix = cosine_similarity(embeddings)
             del embeddings
-        gc.collect()
-        return None
+            gc.collect()
+            return sim_matrix
+        except Exception as fallback_e:
+            if not silent:
+                print(f"Error calculating similarity matrix: {fallback_e}")
+            if 'embeddings' in locals() and embeddings is not None: 
+                del embeddings
+            gc.collect()
+            return None
 
 def analyze_similarity_distribution(sim_matrix):
     """Analyze similarity distribution in matrix, excluding diagonal values."""
