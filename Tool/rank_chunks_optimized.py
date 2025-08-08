@@ -1,6 +1,7 @@
 """
 Optimized ranking module with memory efficiency and caching
 """
+from __future__ import annotations
 import argparse
 import pandas as pd
 import numpy as np
@@ -275,16 +276,32 @@ def rank_and_filter_chunks_optimized(chunks_tsv: str, output_dir: Path,
     # Load mapping query_id → query_text từ file original
     # ------------------------------------------------------------
     try:
-        mapping_df = pd.read_csv(
-        original_tsv,
-        sep='\t',
-        usecols=['query_id', 'query_text'],
-        quoting=csv.QUOTE_NONE,
-        engine='python',
-        on_bad_lines='warn'
-        )
+        # Try with newer pandas parameters first
+        try:
+            mapping_df = pd.read_csv(
+                original_tsv,
+                sep='\t',
+                usecols=['query_id', 'query_text'],
+                quoting=csv.QUOTE_NONE,
+                engine='python',
+                on_bad_lines='warn'
+            )
+        except TypeError:
+            # Fallback for older pandas versions
+            mapping_df = pd.read_csv(
+                original_tsv,
+                sep='\t',
+                usecols=['query_id', 'query_text'],
+                quoting=csv.QUOTE_NONE,
+                engine='python',
+                error_bad_lines=False,
+                warn_bad_lines=True
+            )
+        
         query_map = dict(mapping_df.groupby('query_id')['query_text'].first())
         del mapping_df
+        print(f"Loaded {len(query_map)} unique queries from original TSV")
+        
     except Exception as e:
         print(f"Error loading original TSV for query_text mapping: {e}")
         return ""
@@ -316,7 +333,13 @@ def rank_and_filter_chunks_optimized(chunks_tsv: str, output_dir: Path,
     # First pass: Count total rows and get column info without loading all data
     print("Scanning file structure...")
     try:
-        header_sample = pd.read_csv(chunks_tsv, sep='\t', nrows=5, on_bad_lines='warn', engine='python')
+        # Try with newer pandas parameters first
+        try:
+            header_sample = pd.read_csv(chunks_tsv, sep='\t', nrows=5, on_bad_lines='warn', engine='python')
+        except TypeError:
+            # Fallback for older pandas versions
+            header_sample = pd.read_csv(chunks_tsv, sep='\t', nrows=5, error_bad_lines=False, warn_bad_lines=True, engine='python')
+            
         header_sample = _standardize_columns(header_sample, require_query_text=False)
         required_cols = {'chunk_text'}
         if not required_cols.issubset(set(header_sample.columns)):
@@ -346,8 +369,13 @@ def rank_and_filter_chunks_optimized(chunks_tsv: str, output_dir: Path,
         print("Memory monitoring not available (psutil not installed)")
     
     # Read and process file in chunks
-    chunk_iterator = pd.read_csv(chunks_tsv, sep='\t', chunksize=chunk_size, 
-                                on_bad_lines='warn', engine='python')
+    try:
+        chunk_iterator = pd.read_csv(chunks_tsv, sep='\t', chunksize=chunk_size, 
+                                    on_bad_lines='warn', engine='python')
+    except TypeError:
+        # Fallback for older pandas versions
+        chunk_iterator = pd.read_csv(chunks_tsv, sep='\t', chunksize=chunk_size, 
+                                    error_bad_lines=False, warn_bad_lines=True, engine='python')
     
     for chunk_num, df_chunk in enumerate(chunk_iterator, 1):
         try:

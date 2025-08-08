@@ -42,13 +42,13 @@ del glove_embedding
 gc.collect()
 print("Đã giải phóng bộ nhớ từ GloVe embedding.")
 
-# --- 5. Tạo DataLoader ---
+# --- 5. Tạo DataLoader với batch size lớn hơn ---
 trainset = mz.dataloader.Dataset(
     data_pack=train_pack_processed,
     mode='pair',
     num_dup=5,
     num_neg=1,
-    batch_size=16, 
+    batch_size=64,  # Tăng từ 16 lên 64
     resample=True,
     sort=False,
     shuffle=True
@@ -56,7 +56,7 @@ trainset = mz.dataloader.Dataset(
 testset = mz.dataloader.Dataset(
     data_pack=test_pack_processed,
     mode='point', 
-    batch_size=16, 
+    batch_size=64,  # Tăng từ 16 lên 64
     shuffle=False
 )
 
@@ -76,27 +76,57 @@ testloader = mz.dataloader.DataLoader(
 )
 print("Tạo DataLoader thành công.")
 
-# --- 6. Xây dựng và cấu hình Model ---
+# --- 6. Xây dựng và cấu hình Model với hyperparameters tùy chỉnh ---
 model = mz.models.MatchPyramid()
 model.params['task'] = ranking_task
+
+# Cấu hình hyperparameters như đã thảo luận
+model.params['kernel_count'] = [16, 32]  # Hai lớp conv với 16 và 32 kernels
+model.params['kernel_size'] = [[3, 3], [3, 3]]  # Kernel size 3x3 cho cả hai lớp
+model.params['activation'] = 'relu'  # Giữ ReLU activation
+model.params['dpool_size'] = [3, 10]  # Dynamic pooling size
+model.params['dropout_rate'] = 0.2  # Thêm dropout để tránh overfitting
+
 model.params['embedding'] = embedding_matrix
 model.build()
 model.to(device)
 print(model)
 print("Tổng số tham số cần huấn luyện:", sum(p.numel() for p in model.parameters() if p.requires_grad))
 
-# --- 7. Huấn luyện Model ---
-optimizer = torch.optim.Adam(model.parameters())
+# --- 7. Huấn luyện Model với learning rate tùy chỉnh ---
+optimizer = torch.optim.Adam(model.parameters(), lr=0.001)  # Đặt rõ learning rate
+
+# Thêm learning rate scheduler
+scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+    optimizer, 
+    mode='max',  # Monitor validation metric (cao hơn là tốt hơn)
+    factor=0.5,  # Giảm LR xuống một nửa
+    patience=3,  # Chờ 3 epochs không cải thiện
+    verbose=True
+)
+
 trainer = mz.trainers.Trainer(
     model=model,
     optimizer=optimizer,
     trainloader=trainloader,
     validloader=testloader,
-    validate_interval=None,
-    epochs=5,
+    validate_interval=1,  # Validate mỗi epoch
+    epochs=20,  # Tăng từ 5 lên 20 epochs
     device=device,
     save_dir='Trained_model/match_pyramid_model'
 )
+
+# Thêm callback để monitor training
+class LRSchedulerCallback:
+    def __init__(self, scheduler):
+        self.scheduler = scheduler
+        
+    def on_epoch_end(self, trainer):
+        # Lấy validation score từ trainer
+        if trainer.validate_interval and len(trainer.state.val_scores) > 0:
+            current_score = trainer.state.val_scores[-1]
+            self.scheduler.step(current_score)
+
 trainer.run()
 
 # --- 8. Lưu model và preprocessor ---
@@ -104,3 +134,8 @@ print("Bắt đầu lưu model và preprocessor...")
 trainer.save_model()
 preprocessor.save('Trained_model/match_pyramid_model/preprocessor')
 print("Đã lưu model và preprocessor vào thư mục 'match_pyramid_model'.")
+
+# --- 9. Thêm đánh giá cuối cùng ---
+print("\n--- Đánh giá cuối cùng trên test set ---")
+final_results = trainer.evaluate(testloader)
+print("Kết quả cuối cùng:", final_results)

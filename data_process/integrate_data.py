@@ -54,6 +54,7 @@ def main():
         return
 
     output_lines_count = 0
+    skipped_no_info_count = 0  # Track documents skipped for having no information
     try:
         with open(output_file_path, 'w', encoding='utf-8') as outfile:
             outfile.write("query_id\tquery_text\tdocument_id\tdocument\tlabel\n")  # Header
@@ -89,6 +90,12 @@ def main():
                             document = document.replace('\t', ' ').replace('\n', ' ').replace('\r', '').strip()
                             document = re.sub(r'\s+', ' ', document)  # Remove extra whitespace
                             
+                            # FILTER: Skip documents with no information
+                            if document.strip() == "This document has no information.":
+                                print(f"Skipping document {document_id} - marked as having no information")
+                                skipped_no_info_count += 1
+                                continue
+                            
                             # Fix quotes for TSV format - normalize nested quotes and escape properly
                             # Replace double quotes with single quotes to avoid TSV parsing issues
                             document = document.replace('""', '"')  # Fix double-double quotes first
@@ -106,6 +113,7 @@ def main():
         print(f"Error: {e}")
 
     print(f"Finished. {output_lines_count} records written to {output_file_path}.")
+    print(f"Skipped {skipped_no_info_count} documents marked as having no information.")
 
 if __name__ == "__main__":
     main()

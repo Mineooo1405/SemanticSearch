@@ -363,15 +363,16 @@ def helper_handle_remaining_sentences(remaining_indices, sentences, silent):
 def process_semantic_grouping_with_balanced_chunks(sim_matrix, sentences, initial_threshold, decay_factor, min_threshold, target_chunk_size=150, size_tolerance=0.5, silent=True):
     """
     Enhanced semantic grouping with chunk size balancing.
+    MODIFIED: Now preserves ALL content, only controls maximum chunk sizes.
     
     Args:
         target_chunk_size: Target number of characters per chunk
         size_tolerance: Tolerance for chunk size deviation (0.5 = ±50%)
     
-    Process chunks in descending threshold ranges while maintaining balanced sizes:
+    Process chunks in descending threshold ranges while preventing oversized chunks:
     - Range 1: [initial_threshold, initial_threshold*decay_factor] 
     - Range 2: [initial_threshold*decay_factor, initial_threshold*decay_factor^2]
-    - ... but with size constraints to avoid very large or very small chunks
+    - ... but with upper size constraints to avoid very large chunks
     """
     num_sentences = sim_matrix.shape[0]
     
@@ -388,13 +389,13 @@ def process_semantic_grouping_with_balanced_chunks(sim_matrix, sentences, initia
     
     # Estimate optimal sentences per chunk based on target size
     target_sentences_per_chunk = max(2, int(target_chunk_size / avg_sentence_length))
-    min_chunk_size = int(target_chunk_size * (1 - size_tolerance))
+    # Remove minimum constraint, only set maximum to prevent oversized chunks
     max_chunk_size = int(target_chunk_size * (1 + size_tolerance))
     
     if not silent:
-        print(f" Chunk Size Balancing:")
+        print(f" Chunk Size Control (No Minimum Constraints):")
         print(f"   Target chunk size: {target_chunk_size} chars")
-        print(f"   Size range: {min_chunk_size}-{max_chunk_size} chars")
+        print(f"   Maximum chunk size: {max_chunk_size} chars (no minimum)")
         print(f"   Avg sentence length: {avg_sentence_length:.1f} chars")
         print(f"   Target sentences per chunk: {target_sentences_per_chunk}")
     
@@ -416,7 +417,7 @@ def process_semantic_grouping_with_balanced_chunks(sim_matrix, sentences, initia
             break
     
     if not silent:
-        print(f"Starting balanced threshold range grouping with {num_sentences} sentences")
+        print(f"Starting content-preserving threshold range grouping with {num_sentences} sentences")
         print(f"Threshold ranges: {len(threshold_ranges)} ranges from {initial_threshold:.3f} to {min_threshold:.3f}")
     
     # Process each threshold range with size balancing
@@ -435,7 +436,7 @@ def process_semantic_grouping_with_balanced_chunks(sim_matrix, sentences, initia
             upper_threshold, 
             lower_threshold,
             target_sentences_per_chunk,
-            min_chunk_size,
+            0,  # No minimum size constraint
             max_chunk_size,
             silent
         )
@@ -452,24 +453,31 @@ def process_semantic_grouping_with_balanced_chunks(sim_matrix, sentences, initia
                 if not silent:
                     print(f"  Group {len(groups)}: {len(group)} sentences, {group_chars} chars")
     
-    # Handle remaining ungrouped sentences with size balancing
+    # Handle remaining ungrouped sentences - PRESERVE ALL
     if ungrouped_indices:
         if not silent:
-            print(f"\n--- Balancing {len(ungrouped_indices)} remaining sentences ---")
+            print(f"\n--- Preserving {len(ungrouped_indices)} remaining sentences ---")
         
         remaining_groups = balance_remaining_sentences(
             list(ungrouped_indices), 
             sentences, 
             sentence_lengths,
             target_sentences_per_chunk,
-            min_chunk_size,
+            0,  # No minimum size constraint
             max_chunk_size,
             silent
         )
         groups.extend(remaining_groups)
     
     if not silent:
-        print(f"\nBalanced grouping completed: {len(groups)} groups formed")
+        print(f"\nContent-preserving grouping completed: {len(groups)} groups formed")
+        
+        # Split oversized chunks into smaller ones
+        if groups:
+            print(f"\n--- Splitting oversized chunks (max: {max_chunk_size} chars) ---")
+            groups = split_oversized_chunks(groups, sentences, sentence_lengths, max_chunk_size, silent)
+            print(f"Final result: {len(groups)} chunks after splitting")
+        
         # Print size statistics
         group_sizes = []
         for group in groups:
@@ -478,6 +486,16 @@ def process_semantic_grouping_with_balanced_chunks(sim_matrix, sentences, initia
         
         if group_sizes:
             print(f"Chunk size stats: min={min(group_sizes)}, max={max(group_sizes)}, avg={sum(group_sizes)/len(group_sizes):.1f}")
+    else:
+        # Silent mode - still split oversized chunks but with minimal logging for debugging
+        if groups:
+            groups_before = len(groups)
+            groups = split_oversized_chunks(groups, sentences, sentence_lengths, max_chunk_size, True)
+            groups_after = len(groups)
+            
+            # Log if splitting occurred (even in silent mode for debugging)
+            if groups_after > groups_before:
+                print(f"[DEBUG] Auto-split: {groups_before} → {groups_after} chunks (max_size: {max_chunk_size})")
         
     return groups
 
@@ -578,6 +596,7 @@ def process_range_grouping_with_size_control(sim_matrix, sentences, sentence_len
                                           min_chunk_size, max_chunk_size, silent=True):
     """
     Process grouping within a threshold range with size control.
+    Now accepts ALL groups to avoid losing content.
     """
     if not available_indices:
         return []
@@ -599,20 +618,12 @@ def process_range_grouping_with_size_control(sim_matrix, sentences, sentence_len
         if group:
             group_chars = sum(sentence_lengths[idx] for idx in group)
             
-            # Accept group if it meets minimum size OR we have few sentences left
-            if (group_chars >= min_chunk_size or 
-                len(group) >= 2 or  # Accept small groups to avoid singletons
-                len([i for i in available_indices if i not in visited]) <= target_sentences_per_chunk):
-                
-                groups.append(group)
-                visited.update(group)
-                
-                if not silent:
-                    print(f"    Group: {len(group)} sentences, {group_chars} chars ✓")
-            else:
-                # Skip group if too small, sentences remain available for next range
-                if not silent:
-                    print(f"    Skipped small group: {len(group)} sentences, {group_chars} chars")
+            # Accept ALL groups to preserve content - no filtering by minimum size
+            groups.append(group)
+            visited.update(group)
+            
+            if not silent:
+                print(f"    Group: {len(group)} sentences, {group_chars} chars ✓")
     
     return groups
 
@@ -620,6 +631,7 @@ def expand_group_with_size_control(sim_matrix, sentence_lengths, available_indic
                                  lower_threshold, upper_threshold, target_sentences, max_chars, visited):
     """
     Expand group from start_idx within threshold range with size constraints.
+    Now focuses only on preventing groups that are TOO LARGE, not filtering small ones.
     """
     if start_idx in visited:
         return []
@@ -628,18 +640,19 @@ def expand_group_with_size_control(sim_matrix, sentence_lengths, available_indic
     group_chars = sentence_lengths[start_idx]
     candidates = set(available_indices) - visited - {start_idx}
     
-    # Greedy expansion with size control
-    while candidates and len(group) < target_sentences * 2:  # Allow some flexibility
+    # Greedy expansion with upper size limit only
+    while candidates and len(group) < target_sentences * 3:  # Allow more flexibility for larger groups
         best_candidate = None
         best_similarity = 0
         
-        # Find best candidate that doesn't exceed size limit
+        # Find best candidate that doesn't exceed MAXIMUM size limit
         for candidate in candidates:
             candidate_chars = sentence_lengths[candidate]
             
-            # Check if adding this candidate would exceed size limit
+            # Only check if adding this candidate would exceed MAXIMUM size limit
+            # Remove minimum constraints to preserve content
             if group_chars + candidate_chars > max_chars:
-                continue
+                continue  # Only skip if group becomes TOO LARGE
                 
             # Find maximum similarity with any sentence in current group
             max_sim = 0
@@ -659,18 +672,206 @@ def expand_group_with_size_control(sim_matrix, sentence_lengths, available_indic
             group_chars += sentence_lengths[best_candidate]
             candidates.remove(best_candidate)
             
-            # Early stop if we reach target size
-            if group_chars >= target_sentences * 100:  # Rough target estimate
+            # Early stop if we reach reasonable upper size limit
+            if group_chars >= max_chars * 0.9:  # Stop at 90% of max to avoid getting too close
                 break
         else:
             break  # No more valid candidates
     
     return group
 
+def smart_split_large_group(group, sentences, sentence_lengths, sim_matrix, max_chunk_size, silent=True):
+    """
+    Chia một group lớn thành các group nhỏ hơn dựa trên semantic similarity.
+    
+    Chiến lược: Tìm điểm cắt có similarity thấp nhất để chia group một cách tự nhiên
+    """
+    if len(group) <= 1:
+        return [group]
+    
+    # Sắp xếp group theo thứ tự ban đầu
+    sorted_group = sorted(group)
+    
+    # Nếu group nhỏ, sử dụng chia tuần tự đơn giản
+    if len(sorted_group) <= 3:
+        return split_large_group(group, sentence_lengths, max_chunk_size, silent)
+    
+    # Tìm các điểm cắt tốt dựa trên similarity
+    cut_points = find_semantic_cut_points(sorted_group, sim_matrix, sentence_lengths, max_chunk_size)
+    
+    if not cut_points:
+        # Fallback về chia tuần tự
+        return split_large_group(group, sentence_lengths, max_chunk_size, silent)
+    
+    # Chia group tại các điểm cắt
+    sub_groups = []
+    start_idx = 0
+    
+    for cut_point in cut_points + [len(sorted_group)]:  # Thêm điểm cuối
+        if cut_point > start_idx:
+            sub_group = sorted_group[start_idx:cut_point]
+            sub_groups.append(sub_group)
+            
+            if not silent:
+                sub_chars = sum(sentence_lengths[idx] for idx in sub_group)
+                print(f"        Semantic sub-chunk: {len(sub_group)} sentences, {sub_chars} chars")
+            
+            start_idx = cut_point
+    
+    return sub_groups
+
+def find_semantic_cut_points(sorted_group, sim_matrix, sentence_lengths, max_chunk_size):
+    """
+    Tìm các điểm cắt tốt dựa trên semantic similarity giữa các câu liên tiếp.
+    """
+    if len(sorted_group) <= 2:
+        return []
+    
+    # Tính similarity giữa các câu liên tiếp
+    similarities = []
+    for i in range(len(sorted_group) - 1):
+        idx1, idx2 = sorted_group[i], sorted_group[i + 1]
+        sim = sim_matrix[idx1, idx2] if sim_matrix is not None else 0.5
+        similarities.append((i + 1, sim))  # (cut_position, similarity)
+    
+    # Sắp xếp theo similarity tăng dần (similarity thấp = điểm cắt tốt)
+    similarities.sort(key=lambda x: x[1])
+    
+    # Chọn điểm cắt tốt nhất mà vẫn đảm bảo kích thước
+    cut_points = []
+    current_start = 0
+    
+    for cut_pos, sim in similarities:
+        # Kiểm tra xem cắt tại đây có tạo chunk hợp lý không
+        chunk1 = sorted_group[current_start:cut_pos]
+        chunk1_chars = sum(sentence_lengths[idx] for idx in chunk1)
+        
+        # Chỉ cắt nếu chunk đầu không quá nhỏ và không vượt quá giới hạn
+        if len(chunk1) >= 2 and chunk1_chars <= max_chunk_size:
+            # Kiểm tra phần còn lại có cần chia tiếp không
+            remaining = sorted_group[cut_pos:]
+            remaining_chars = sum(sentence_lengths[idx] for idx in remaining)
+            
+            if remaining_chars > max_chunk_size:
+                # Cần chia tiếp, chấp nhận điểm cắt này
+                cut_points.append(cut_pos)
+                current_start = cut_pos
+            else:
+                # Phần còn lại đã OK, có thể dừng
+                break
+    
+    return cut_points
+
+def split_oversized_chunks(groups, sentences, sentence_lengths, max_chunk_size, silent=True):
+    """
+    Chia các chunk quá lớn thành các chunk nhỏ hơn.
+    
+    Args:
+        groups: List các group indices
+        sentences: List các câu
+        sentence_lengths: List độ dài từng câu
+        max_chunk_size: Kích thước tối đa cho phép
+        silent: Có in log không
+    
+    Returns:
+        List các group đã được chia nhỏ
+    """
+    if not groups:
+        return groups
+    
+    final_groups = []
+    split_count = 0
+    oversized_chunks = []
+    
+    for group_idx, group in enumerate(groups):
+        group_chars = sum(sentence_lengths[idx] for idx in group)
+        
+        if group_chars <= max_chunk_size:
+            # Chunk đã OK, giữ nguyên
+            final_groups.append(group)
+            if not silent:
+                print(f"    Chunk {group_idx}: {len(group)} sentences, {group_chars} chars ✓")
+        else:
+            # Chunk quá lớn, cần chia nhỏ
+            oversized_chunks.append((group_idx, group_chars))
+            
+            if not silent:
+                print(f"    Chunk {group_idx}: {len(group)} sentences, {group_chars} chars - SPLITTING...")
+            
+            sub_groups = split_large_group(group, sentence_lengths, max_chunk_size, silent)
+            final_groups.extend(sub_groups)
+            split_count += 1
+            
+            if not silent:
+                total_sub_chars = sum(sum(sentence_lengths[idx] for idx in sub_group) for sub_group in sub_groups)
+                print(f"      → Split into {len(sub_groups)} sub-chunks, total: {total_sub_chars} chars")
+    
+    # Debug logging even in silent mode if splits occurred
+    if split_count > 0:
+        if not silent:
+            print(f"  Split {split_count} oversized chunks into smaller ones")
+        else:
+            # Minimal debug info for silent mode
+            max_oversized = max(oversized_chunks, key=lambda x: x[1])[1] if oversized_chunks else 0
+            print(f"[AUTO_SPLIT] Split {split_count} chunks (largest was {max_oversized} chars, limit: {max_chunk_size})")
+    
+    return final_groups
+
+def split_large_group(group, sentence_lengths, max_chunk_size, silent=True):
+    """
+    Chia một group lớn thành các group nhỏ hơn.
+    
+    Chiến lược: Chia tuần tự, đảm bảo mỗi sub-group không vượt quá max_chunk_size
+    """
+    if not group:
+        return []
+    
+    # Sắp xếp group theo thứ tự ban đầu để duy trì tính liên tục
+    sorted_group = sorted(group)
+    sub_groups = []
+    current_sub_group = []
+    current_chars = 0
+    
+    for sentence_idx in sorted_group:
+        sentence_chars = sentence_lengths[sentence_idx]
+        
+        # Kiểm tra nếu thêm câu này có vượt quá giới hạn không
+        if current_chars + sentence_chars <= max_chunk_size:
+            # An toàn để thêm
+            current_sub_group.append(sentence_idx)
+            current_chars += sentence_chars
+        else:
+            # Vượt quá giới hạn
+            if current_sub_group:
+                # Lưu sub-group hiện tại
+                sub_groups.append(current_sub_group.copy())
+                if not silent:
+                    print(f"        Sub-chunk: {len(current_sub_group)} sentences, {current_chars} chars")
+                
+                # Bắt đầu sub-group mới
+                current_sub_group = [sentence_idx]
+                current_chars = sentence_chars
+            else:
+                # Trường hợp đặc biệt: câu đơn lẻ vượt quá giới hạn
+                # Vẫn phải giữ lại để bảo toàn nội dung
+                current_sub_group = [sentence_idx]
+                current_chars = sentence_chars
+                if not silent:
+                    print(f" Single sentence exceeds limit: {sentence_chars} chars")
+    
+    # Thêm sub-group cuối cùng nếu có
+    if current_sub_group:
+        sub_groups.append(current_sub_group)
+        if not silent:
+            print(f"        Sub-chunk: {len(current_sub_group)} sentences, {current_chars} chars")
+    
+    return sub_groups
+
 def balance_remaining_sentences(remaining_indices, sentences, sentence_lengths, 
                               target_sentences_per_chunk, min_chunk_size, max_chunk_size, silent=True):
     """
     Balance remaining ungrouped sentences into appropriately sized chunks.
+    MODIFIED: Now preserves ALL sentences, no minimum size filtering.
     """
     if not remaining_indices:
         return []
@@ -679,37 +880,46 @@ def balance_remaining_sentences(remaining_indices, sentences, sentence_lengths,
     remaining = remaining_indices.copy()
     
     if not silent:
-        print(f"    Balancing {len(remaining)} remaining sentences")
+        print(f"    Preserving {len(remaining)} remaining sentences (no content loss)")
     
-    # Group remaining sentences by size targets
+    # Group remaining sentences, avoiding only oversized chunks
     while remaining:
         if len(remaining) <= target_sentences_per_chunk:
-            # Last group - take all remaining
+            # Last group - take all remaining to preserve content
             group_chars = sum(sentence_lengths[idx] for idx in remaining)
             if not silent:
-                print(f"    Final group: {len(remaining)} sentences, {group_chars} chars")
+                print(f"    Final group: {len(remaining)} sentences, {group_chars} chars ✓")
             groups.append(remaining.copy())
             break
         
-        # Create optimally sized group
+        # Create group up to max size limit
         current_group = []
         current_chars = 0
         
-        # Take sentences up to target size
-        for idx in remaining[:target_sentences_per_chunk]:
-            current_group.append(idx)
-            current_chars += sentence_lengths[idx]
+        # Take sentences up to maximum size limit (not minimum)
+        for idx in remaining:
+            sentence_chars = sentence_lengths[idx]
             
-            # Stop if we reach good size
-            if current_chars >= min_chunk_size and len(current_group) >= 2:
-                break
+            # Only check if adding would exceed MAXIMUM limit
+            if current_chars + sentence_chars <= max_chunk_size:
+                current_group.append(idx)
+                current_chars += sentence_chars
+            else:
+                # If current group has at least one sentence, stop here
+                if current_group:
+                    break
+                else:
+                    # If single sentence exceeds max, take it anyway to preserve content
+                    current_group.append(idx)
+                    current_chars += sentence_chars
+                    break
         
         if current_group:
             groups.append(current_group)
             remaining = [idx for idx in remaining if idx not in current_group]
             
             if not silent:
-                print(f"    Balanced group: {len(current_group)} sentences, {current_chars} chars")
+                print(f"    Preserved group: {len(current_group)} sentences, {current_chars} chars ✓")
         else:
             # Fallback - take first sentence to avoid infinite loop
             groups.append([remaining[0]])
@@ -719,11 +929,17 @@ def balance_remaining_sentences(remaining_indices, sentences, sentence_lengths,
 
 def process_semantic_grouping_optimized(sim_matrix, sentences, initial_threshold, decay_factor, min_threshold, silent=True):
     """
-    Wrapper function that delegates to the new balanced chunking algorithm.
-    Maintains backward compatibility while using the new balanced approach.
+    ORIGINAL semantic grouping algorithm without size constraints.
+    
+    This function maintains backward compatibility for true "no limit" semantic grouping.
+    Uses range-based grouping with similarity thresholds only, no size balancing.
     """
-    return process_semantic_grouping_with_balanced_chunks(
-        sim_matrix, sentences, initial_threshold, decay_factor, min_threshold, silent=silent
+    # Call the original range-based algorithm from Semantic_Grouping.py
+    from Method.Semantic_Grouping import semantic_spreading_grouping_optimized
+    
+    return semantic_spreading_grouping_optimized(
+        sim_matrix, sentences, initial_threshold, decay_factor, min_threshold, 
+        min_chunk_len=0, max_chunk_len=float('inf'), silent=silent
     )
 
 def format_oie_triples_to_string(triples_list: List[Dict[str, str]], max_triples: Optional[int] = None) -> Optional[str]:
@@ -984,14 +1200,15 @@ def semantic_grouping_main(
         
         num_sentences = len(valid_indices)
         
-        # Check sentence count requirement only
-        meets_sentence_requirement = num_sentences >= min_sentences_per_chunk
+        # Check sentence count requirement only - ACCEPT ALL CHUNKS to preserve content
+        meets_sentence_requirement = True  # Accept all chunks regardless of size
         
         if meets_sentence_requirement:
             final_chunks.append((chunk_id, final_chunk_text, oie_string))
             if not silent:
-                print(f"   ✓ Chunk {i}: {num_sentences} sentences")
+                print(f"   ✓ Chunk {i}: {num_sentences} sentences (preserved)")
         else:
+            # This branch should never be reached now, but keep for safety
             if not silent:
                 print(f"   ✗ Chunk {i}: {num_sentences} sentences < {min_sentences_per_chunk} (discarded)")
 

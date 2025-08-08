@@ -208,7 +208,8 @@ def create_and_split_datapack(input_file: str, train_ratio: float, has_header: b
     :param input_file: Đường dẫn đến file TSV.
     :param train_ratio: Tỷ lệ cho tập huấn luyện (không sử dụng khi chỉ tạo CV folds).
     :param has_header: True nếu file có dòng tiêu đề.
-    :param create_cv_folds: True để tạo 5-fold cross-validation (mặc định True).
+    :param create_cv_folds: True để tạo cross-validation (mặc định True).
+    :param n_folds: Số lượng folds cho CV
     
     Note: Script này được sửa đổi để chỉ tạo Cross-Validation folds, 
           không tạo train_pack.dam và test_pack.dam riêng biệt.
@@ -216,6 +217,17 @@ def create_and_split_datapack(input_file: str, train_ratio: float, has_header: b
     print(f"Đang xử lý file: {input_file}")
     output_dir = os.path.dirname(input_file)
     
+    # Check file size first to determine processing strategy
+    file_size_mb = os.path.getsize(input_file) / (1024 * 1024)
+    print(f"File size: {file_size_mb:.1f} MB")
+    
+    # For very large files (>500MB), use chunked processing
+    if file_size_mb > 500:
+        print("Large file detected. Using memory-optimized processing...")
+        create_cv_folds_from_large_file(input_file, has_header, n_folds, output_dir)
+        return
+
+    # Original processing for smaller files
     # 1) Đọc file TSV
     try:
         if has_header:
@@ -265,7 +277,7 @@ def create_and_split_datapack(input_file: str, train_ratio: float, has_header: b
     # 6) Tạo Cross-Validation folds
     try:
         if create_cv_folds:
-            print("\n--- Tạo 5-Fold Cross-Validation ---")
+            print(f"\n--- Tạo {n_folds}-Fold Cross-Validation ---")
             create_cv_folds_datapack(pack, output_dir, n_folds)
         else:
             print("Không tạo cross-validation folds.")
@@ -274,81 +286,331 @@ def create_and_split_datapack(input_file: str, train_ratio: float, has_header: b
         print(f"Lỗi khi tạo CV folds: {e}")
         sys.exit(1)
 
+
+def create_cv_folds_from_large_file(input_file: str, has_header: bool, n_folds: int, output_dir: str):
+    """
+    Xử lý file lớn bằng cách đọc từng chunk và tạo CV folds trực tiếp
+    """
+    try:
+        import gc
+        
+        cv_dir = os.path.join(output_dir, 'cv_folds')
+        os.makedirs(cv_dir, exist_ok=True)
+        
+        print("Processing large file with chunked reading...")
+        
+        # First pass: count total rows
+        print("Counting total rows...")
+        total_rows = 0
+        chunksize = 10000
+        
+        for chunk in pd.read_csv(input_file, sep='\t', chunksize=chunksize, header=0 if has_header else None):
+            if not has_header and len(chunk.columns) == 3:
+                chunk.columns = ['text_left', 'text_right', 'label']
+            elif has_header:
+                chunk = chunk.rename(columns={
+                    chunk.columns[0]: 'text_left',
+                    chunk.columns[1]: 'text_right',
+                    chunk.columns[2]: 'label'
+                })
+            
+            # Clean chunk
+            chunk['label'] = pd.to_numeric(chunk['label'], errors='coerce')
+            chunk.dropna(subset=['text_left', 'text_right', 'label'], inplace=True)
+            total_rows += len(chunk)
+            
+        print(f"Total valid rows: {total_rows:,}")
+        
+        # Calculate fold boundaries
+        fold_size = total_rows // n_folds
+        remainder = total_rows % n_folds
+        
+        fold_boundaries = []
+        current_pos = 0
+        for i in range(n_folds):
+            fold_len = fold_size + (1 if i < remainder else 0)
+            fold_boundaries.append((current_pos, current_pos + fold_len))
+            current_pos += fold_len
+        
+        print(f"Fold sizes: {[end - start for start, end in fold_boundaries]}")
+        
+        # Create temporary files for each fold
+        temp_files = {
+            f'fold_{i+1}_train': [] for i in range(n_folds)
+        }
+        temp_files.update({
+            f'fold_{i+1}_test': [] for i in range(n_folds)
+        })
+        
+        # Second pass: distribute data to folds
+        print("Distributing data to folds...")
+        current_row = 0
+        
+        for chunk in pd.read_csv(input_file, sep='\t', chunksize=chunksize, header=0 if has_header else None):
+            if not has_header and len(chunk.columns) == 3:
+                chunk.columns = ['text_left', 'text_right', 'label']
+            elif has_header:
+                chunk = chunk.rename(columns={
+                    chunk.columns[0]: 'text_left',
+                    chunk.columns[1]: 'text_right', 
+                    chunk.columns[2]: 'label'
+                })
+            
+            # Clean chunk
+            chunk['label'] = pd.to_numeric(chunk['label'], errors='coerce')
+            chunk.dropna(subset=['text_left', 'text_right', 'label'], inplace=True)
+            chunk.reset_index(drop=True, inplace=True)
+            
+            for idx, row in chunk.iterrows():
+                # Determine which fold this row belongs to for test
+                test_fold = None
+                for fold_idx, (start, end) in enumerate(fold_boundaries):
+                    if start <= current_row < end:
+                        test_fold = fold_idx
+                        break
+                
+                if test_fold is not None:
+                    # Add to test set of this fold
+                    temp_files[f'fold_{test_fold+1}_test'].append(row.to_dict())
+                    
+                    # Add to train sets of all other folds
+                    for train_fold in range(n_folds):
+                        if train_fold != test_fold:
+                            temp_files[f'fold_{train_fold+1}_train'].append(row.to_dict())
+                
+                current_row += 1
+            
+            if current_row % 50000 == 0:
+                print(f"  Processed {current_row:,}/{total_rows:,} rows...")
+        
+        # Create DataPacks from accumulated data
+        print("Creating DataPacks...")
+        fold_info = []
+        
+        for fold_idx in range(n_folds):
+            try:
+                train_data = temp_files[f'fold_{fold_idx+1}_train']
+                test_data = temp_files[f'fold_{fold_idx+1}_test']
+                
+                if train_data and test_data:
+                    train_df = pd.DataFrame(train_data)
+                    test_df = pd.DataFrame(test_data)
+                    
+                    train_pack = mz.pack(train_df)
+                    test_pack = mz.pack(test_df)
+                    
+                    train_path = os.path.join(cv_dir, f'fold_{fold_idx+1}_train.dam')
+                    test_path = os.path.join(cv_dir, f'fold_{fold_idx+1}_test.dam')
+                    
+                    train_pack.save(train_path)
+                    test_pack.save(test_path)
+                    
+                    fold_info.append({
+                        'fold': fold_idx + 1,
+                        'train_size': len(train_pack),
+                        'test_size': len(test_pack),
+                        'train_path': train_path,
+                        'test_path': test_path
+                    })
+                    
+                    print(f"✓ Fold {fold_idx+1}: {len(train_pack):,} train, {len(test_pack):,} test")
+                    
+                    del train_df, test_df, train_pack, test_pack
+                    gc.collect()
+                    
+            except Exception as e:
+                print(f"✗ Error creating fold {fold_idx+1}: {e}")
+        
+        # Save fold info
+        if fold_info:
+            fold_info_path = os.path.join(cv_dir, 'fold_info.txt')
+            with open(fold_info_path, 'w', encoding='utf-8') as f:
+                f.write(f"{n_folds}-Fold Cross-Validation Information (Large File Processing)\n")
+                f.write("=" * 50 + "\n\n")
+                f.write(f"Total dataset size: {total_rows:,} samples\n\n")
+                
+                for info in fold_info:
+                    f.write(f"Fold {info['fold']}:\n")
+                    f.write(f"  Train: {info['train_size']:,} samples -> {info['train_path']}\n") 
+                    f.write(f"  Test:  {info['test_size']:,} samples -> {info['test_path']}\n\n")
+            
+            print(f"\n✓ Successfully created {len(fold_info)}/{n_folds} folds using large file processing!")
+            print(f"✓ Output directory: {cv_dir}")
+            print(f"✓ Details saved to: {fold_info_path}")
+        
+    except Exception as e:
+        print(f"✗ Error in large file processing: {e}")
+        import traceback
+        traceback.print_exc()
+
 def create_cv_folds_datapack(full_pack: mz.DataPack, output_dir: str, n_folds: int = 5):
     """
-    Tạo 5-fold cross-validation từ toàn bộ dataset.
+    Tạo n-fold cross-validation từ toàn bộ dataset với memory optimization.
     
     :param full_pack: DataPack chứa toàn bộ dữ liệu để chia thành các folds
     :param output_dir: Thư mục lưu các folds
     :param n_folds: Số lượng folds (mặc định 5)
     """
     try:
+        import gc
+        from typing import List, Tuple
+        
         # Tạo thư mục con cho CV folds
         cv_dir = os.path.join(output_dir, 'cv_folds')
         os.makedirs(cv_dir, exist_ok=True)
         
-        # Lấy dữ liệu từ full_pack để xử lý với KFold
-        # MatchZoo DataPack.unpack() trả về tuple (data_dict, labels_array)
-        data_dict, labels_array = full_pack.unpack()
+        print(f"Starting memory-optimized {n_folds}-fold CV creation...")
         
-        # Tạo DataFrame từ dữ liệu đã unpack
-        df_full = pd.DataFrame({
-            'text_left': data_dict['text_left'],
-            'text_right': data_dict['text_right'], 
-            'label': labels_array.flatten()  # flatten để chuyển từ 2D array thành 1D
-        })
+        # Lấy size của dataset
+        total_size = len(full_pack)
+        print(f"Total dataset size: {total_size:,} samples")
         
-        print(f"Dữ liệu CV: {len(df_full)} mẫu")
+        # Tính fold size
+        fold_size = total_size // n_folds
+        remainder = total_size % n_folds
         
-        # Tạo KFold splitter
-        kfold = KFold(n_splits=n_folds, shuffle=True, random_state=42)
+        print(f"Base fold size: {fold_size:,} samples")
+        if remainder > 0:
+            print(f"Some folds will have +1 sample (remainder: {remainder})")
+        
+        # Tạo indices cho từng fold
+        fold_indices = []
+        start_idx = 0
+        
+        for fold_idx in range(n_folds):
+            # Some folds get +1 sample for remainder
+            current_fold_size = fold_size + (1 if fold_idx < remainder else 0)
+            end_idx = start_idx + current_fold_size
+            
+            fold_indices.append((start_idx, end_idx))
+            start_idx = end_idx
         
         fold_info = []
         
-        for fold_idx, (train_indices, test_indices) in enumerate(kfold.split(df_full)):
-            print(f"Đang tạo Fold {fold_idx + 1}/{n_folds}...")
+        # Xử lý từng fold một để tránh memory overflow
+        for fold_idx in range(n_folds):
+            print(f"\nCreating Fold {fold_idx + 1}/{n_folds}...")
             
-            # Chia dữ liệu theo indices
-            fold_train_df = df_full.iloc[train_indices].reset_index(drop=True)
-            fold_test_df = df_full.iloc[test_indices].reset_index(drop=True)
+            # Lấy test indices cho fold hiện tại
+            test_start, test_end = fold_indices[fold_idx]
+            test_size = test_end - test_start
             
-            # Tạo DataPack cho từng fold
-            fold_train_pack = mz.pack(fold_train_df)
-            fold_test_pack = mz.pack(fold_test_df)
+            # Train indices là tất cả indices khác
+            train_size = total_size - test_size
             
-            # Lưu các fold
-            fold_train_path = os.path.join(cv_dir, f'fold_{fold_idx + 1}_train.dam')
-            fold_test_path = os.path.join(cv_dir, f'fold_{fold_idx + 1}_test.dam')
+            print(f"  Train size: {train_size:,}, Test size: {test_size:,}")
             
-            fold_train_pack.save(fold_train_path)
-            fold_test_pack.save(fold_test_path)
-            
-            fold_info.append({
-                'fold': fold_idx + 1,
-                'train_size': len(fold_train_pack),
-                'test_size': len(fold_test_pack),
-                'train_path': fold_train_path,
-                'test_path': fold_test_path
-            })
-            
-            print(f"  Fold {fold_idx + 1}: {len(fold_train_pack)} train, {len(fold_test_pack)} test")
+            try:
+                # Tạo train pack (tất cả trừ fold hiện tại)
+                train_data_left = []
+                train_data_right = []
+                train_labels = []
+                
+                # Collect train data from other folds in chunks to manage memory
+                chunk_size = min(10000, fold_size)  # Process in smaller chunks
+                
+                for other_fold_idx in range(n_folds):
+                    if other_fold_idx == fold_idx:
+                        continue  # Skip current test fold
+                        
+                    other_start, other_end = fold_indices[other_fold_idx]
+                    
+                    # Process this fold in chunks
+                    for chunk_start in range(other_start, other_end, chunk_size):
+                        chunk_end = min(chunk_start + chunk_size, other_end)
+                        
+                        # Extract chunk from full_pack
+                        chunk_indices = list(range(chunk_start, chunk_end))
+                        chunk_pack = full_pack[chunk_indices]
+                        
+                        # Unpack chunk data
+                        chunk_data, chunk_labels = chunk_pack.unpack()
+                        
+                        # Append to train data
+                        train_data_left.extend(chunk_data['text_left'])
+                        train_data_right.extend(chunk_data['text_right'])
+                        train_labels.extend(chunk_labels.flatten())
+                        
+                        # Clean up chunk to free memory
+                        del chunk_pack, chunk_data, chunk_labels
+                        gc.collect()
+                
+                # Create train DataFrame and pack
+                train_df = pd.DataFrame({
+                    'text_left': train_data_left,
+                    'text_right': train_data_right,
+                    'label': train_labels
+                })
+                
+                fold_train_pack = mz.pack(train_df)
+                
+                # Clean up train data to free memory
+                del train_data_left, train_data_right, train_labels, train_df
+                gc.collect()
+                
+                # Create test pack
+                test_indices = list(range(test_start, test_end))
+                fold_test_pack = full_pack[test_indices]
+                
+                # Save fold packs
+                fold_train_path = os.path.join(cv_dir, f'fold_{fold_idx + 1}_train.dam')
+                fold_test_path = os.path.join(cv_dir, f'fold_{fold_idx + 1}_test.dam')
+                
+                fold_train_pack.save(fold_train_path)
+                fold_test_pack.save(fold_test_path)
+                
+                fold_info.append({
+                    'fold': fold_idx + 1,
+                    'train_size': len(fold_train_pack),
+                    'test_size': len(fold_test_pack),
+                    'train_path': fold_train_path,
+                    'test_path': fold_test_path
+                })
+                
+                print(f"  ✓ Saved: {len(fold_train_pack):,} train, {len(fold_test_pack):,} test")
+                
+                # Clean up fold packs
+                del fold_train_pack, fold_test_pack
+                gc.collect()
+                
+            except Exception as e:
+                print(f"  ✗ Error creating fold {fold_idx + 1}: {e}")
+                continue
         
         # Lưu thông tin về các folds
-        fold_info_path = os.path.join(cv_dir, 'fold_info.txt')
-        with open(fold_info_path, 'w', encoding='utf-8') as f:
-            f.write("5-Fold Cross-Validation Information\n")
-            f.write("=" * 40 + "\n\n")
-            for info in fold_info:
-                f.write(f"Fold {info['fold']}:\n")
-                f.write(f"  Train: {info['train_size']} samples -> {info['train_path']}\n")
-                f.write(f"  Test:  {info['test_size']} samples -> {info['test_path']}\n\n")
+        if fold_info:
+            fold_info_path = os.path.join(cv_dir, 'fold_info.txt')
+            with open(fold_info_path, 'w', encoding='utf-8') as f:
+                f.write(f"{n_folds}-Fold Cross-Validation Information\n")
+                f.write("=" * 40 + "\n\n")
+                f.write(f"Total dataset size: {total_size:,} samples\n\n")
+                
+                total_train = 0
+                total_test = 0
+                
+                for info in fold_info:
+                    f.write(f"Fold {info['fold']}:\n")
+                    f.write(f"  Train: {info['train_size']:,} samples -> {info['train_path']}\n")
+                    f.write(f"  Test:  {info['test_size']:,} samples -> {info['test_path']}\n\n")
+                    
+                    total_train += info['train_size']
+                    total_test += info['test_size']
+                
+                f.write(f"Summary:\n")
+                f.write(f"  Successfully created: {len(fold_info)}/{n_folds} folds\n")
+                f.write(f"  Average train size: {total_train // len(fold_info):,} samples\n")
+                f.write(f"  Average test size: {total_test // len(fold_info):,} samples\n")
 
-        print(f"\nĐã tạo {n_folds}-fold cross-validation thành công!")
-        print(f"Thư mục output: {cv_dir}")
-        print(f"Chi tiết folds: {fold_info_path}")
+            print(f"\n✓ Successfully created {len(fold_info)}/{n_folds} folds!")
+            print(f"✓ Output directory: {cv_dir}")
+            print(f"✓ Details saved to: {fold_info_path}")
+        else:
+            print(f"\n✗ Failed to create any folds!")
         
     except Exception as e:
-        print(f"Lỗi khi tạo CV folds: {e}")
+        print(f"✗ Error in CV folds creation: {e}")
+        import traceback
+        traceback.print_exc()
         return
 
 if __name__ == "__main__":

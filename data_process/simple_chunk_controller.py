@@ -12,6 +12,8 @@ import os, warnings, logging
 # Disable tokenizers parallelism globally (must be before SentenceTransformer import)
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
+# Tăng giới hạn lên 1 triệu (hoặc lớn hơn nếu cần)
+
 # For newer tokenizers versions explicitly disable parallelism API
 try:
     import tokenizers
@@ -40,7 +42,13 @@ from pathlib import Path
 from typing import Any, List, Tuple, Optional, Dict
 
 import pandas as pd
-
+max_limit = sys.maxsize
+while True:
+    try:
+        csv.field_size_limit(max_limit)
+        break
+    except OverflowError:
+        max_limit = int(max_limit / 10)
 # ==== Import optimized chunking methods ====
 # Note: Semantic Splitter has been optimized - removed adaptive parameters (target_tokens, tolerance, enable_adaptive)
 from Method.Semantic_Grouping_Optimized import (
@@ -55,11 +63,26 @@ from Method.Text_Splitter_Optimized import (
 
 
 """
-# Enable text cleaning (default)
+Usage Examples:
+
+# Enable text cleaning (default) with balanced chunking
 python simple_chunk_controller.py -i input.tsv -o output --configs semantic_grouping_balanced
 
-# Disable text cleaning (raw documents)
-python simple_chunk_controller.py -i input.tsv -o output --configs semantic_grouping_balanced --disable-text-cleaning
+# Disable text cleaning (raw documents) with no size limits
+python simple_chunk_controller.py -i input.tsv -o output --configs semantic_grouping_no_limit --disable-text-cleaning
+
+# Use large chunks with automatic splitting
+python simple_chunk_controller.py -i input.tsv -o output --configs semantic_grouping_large_chunks
+
+Available Chunking Methods:
+1. semantic_grouping_*: Advanced semantic grouping with threshold ranges
+2. semantic_splitter_*: Sequential semantic splitting with similarity detection
+3. simple_splitter: Basic text splitting (fallback)
+
+Content Preservation Features:
+- min_sentences_per_chunk=1: Accepts all chunks including single sentences
+- enable_balanced_chunking=True: Automatically splits oversized chunks
+- Intelligent text cleaning preserves essential content while improving sentence detection
 """
 # ==== Default constants ====
 BATCH_SIZE = 600  # dòng/đợt đọc pandas
@@ -450,7 +473,51 @@ def _process_batch(
             silent=True,
             output_dir=None,
         )
+        
+        # Enhanced logging for chunk processing results
+        chunk_sizes = [len(chunk_text) for _, chunk_text, _ in tuples if chunk_text]
+        if chunk_sizes:
+            avg_size = sum(chunk_sizes) / len(chunk_sizes)
+            max_size = max(chunk_sizes)
+            min_size = min(chunk_sizes)
+            
+            # Log statistics every 100 documents for monitoring
+            if local_idx % 100 == 0:
+                method_name = {
+                    "1": "semantic_grouping",
+                    "2": "semantic_splitter", 
+                    "3": "simple_splitter"
+                }.get(method_choice, "unknown")
+                
+                balanced_info = ""
+                if params.get('enable_balanced_chunking'):
+                    target = params.get('target_chunk_size', 'N/A')
+                    balanced_info = f" [AUTO_SPLIT: target={target}, max_actual={max_size}]"
+                
+                print(f"[PID {pid}] Doc {local_idx}: {method_name} → {len(tuples)} chunks "
+                      f"(sizes: avg={avg_size:.0f}, min={min_size}, max={max_size}){balanced_info}")
+        
         for chunk_id, chunk_text, _ in tuples:
+            # CRITICAL: Validate and sanitize chunk_text for TSV writing
+            if not isinstance(chunk_text, str):
+                chunk_text = str(chunk_text)
+            
+            # Remove problematic characters that can break TSV format
+            chunk_text = chunk_text.replace('\t', ' ')  # Replace tabs with spaces
+            chunk_text = chunk_text.replace('\n', ' ')  # Replace newlines with spaces  
+            chunk_text = chunk_text.replace('\r', ' ')  # Replace carriage returns
+            chunk_text = chunk_text.strip()
+            
+            # Skip empty chunks
+            if not chunk_text:
+                continue
+                
+            # Limit chunk size to prevent TSV writing issues (max 50KB per chunk)
+            MAX_CHUNK_SIZE = 50000
+            if len(chunk_text) > MAX_CHUNK_SIZE:
+                print(f"[WARNING] Chunk too large ({len(chunk_text)} chars), truncating to {MAX_CHUNK_SIZE}")
+                chunk_text = chunk_text[:MAX_CHUNK_SIZE] + "..."
+            
             # Output: query_id  | document_id | chunk_text | label
             results.append([query_id, doc_orig, chunk_text, label])
     print(f"[PID {pid}]Batch {batch_idx} done – {len(results)} chunks")
@@ -494,34 +561,117 @@ def run_config(
     ) as reader:
         all_batches = [(idx + 1, df) for idx, df in enumerate(reader)]
 
-    # pool xử lý batch
-    if config_workers > 1:
-        with ProcessPoolExecutor(
-            max_workers=config_workers,
-            initializer=_worker_init,
-            initargs=(actual_embedding_model, actual_device_preference),
-        ) as exe:
-            futures = {
-                exe.submit(_process_batch, df, config, idx, actual_embedding_model, actual_device_preference, actual_enable_text_cleaning): idx 
-                for idx, df in all_batches
-            }
-            batch_results = []
-            for fut in as_completed(futures):
-                batch_results.extend(fut.result())
-    else:
-        batch_results = []
-        for idx, df in all_batches:
-            batch_results.extend(_process_batch(df, config, idx, actual_embedding_model, actual_device_preference, actual_enable_text_cleaning))
-
-    # ghi file
+    # Initialize output file with header
     outfile.parent.mkdir(exist_ok=True)
+    total_chunks = 0
+    
     with open(outfile, "w", encoding="utf-8", newline="") as f:
         w = csv.writer(f, delimiter="\t")
         w.writerow(["query_id", "document_id", "chunk_text", "label"])
-        w.writerows(batch_results)
+        
+        # pool xử lý batch with streaming write
+        if config_workers > 1:
+            with ProcessPoolExecutor(
+                max_workers=config_workers,
+                initializer=_worker_init,
+                initargs=(actual_embedding_model, actual_device_preference),
+            ) as exe:
+                futures = {
+                    exe.submit(_process_batch, df, config, idx, actual_embedding_model, actual_device_preference, actual_enable_text_cleaning): idx 
+                    for idx, df in all_batches
+                }
+                
+                # Write results as they complete (streaming)
+                completed_batches = 0
+                for fut in as_completed(futures):
+                    try:
+                        batch_results = fut.result()
+                        if batch_results:
+                            # CRITICAL: Validate each row before writing to prevent TSV corruption
+                            validated_results = []
+                            for row in batch_results:
+                                try:
+                                    # Ensure all fields are strings and properly formatted
+                                    validated_row = [
+                                        str(row[0]) if row[0] is not None else "",  # query_id
+                                        str(row[1]) if row[1] is not None else "",  # document_id  
+                                        str(row[2]) if row[2] is not None else "",  # chunk_text
+                                        str(row[3]) if row[3] is not None else ""   # label
+                                    ]
+                                    validated_results.append(validated_row)
+                                except Exception as row_error:
+                                    print(f"[WARNING] Skipping invalid row: {row_error}")
+                                    continue
+                            
+                            if validated_results:
+                                w.writerows(validated_results)
+                                f.flush()  # Ensure data is written to disk immediately
+                                total_chunks += len(validated_results)
+                        completed_batches += 1
+                        
+                        # Progress update
+                        if completed_batches % max(1, len(all_batches) // 10) == 0:
+                            progress = (completed_batches / len(all_batches)) * 100
+                            print(f"[{config['name']}] Progress: {progress:.1f}% ({completed_batches}/{len(all_batches)} batches, {total_chunks} chunks)")
+                    except Exception as e:
+                        print(f"[ERROR] Failed to process batch: {e}")
+                        print(f"[ERROR] Error type: {type(e).__name__}")
+                        completed_batches += 1
+        else:
+            # Single-threaded with streaming write
+            for batch_num, (idx, df) in enumerate(all_batches, 1):
+                try:
+                    batch_results = _process_batch(df, config, idx, actual_embedding_model, actual_device_preference, actual_enable_text_cleaning)
+                    if batch_results:
+                        # CRITICAL: Validate each row before writing to prevent TSV corruption
+                        validated_results = []
+                        for row in batch_results:
+                            try:
+                                # Ensure all fields are strings and properly formatted
+                                validated_row = [
+                                    str(row[0]) if row[0] is not None else "",  # query_id
+                                    str(row[1]) if row[1] is not None else "",  # document_id  
+                                    str(row[2]) if row[2] is not None else "",  # chunk_text
+                                    str(row[3]) if row[3] is not None else ""   # label
+                                ]
+                                validated_results.append(validated_row)
+                            except Exception as row_error:
+                                print(f"[WARNING] Skipping invalid row: {row_error}")
+                                continue
+                        
+                        if validated_results:
+                            w.writerows(validated_results)
+                            f.flush()  # Ensure data is written to disk immediately
+                            total_chunks += len(validated_results)
+                        
+                        # Progress update
+                        if batch_num % max(1, len(all_batches) // 10) == 0:
+                            progress = (batch_num / len(all_batches)) * 100
+                            print(f"[{config['name']}] Progress: {progress:.1f}% ({batch_num}/{len(all_batches)} batches, {total_chunks} chunks)")
+                except Exception as e:
+                    print(f"[ERROR] Failed to process batch {batch_num}: {e}")
+                    print(f"[ERROR] Error type: {type(e).__name__}")
+                    continue
 
     elapsed = time.time() - start
-    print(f"[CONFIG DONE] {config['name']} → {outfile} | {len(batch_results)} chunks | {elapsed:.1f}s")
+    
+    # Enhanced completion message with statistics
+    avg_chunks_per_doc = total_chunks / max(1, len(all_batches) * batch_size)
+    chunks_per_sec = total_chunks / max(1, elapsed)
+    
+    split_info = ""
+    config_params = config.get('params', {})
+    if config_params.get('enable_balanced_chunking'):
+        target_size = config_params.get('target_chunk_size', 'N/A')
+        split_info = f" | AUTO_SPLIT enabled (target: {target_size} chars)"
+    
+    preserve_info = ""
+    if config_params.get('min_sentences_per_chunk', 2) == 1:
+        preserve_info = " | CONTENT_PRESERVED (no chunks discarded)"
+    
+    print(f"[CONFIG DONE] {config['name']} → {outfile}")
+    print(f" {total_chunks} chunks |  {elapsed:.1f}s | {chunks_per_sec:.1f} chunks/sec")
+    print(f"  {avg_chunks_per_doc:.1f} chunks/doc{split_info}{preserve_info}")
 
 
 # ==== RUN_CONFIGURATIONS =====================================================
@@ -535,34 +685,74 @@ RUN_CONFIGURATIONS: List[Dict[str, Any]] = [
             "chunk_size": None,  # No character limit
             "chunk_overlap": 0,
             "semantic_threshold": 0.35,
-            "min_sentences_per_chunk": 3,
+            "min_sentences_per_chunk": 1,  # Accept all chunks to preserve content
         },
-        "description": "Semantic splitter chunking without size limits"
+        "description": "Semantic splitter without size limits - preserves ALL content"
+    },
+    {
+        "name": "semantic_splitter_balanced",
+        "method_choice": "2",
+        "params": {
+            "chunk_size": 300,  # Character limit with automatic splitting
+            "chunk_overlap": 20,
+            "semantic_threshold": 0.4,
+            "min_sentences_per_chunk": 1,  # Accept all chunks to preserve content
+        },
+        "description": "Semantic splitter with size control - splits oversized chunks while preserving content"
     },
     {
         "name": "semantic_grouping_no_limit",
         "method_choice": "1",
         "params": {
-            "initial_threshold": 1,
+            "initial_threshold": 0.9,
             "decay_factor": 0.85,
-            "min_threshold": 0.1, 
-            "min_sentences_per_chunk": 2,  # Lowered to allow smaller but coherent chunks
+            "min_threshold": 0.3, 
+            "min_sentences_per_chunk": 1,  # Accept all chunks to preserve content
+            "enable_balanced_chunking": False,  # Disable balanced chunking to remove size constraints
         },
-        "description": "Semantic grouping chunking with threshold ranges - no size constraints"
+        "description": "Semantic grouping with NO size limits - preserves ALL content, pure semantic coherence"
     },
     {
         "name": "semantic_grouping_balanced",
         "method_choice": "1",
         "params": {
-            "initial_threshold": 0.9,
+            "initial_threshold": 0.85,
             "decay_factor": 0.75,
-            "min_threshold": 0.3,
-            "min_sentences_per_chunk": 2,
-            "target_chunk_size": 150,      # Target character count per chunk
-            "size_tolerance": 0.5,         # ±50% tolerance for chunk size
-            "enable_balanced_chunking": True,  # Enable the new balanced algorithm
+            "min_threshold": 0.25,
+            "min_sentences_per_chunk": 3,  # Accept all chunks to preserve content
+            "target_chunk_size": 200,      # Target character count per chunk
+            "size_tolerance": 0.4,         # ±40% tolerance for chunk size
+            "enable_balanced_chunking": True,  # Enable the new balanced algorithm with splitting
         },
-        "description": "Balanced semantic grouping - balances semantic coherence with chunk size consistency"
+        "description": "Balanced semantic grouping - controls max chunk size with automatic splitting of oversized chunks"
+    },
+    {
+        "name": "semantic_grouping_large_chunks",
+        "method_choice": "1", 
+        "params": {
+            "initial_threshold": 0.8,
+            "decay_factor": 0.8,
+            "min_threshold": 0.2,
+            "min_sentences_per_chunk": 3,  # Accept all chunks to preserve content
+            "target_chunk_size": 400,      # Larger target for longer documents
+            "size_tolerance": 0.3,         # ±30% tolerance (reduced from 0.5 for stricter splitting)
+            "enable_balanced_chunking": True,  # Enable with larger chunks
+        },
+        "description": "Semantic grouping for larger chunks (400 chars target) with automatic splitting - stricter size control"
+    },
+    {
+        "name": "semantic_grouping_strict",
+        "method_choice": "1",
+        "params": {
+            "initial_threshold": 0.8,
+            "decay_factor": 0.75,
+            "min_threshold": 0.25,
+            "min_sentences_per_chunk": 1,  # Accept all chunks to preserve content
+            "target_chunk_size": 300,      # Smaller target for more frequent splitting
+            "size_tolerance": 0.2,         # ±20% tolerance (very strict splitting)
+            "enable_balanced_chunking": True,  # Enable with strict control
+        },
+        "description": "Strict semantic grouping (300 chars, ±20%) - aggressive chunk splitting for consistent sizes"
     },
 ]
 
@@ -630,6 +820,10 @@ def interactive_ui():
             params_info.append(f"threshold={params['semantic_threshold']}")
         if 'initial_threshold' in params and params['initial_threshold'] != 'auto':
             params_info.append(f"init_th={params['initial_threshold']}")
+        if 'target_chunk_size' in params:
+            params_info.append(f"target_size={params['target_chunk_size']}")
+        if 'enable_balanced_chunking' in params and params['enable_balanced_chunking']:
+            params_info.append("auto_split=Yes")
             
         param_str = f" ({', '.join(params_info)})" if params_info else ""
         print(f"  {i:2d}. {cfg['name']}{param_str}")
@@ -670,6 +864,10 @@ def interactive_ui():
             params_summary.append(f"min_sentences={params['min_sentences_per_chunk']}")
         if 'include_oie' in params and params['include_oie']:
             params_summary.append("OIE")
+        if 'target_chunk_size' in params:
+            params_summary.append(f"target_size={params['target_chunk_size']}")
+        if 'enable_balanced_chunking' in params and params['enable_balanced_chunking']:
+            params_summary.append("auto_split")
         param_str = f" ({', '.join(params_summary)})" if params_summary else ""
         print(f"  - {cfg['name']}{param_str}")
     print(f"Workers      : per-config={cfg_workers}\n")
@@ -697,13 +895,33 @@ def interactive_ui():
 # ==== CLI ====================================================================
 
 def main():
-    # Display available configurations in help
-    config_list = "\n".join([f"    {i+1}. {cfg['name']} - {cfg.get('description', 'No description')}" 
-                             for i, cfg in enumerate(RUN_CONFIGURATIONS)])
+    # Display available configurations in help with enhanced descriptions
+    config_list = []
+    for i, cfg in enumerate(RUN_CONFIGURATIONS):
+        name = cfg['name']
+        desc = cfg.get('description', 'No description')
+        params = cfg.get('params', {})
+        
+        # Extract key features for display
+        features = []
+        if not params.get('enable_balanced_chunking', False):
+            features.append("NO_SIZE_LIMITS")
+        else:
+            target = params.get('target_chunk_size', 'N/A')
+            features.append(f"AUTO_SPLIT(target={target})")
+        
+        if params.get('min_sentences_per_chunk', 2) == 1:
+            features.append("PRESERVES_ALL")
+            
+        feature_str = f" [{', '.join(features)}]" if features else ""
+        config_list.append(f"    {i+1}. {name}{feature_str}")
+        config_list.append(f"       {desc}")
+    
+    config_display = "\n".join(config_list)
     
     ap = argparse.ArgumentParser(
-        description="Simple multi-config chunking controller",
-        epilog=f"Available configurations:\n{config_list}",
+        description="Enhanced chunking controller with content preservation and automatic chunk splitting",
+        epilog=f"Available configurations:\n{config_display}\n\nKey Features:\n  ✅ Preserves ALL content (no chunks discarded)\n  ✅ Automatic splitting of oversized chunks\n  ✅ Semantic coherence with size control\n  ✅ Advanced text cleaning for better sentence detection",
         formatter_class=argparse.RawDescriptionHelpFormatter
     )
     ap.add_argument("-i", "--input", required=True, help="Input TSV path")

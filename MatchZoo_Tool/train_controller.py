@@ -5,20 +5,27 @@ MatchZoo Training Controller with CLI
 CLI interface để train các mô hình MatchZoo với dataset đã được chunked.
 
 Usage Examples:
-    # Train một model cụ thể
-    python train_controller.py --model ArcII --data-pack f:/SematicSearch/[method]semantic_grouping/train_pack.dam --epochs 10 --device cpu
+    # CV Fold mode (Recommended)
+    python train_controller.py --model MatchPyramid --train-data cv_folds/fold_1_train.dam --test-data cv_folds/fold_1_test.dam --epochs 50 --device cuda --batch-size 64 --lr 0.001
+    
+    # Auto-detect test file từ train file  
+    python train_controller.py --model ArcII --data-pack cv_folds/fold_1_train.dam --epochs 10 --device cpu
+
+    # Legacy mode: directory chứa train_pack.dam và test_pack.dam
+    python train_controller.py --model ArcII --data-pack f:/SematicSearch/[method]semantic_grouping --epochs 10 --device cpu
 
     # Train nhiều models liên tiếp
-    python train_controller.py --model ArcII KNRM ESIM --data-pack f:/SematicSearch/[method]semantic_grouping/train_pack.dam --epochs 5
+    python train_controller.py --model ArcII KNRM ESIM --train-data cv_folds/fold_1_train.dam --test-data cv_folds/fold_1_test.dam --epochs 5
 
     # Sử dụng custom output directory
-    python train_controller.py --model ArcII --data-pack f:/path/to/datapack --output-dir ./custom_models --epochs 10
+    python train_controller.py --model ArcII --train-data cv_folds/fold_1_train.dam --test-data cv_folds/fold_1_test.dam --output-dir ./custom_models --epochs 10
 
     # Với device cụ thể
-    python train_controller.py --model ArcII --data-pack f:/path/to/datapack --device cuda --batch-size 32
+    python train_controller.py --model MatchPyramid --train-data cv_folds/fold_1_train.dam --test-data cv_folds/fold_1_test.dam --device cuda --batch-size 32
 
 Features:
     - Hỗ trợ tất cả các model: ArcII, KNRM, Conv-KNRM, ESIM, MatchLSTM, MatchPyramid, MVLSTM
+    - CV Fold support: trực tiếp sử dụng fold_X_train.dam và fold_X_test.dam
     - Device auto-detection: DirectML (AMD GPU), CUDA (NVIDIA), CPU fallback
     - Configurable hyperparameters qua CLI
     - Progress logging và model saving
@@ -147,12 +154,19 @@ MODEL_CONFIGS = {
         'class': mz.models.MatchPyramid,
         'preprocessor': lambda: mz.models.MatchPyramid.get_default_preprocessor(),
         'padding_callback': lambda: mz.models.MatchPyramid.get_default_padding_callback(),
-        'model_params': {},
+        'model_params': {
+            'kernel_count': [12, 24],  # Further reduced from [16, 32] 
+            'kernel_size': [[3, 3], [3, 3]],
+            'dpool_size': [3, 10],
+            'dropout_rate': 0.3  # Add dropout for regularization
+        },
         'training_params': {
             'optimizer_class': torch.optim.Adam,
-            'batch_size': 16,
-            'num_dup': 5,
+            'batch_size': 4,  # Further reduced from 8 to 4 for VRAM efficiency
+            'num_dup': 2,     # Reduced from 3 to 2
             'num_neg': 1,
+            'gradient_accumulation_steps': 2,  # Accumulate 2 steps to maintain effective batch size of 8
+            'memory_efficient': True  # Enable memory efficient training
         }
     },
     'MVLSTM': {
@@ -232,11 +246,27 @@ class ModelTrainer:
     """Class để huấn luyện các mô hình MatchZoo"""
     
     def __init__(self, 
-                 data_pack_dir: str, 
+                 data_pack_dir: str = None,
+                 train_pack_path: str = None,
+                 test_pack_path: str = None, 
                  output_dir: str = "Trained_model",
                  device: str = "auto",
                  verbose: bool = True):
-        self.data_pack_dir = Path(data_pack_dir)
+        
+        # Handle both legacy and new CV fold modes
+        if data_pack_dir:
+            # Legacy mode: directory with train_pack.dam and test_pack.dam
+            self.data_pack_dir = Path(data_pack_dir)
+            self.train_pack_path = None
+            self.test_pack_path = None
+        elif train_pack_path and test_pack_path:
+            # CV fold mode: direct file paths
+            self.data_pack_dir = None
+            self.train_pack_path = Path(train_pack_path)
+            self.test_pack_path = Path(test_pack_path)
+        else:
+            raise ValueError("Cần chỉ định data_pack_dir HOẶC (train_pack_path và test_pack_path)")
+            
         self.output_dir = Path(output_dir)
         self.device = configure_device(device)
         self.verbose = verbose
@@ -244,24 +274,39 @@ class ModelTrainer:
         # Tạo output directory
         self.output_dir.mkdir(exist_ok=True)
         
-        # Validate data pack directory
-        if not self.data_pack_dir.exists():
-            raise FileNotFoundError(f"Data pack directory không tồn tại: {data_pack_dir}")
+        # Validate and load data packs
+        if self.data_pack_dir:
+            # Validate data pack directory
+            if not self.data_pack_dir.exists():
+                raise FileNotFoundError(f"Data pack directory không tồn tại: {self.data_pack_dir}")
+        else:
+            # Validate direct file paths
+            if not self.train_pack_path.exists():
+                raise FileNotFoundError(f"Train pack file không tồn tại: {self.train_pack_path}")
+            if not self.test_pack_path.exists():
+                raise FileNotFoundError(f"Test pack file không tồn tại: {self.test_pack_path}")
         
         self._load_data_packs()
         
     def _load_data_packs(self):
-        """Tải DataPacks từ thư mục"""
-        train_pack_path = self.data_pack_dir / 'train_pack.dam'
-        test_pack_path = self.data_pack_dir / 'test_pack.dam'
-        
-        if not train_pack_path.exists():
-            raise FileNotFoundError(f"Không tìm thấy train_pack.dam trong {self.data_pack_dir}")
-        if not test_pack_path.exists():
-            raise FileNotFoundError(f"Không tìm thấy test_pack.dam trong {self.data_pack_dir}")
+        """Tải DataPacks từ thư mục hoặc files cụ thể"""
+        if self.data_pack_dir:
+            # Legacy mode: tìm files trong directory
+            train_pack_path = self.data_pack_dir / 'train_pack.dam'
+            test_pack_path = self.data_pack_dir / 'test_pack.dam'
+            
+            if not train_pack_path.exists():
+                raise FileNotFoundError(f"Không tìm thấy train_pack.dam trong {self.data_pack_dir}")
+            if not test_pack_path.exists():
+                raise FileNotFoundError(f"Không tìm thấy test_pack.dam trong {self.data_pack_dir}")
+        else:
+            # CV fold mode: sử dụng direct paths
+            train_pack_path = self.train_pack_path
+            test_pack_path = self.test_pack_path
         
         if self.verbose:
-            print(f"Loading DataPacks từ {self.data_pack_dir}")
+            print(f"Loading train pack từ: {train_pack_path}")
+            print(f"Loading test pack từ: {test_pack_path}")
         
         self.train_pack_raw = mz.load_data_pack(str(train_pack_path))
         self.test_pack_raw = mz.load_data_pack(str(test_pack_path))
@@ -297,12 +342,32 @@ class ModelTrainer:
         model_output_dir = self.output_dir / f"{model_name.lower()}_model"
         model_output_dir.mkdir(exist_ok=True)
         
-        if self.verbose:
-            print(f"\n🚀 Bắt đầu huấn luyện model {model_name}")
-            print(f"   📁 Output: {model_output_dir}")
-            print(f"   🔄 Epochs: {epochs}")
-            print(f"   💾 Device: {self.device}")
+        # Auto-adjust batch size for MatchPyramid if not specified
+        if model_name == 'MatchPyramid' and batch_size is None:
+            default_batch_size = config['training_params']['batch_size']
+            if self.device.type == 'cuda':
+                # Further reduce for GPU to prevent VRAM overflow
+                recommended_batch_size = max(1, default_batch_size // 2)
+                if self.verbose:
+                    print(f"MatchPyramid auto-adjustment: batch_size {default_batch_size} → {recommended_batch_size} (VRAM optimization)")
+                batch_size = recommended_batch_size
         
+        if self.verbose:
+            print(f"\nBắt đầu huấn luyện model {model_name}")
+            print(f"   Output: {model_output_dir}")
+            print(f"   Epochs: {epochs}")
+            print(f"   Device: {self.device}")
+            
+            # Special warnings for MatchPyramid
+            if model_name == 'MatchPyramid':
+                actual_batch_size = batch_size or config['training_params']['batch_size']
+                print(f"   MatchPyramid Memory Settings:")
+                print(f"     - Batch size: {actual_batch_size} (memory optimized)")
+                print(f"     - Kernel count: {config['model_params']['kernel_count']} (reduced)")
+                print(f"     - Memory efficient mode: {config['training_params'].get('memory_efficient', False)}")
+                if actual_batch_size > 4:
+                    print(f"   WARNING: Batch size > 4 may cause VRAM issues on MatchPyramid")
+
         try:
             # 1. Setup task và metrics
             task = self._setup_task(config)
@@ -332,7 +397,7 @@ class ModelTrainer:
             # 6. Setup optimizer
             optimizer, scheduler = self._setup_optimizer(model, config, learning_rate)
             
-            # 7. Train
+            # 7. Train with memory monitoring
             trainer = self._setup_trainer(
                 model, optimizer, trainloader, testloader, 
                 epochs, model_output_dir, config, scheduler
@@ -340,8 +405,66 @@ class ModelTrainer:
             
             if self.verbose:
                 print(f"Bắt đầu huấn luyện với {sum(p.numel() for p in model.parameters() if p.requires_grad):,} parameters")
+                
+                # Print initial GPU memory usage
+                if self.device.type == 'cuda':
+                    print(f"Initial GPU memory: {torch.cuda.memory_allocated(self.device) / 1024**3:.2f}GB allocated")
             
-            trainer.run()
+            # Monitor memory during training with auto-retry for MatchPyramid
+            current_batch_size = batch_size or config['training_params']['batch_size']
+            max_retries = 3 if model_name == 'MatchPyramid' else 1
+            
+            for retry_attempt in range(max_retries):
+                try:
+                    if retry_attempt > 0:
+                        # Rebuild with smaller batch size
+                        if self.verbose:
+                            print(f"\nRetry #{retry_attempt}: Rebuilding with batch_size={current_batch_size}")
+                        
+                        # Clear previous objects
+                        del trainer, trainloader, testloader
+                        if hasattr(torch.cuda, 'empty_cache') and self.device.type == 'cuda':
+                            torch.cuda.empty_cache()
+                        gc.collect()
+                        
+                        # Rebuild dataloaders with smaller batch size
+                        trainloader, testloader = self._create_dataloaders(
+                            train_pack_processed, 
+                            test_pack_processed,
+                            config,
+                            current_batch_size
+                        )
+                        
+                        # Rebuild trainer
+                        trainer = self._setup_trainer(
+                            model, optimizer, trainloader, testloader, 
+                            epochs, model_output_dir, config, scheduler
+                        )
+                    
+                    trainer.run()
+                    break  # Success, exit retry loop
+                    
+                except RuntimeError as e:
+                    if "out of memory" in str(e).lower() and retry_attempt < max_retries - 1:
+                        print(f"\nGPU Out of Memory Error! (Attempt {retry_attempt + 1}/{max_retries})")
+                        
+                        # Auto-reduce batch size for next attempt
+                        current_batch_size = max(1, current_batch_size // 2)
+                        print(f"   Auto-reducing batch size to: {current_batch_size}")
+                        
+                        if hasattr(torch.cuda, 'empty_cache'):
+                            torch.cuda.empty_cache()
+                        gc.collect()
+                        
+                        continue  # Try again with smaller batch size
+                    else:
+                        # Final attempt failed or non-memory error
+                        print(f"\nGPU Out of Memory Error! (Final attempt)")
+                        print(f"   Current batch size: {current_batch_size}")
+                        print(f"   Recommendation: Use --batch-size 1 or switch to CPU training")
+                        if hasattr(torch.cuda, 'empty_cache'):
+                            torch.cuda.empty_cache()
+                        raise
             
             # 8. Save
             trainer.save_model()
@@ -356,10 +479,40 @@ class ModelTrainer:
             print(f"Lỗi khi huấn luyện {model_name}: {e}")
             raise
         finally:
-            # Cleanup memory
+            # Aggressive memory cleanup
+            try:
+                if 'trainer' in locals():
+                    del trainer
+                if 'model' in locals():
+                    del model
+                if 'optimizer' in locals():
+                    del optimizer
+                if 'scheduler' in locals() and scheduler:
+                    del scheduler
+                if 'trainloader' in locals():
+                    del trainloader
+                if 'testloader' in locals():
+                    del testloader
+                if 'embedding_matrix' in locals():
+                    del embedding_matrix
+                if 'train_pack_processed' in locals():
+                    del train_pack_processed
+                if 'test_pack_processed' in locals():
+                    del test_pack_processed
+            except:
+                pass
+                
+            # Force garbage collection
             gc.collect()
-            if hasattr(torch.cuda, 'empty_cache'):
+            
+            # Clear GPU cache
+            if hasattr(torch.cuda, 'empty_cache') and self.device.type == 'cuda':
                 torch.cuda.empty_cache()
+                torch.cuda.synchronize()
+                
+                if self.verbose:
+                    print(f"Memory cleanup completed")
+                    print(f"Final GPU memory: {torch.cuda.memory_allocated(self.device) / 1024**3:.2f}GB allocated")
     
     def _setup_task(self, config: Dict[str, Any]) -> mz.tasks.Ranking:
         """Setup ranking task với metrics"""
@@ -408,6 +561,9 @@ class ModelTrainer:
         """Tạo DataLoaders cho training và testing"""
         training_params = config['training_params']
         
+        # Special memory efficient mode for MatchPyramid
+        memory_efficient = training_params.get('memory_efficient', False)
+        
         trainset = mz.dataloader.Dataset(
             data_pack=train_pack_processed,
             mode='pair',
@@ -419,10 +575,13 @@ class ModelTrainer:
             shuffle=True
         )
         
+        # Reduce test batch size for memory efficient models
+        test_batch_size = batch_size // 2 if memory_efficient else batch_size
+        
         testset = mz.dataloader.Dataset(
             data_pack=test_pack_processed,
             mode='point',
-            batch_size=batch_size,
+            batch_size=test_batch_size,
             shuffle=False
         )
         
@@ -451,7 +610,7 @@ class ModelTrainer:
                      config: Dict[str, Any],
                      task: mz.tasks.Ranking,
                      embedding_matrix: np.ndarray,
-                     custom_params: Optional[Dict[str, Any]] = None) -> mz.models.Model:
+                     custom_params: Optional[Dict[str, Any]] = None):
         """Build và configure model"""
         model = config['class']()
         model.params['task'] = task
@@ -474,7 +633,7 @@ class ModelTrainer:
         return model
     
     def _setup_optimizer(self, 
-                        model: mz.models.Model,
+                        model,
                         config: Dict[str, Any],
                         learning_rate: Optional[float] = None) -> Tuple[torch.optim.Optimizer, Optional[Any]]:
         """Setup optimizer và scheduler"""
@@ -498,7 +657,7 @@ class ModelTrainer:
         return optimizer, scheduler
     
     def _setup_trainer(self,
-                      model: mz.models.Model,
+                      model,
                       optimizer: torch.optim.Optimizer,
                       trainloader: mz.dataloader.DataLoader,
                       testloader: mz.dataloader.DataLoader,
@@ -506,7 +665,7 @@ class ModelTrainer:
                       save_dir: Path,
                       config: Dict[str, Any],
                       scheduler: Optional[Any] = None) -> mz.trainers.Trainer:
-        """Setup trainer"""
+        """Setup trainer with memory optimization"""
         training_params = config['training_params']
         
         trainer_kwargs = {
@@ -514,7 +673,7 @@ class ModelTrainer:
             'optimizer': optimizer,
             'trainloader': trainloader,
             'validloader': testloader,
-            'validate_interval': None,
+            'validate_interval': 1,  # Validate every epoch to monitor memory
             'epochs': epochs,
             'device': self.device,
             'save_dir': str(save_dir)
@@ -526,7 +685,58 @@ class ModelTrainer:
         if 'clip_norm' in training_params:
             trainer_kwargs['clip_norm'] = training_params['clip_norm']
         
-        return mz.trainers.Trainer(**trainer_kwargs)
+        # Create trainer with memory management callback
+        trainer = mz.trainers.Trainer(**trainer_kwargs)
+        
+        # Add aggressive memory cleanup callback for MatchPyramid
+        original_run_epoch = trainer._run_epoch
+        is_matchpyramid = 'MatchPyramid' in str(type(model))
+        
+        def memory_optimized_run_epoch(stage):
+            result = original_run_epoch(stage)
+            
+            # Aggressive cleanup for MatchPyramid
+            if is_matchpyramid:
+                # Clear gradients explicitly
+                if hasattr(model, 'zero_grad'):
+                    model.zero_grad()
+                if hasattr(optimizer, 'zero_grad'):
+                    optimizer.zero_grad()
+                
+                # Force cleanup after each epoch
+                if hasattr(torch.cuda, 'empty_cache') and self.device.type == 'cuda':
+                    torch.cuda.empty_cache()
+                    torch.cuda.synchronize()
+                    # Double cleanup for MatchPyramid
+                    torch.cuda.empty_cache()
+                    
+                # Aggressive garbage collection
+                gc.collect()
+                gc.collect()  # Double GC for MatchPyramid
+                
+            else:
+                # Standard cleanup for other models
+                if hasattr(torch.cuda, 'empty_cache') and self.device.type == 'cuda':
+                    torch.cuda.empty_cache()
+                    torch.cuda.synchronize()
+                    
+                gc.collect()
+            
+            # Print memory usage if verbose
+            if self.verbose and self.device.type == 'cuda':
+                allocated = torch.cuda.memory_allocated(self.device) / 1024**3
+                cached = torch.cuda.memory_reserved(self.device) / 1024**3
+                print(f"   GPU Memory - Allocated: {allocated:.2f}GB, Cached: {cached:.2f}GB")
+                
+                # Warning for MatchPyramid if memory usage is high
+                if is_matchpyramid and allocated > 18.0:  # Warning at 18GB for 22GB VRAM
+                    print(f"   WARNING: High memory usage detected! Consider reducing batch size further.")
+            
+            return result
+        
+        trainer._run_epoch = memory_optimized_run_epoch
+        
+        return trainer
 
 # ===== CLI Functions =====
 def parse_arguments():
@@ -560,8 +770,17 @@ Examples:
     
     parser.add_argument(
         '--data-pack',
-        required=True,
-        help='Đường dẫn đến thư mục chứa train_pack.dam và test_pack.dam'
+        help='Đường dẫn đến thư mục chứa train_pack.dam và test_pack.dam (legacy mode)'
+    )
+    
+    parser.add_argument(
+        '--train-data',
+        help='Đường dẫn đến train data pack file (e.g., fold_1_train.dam)'
+    )
+    
+    parser.add_argument(
+        '--test-data',
+        help='Đường dẫn đến test data pack file (e.g., fold_1_test.dam)'
     )
     
     parser.add_argument(
@@ -618,14 +837,54 @@ def main():
     # Handle quiet mode
     verbose = args.verbose and not args.quiet
     
+    # Validate data arguments
+    if args.train_data and args.test_data:
+        # New CV fold mode: direct file paths
+        train_pack_path = args.train_data
+        test_pack_path = args.test_data
+        data_pack_dir = None
+    elif args.data_pack:
+        # Legacy mode: directory with train_pack.dam and test_pack.dam
+        data_pack_dir = args.data_pack
+        train_pack_path = None
+        test_pack_path = None
+    else:
+        # Auto-detect from data_pack argument
+        if args.data_pack and args.data_pack.endswith('.dam'):
+            # Single file provided, try to infer test file
+            train_pack_path = args.data_pack
+            if 'train' in train_pack_path:
+                test_pack_path = train_pack_path.replace('train', 'test')
+            else:
+                print("Lỗi: Không thể tự động tìm test file từ train file.")
+                print("Sử dụng --train-data và --test-data để chỉ định cụ thể.")
+                sys.exit(1)
+            data_pack_dir = None
+        else:
+            print("Lỗi: Cần chỉ định dữ liệu:")
+            print("  - Sử dụng --train-data và --test-data cho CV folds")
+            print("  - Hoặc --data-pack cho thư mục chứa train_pack.dam và test_pack.dam")
+            sys.exit(1)
+    
     try:
         # Initialize trainer
-        trainer = ModelTrainer(
-            data_pack_dir=args.data_pack,
-            output_dir=args.output_dir,
-            device=args.device,
-            verbose=verbose
-        )
+        if data_pack_dir:
+            # Legacy mode
+            trainer = ModelTrainer(
+                data_pack_dir=data_pack_dir,
+                output_dir=args.output_dir,
+                device=args.device,
+                verbose=verbose
+            )
+        else:
+            # CV fold mode
+            trainer = ModelTrainer(
+                train_pack_path=train_pack_path,
+                test_pack_path=test_pack_path,
+                output_dir=args.output_dir,
+                device=args.device,
+                verbose=verbose
+            )
         
         trained_models = []
         
