@@ -48,16 +48,16 @@ MODEL_CONFIGS = {
         'class': mz.models.ArcII,
         'preprocessor': lambda: mz.models.ArcII.get_default_preprocessor(
             filter_mode='df',
-            filter_low_freq=2,
+            filter_low_freq=5,
         ),
         'padding_callback': lambda: mz.models.ArcII.get_default_padding_callback(
-            fixed_length_left=10,
+            fixed_length_left=16,
             fixed_length_right=256,
             pad_word_value=0,
             pad_word_mode='pre'
         ),
         'model_params': {
-            'left_length': 10,
+            'left_length': 16,
             'right_length': 256,
             'kernel_1d_count': 32,
             'kernel_1d_size': 3,
@@ -68,17 +68,17 @@ MODEL_CONFIGS = {
         },
         'training_params': {
             'optimizer_class': torch.optim.Adam,
-            'batch_size': 20,
-            'num_dup': 2,
+            'batch_size': 12,
+            'num_dup': 1,
             'num_neg': 1,
         }
     },
     'KNRM': {
         'class': mz.models.KNRM,
         'preprocessor': lambda: mz.preprocessors.BasicPreprocessor(
-            truncated_length_left=10,
-            truncated_length_right=40,
-            filter_low_freq=2
+            truncated_length_left=16,
+            truncated_length_right=64,
+            filter_low_freq=5
         ),
         'padding_callback': lambda: mz.models.KNRM.get_default_padding_callback(),
         'model_params': {
@@ -88,8 +88,8 @@ MODEL_CONFIGS = {
         },
         'training_params': {
             'optimizer_class': torch.optim.Adadelta,
-            'batch_size': 20,
-            'num_dup': 5,
+            'batch_size': 12,
+            'num_dup': 1,
             'num_neg': 1,
         }
     },
@@ -111,10 +111,12 @@ MODEL_CONFIGS = {
             'optimizer_kwargs': {},
             'scheduler_class': torch.optim.lr_scheduler.StepLR,
             'scheduler_kwargs': {'step_size': 3},
-            'batch_size': 20,
-            'num_dup': 5,
+            'batch_size': 4,
+            'num_dup': 1,
             'num_neg': 1,
-            'clip_norm': 10
+            'clip_norm': 10,
+            'memory_efficient': True,
+            'gradient_accumulation_steps': 2
         }
     },
     'ESIM': {
@@ -129,10 +131,10 @@ MODEL_CONFIGS = {
         },
         'training_params': {
             'optimizer_class': torch.optim.Adadelta,
-            'batch_size': 20,
-            'num_dup': 5,
-            'num_neg': 10,
-            'loss': mz.losses.RankCrossEntropyLoss(num_neg=10)
+            'batch_size': 8,
+            'num_dup': 1,
+            'num_neg': 1,
+            'loss': mz.losses.RankCrossEntropyLoss(num_neg=1)
         }
     },
     'MatchLSTM': {
@@ -144,10 +146,10 @@ MODEL_CONFIGS = {
         },
         'training_params': {
             'optimizer_class': torch.optim.Adadelta,
-            'batch_size': 20,
-            'num_dup': 5,
-            'num_neg': 10,
-            'loss': mz.losses.RankCrossEntropyLoss(num_neg=10)
+            'batch_size': 8,
+            'num_dup': 1,
+            'num_neg': 1,
+            'loss': mz.losses.RankCrossEntropyLoss(num_neg=1)
         }
     },
     'MatchPyramid': {
@@ -163,10 +165,11 @@ MODEL_CONFIGS = {
         'training_params': {
             'optimizer_class': torch.optim.Adam,
             'batch_size': 4,  # Further reduced from 8 to 4 for VRAM efficiency
-            'num_dup': 2,     # Reduced from 3 to 2
+            'num_dup': 1,     # Reduced for dataset scale
             'num_neg': 1,
             'gradient_accumulation_steps': 2,  # Accumulate 2 steps to maintain effective batch size of 8
-            'memory_efficient': True  # Enable memory efficient training
+            'memory_efficient': True,  # Enable memory efficient training
+            'aggressive_batch_cleanup': True  # NEW: free VRAM every batch
         }
     },
     'MVLSTM': {
@@ -176,13 +179,26 @@ MODEL_CONFIGS = {
         'model_params': {},
         'training_params': {
             'optimizer_class': torch.optim.Adadelta,
-            'batch_size': 16,
-            'num_dup': 5,
-            'num_neg': 10,
-            'loss': mz.losses.RankCrossEntropyLoss(num_neg=10)
+            'batch_size': 8,
+            'num_dup': 1,
+            'num_neg': 1,
+            'loss': mz.losses.RankCrossEntropyLoss(num_neg=1)
         }
     }
 }
+
+# ===== Helpers =====
+def _is_memory_error(exc: Exception) -> bool:
+    """Detect both GPU and CPU out-of-memory errors."""
+    msg = str(exc).lower()
+    return (
+        isinstance(exc, MemoryError)
+        or 'out of memory' in msg
+        or 'cuda' in msg and 'memory' in msg
+        or 'cublas' in msg and 'alloc' in msg
+        or 'cannot allocate memory' in msg
+        or 'bad_alloc' in msg
+    )
 
 # ===== Device Configuration =====
 def configure_device(device_preference: str = "auto") -> torch.device:
@@ -410,9 +426,10 @@ class ModelTrainer:
                 if self.device.type == 'cuda':
                     print(f"Initial GPU memory: {torch.cuda.memory_allocated(self.device) / 1024**3:.2f}GB allocated")
             
-            # Monitor memory during training with auto-retry for MatchPyramid
+            # Monitor memory during training with auto-retry and batch backoff
             current_batch_size = batch_size or config['training_params']['batch_size']
-            max_retries = 3 if model_name == 'MatchPyramid' else 1
+            min_batch_size = 1
+            max_retries = 3 if model_name == 'MatchPyramid' else 2
             
             for retry_attempt in range(max_retries):
                 try:
@@ -444,26 +461,36 @@ class ModelTrainer:
                     trainer.run()
                     break  # Success, exit retry loop
                     
-                except RuntimeError as e:
-                    if "out of memory" in str(e).lower() and retry_attempt < max_retries - 1:
-                        print(f"\nGPU Out of Memory Error! (Attempt {retry_attempt + 1}/{max_retries})")
-                        
+                except Exception as e:
+                    if _is_memory_error(e) and retry_attempt < max_retries - 1:
+                        print(f"\n[Memory] OOM detected! (Attempt {retry_attempt + 1}/{max_retries})")
                         # Auto-reduce batch size for next attempt
-                        current_batch_size = max(1, current_batch_size // 2)
+                        new_batch_size = max(min_batch_size, current_batch_size // 2)
+                        if new_batch_size == current_batch_size and current_batch_size > min_batch_size:
+                            new_batch_size = max(min_batch_size, current_batch_size - 1)
+                        if new_batch_size == current_batch_size:
+                            print("   Cannot reduce batch size further.")
+                            raise
+                        current_batch_size = new_batch_size
                         print(f"   Auto-reducing batch size to: {current_batch_size}")
-                        
                         if hasattr(torch.cuda, 'empty_cache'):
-                            torch.cuda.empty_cache()
+                            try:
+                                torch.cuda.empty_cache()
+                            except Exception:
+                                pass
                         gc.collect()
-                        
                         continue  # Try again with smaller batch size
                     else:
                         # Final attempt failed or non-memory error
-                        print(f"\nGPU Out of Memory Error! (Final attempt)")
+                        print(f"\nTraining failed.")
                         print(f"   Current batch size: {current_batch_size}")
-                        print(f"   Recommendation: Use --batch-size 1 or switch to CPU training")
-                        if hasattr(torch.cuda, 'empty_cache'):
-                            torch.cuda.empty_cache()
+                        if _is_memory_error(e):
+                            print(f"   Recommendation: Use --batch-size 1 or switch to CPU training")
+                            if hasattr(torch.cuda, 'empty_cache'):
+                                try:
+                                    torch.cuda.empty_cache()
+                                except Exception:
+                                    pass
                         raise
             
             # 8. Save
@@ -667,7 +694,9 @@ class ModelTrainer:
                       scheduler: Optional[Any] = None) -> mz.trainers.Trainer:
         """Setup trainer with memory optimization"""
         training_params = config['training_params']
-        
+        grad_acc_steps = training_params.get('gradient_accumulation_steps', 1)
+        aggressive_batch_cleanup = training_params.get('aggressive_batch_cleanup', False)
+
         trainer_kwargs = {
             'model': model,
             'optimizer': optimizer,
@@ -678,64 +707,56 @@ class ModelTrainer:
             'device': self.device,
             'save_dir': str(save_dir)
         }
-        
         if scheduler:
             trainer_kwargs['scheduler'] = scheduler
-        
         if 'clip_norm' in training_params:
             trainer_kwargs['clip_norm'] = training_params['clip_norm']
-        
-        # Create trainer with memory management callback
         trainer = mz.trainers.Trainer(**trainer_kwargs)
-        
-        # Add aggressive memory cleanup callback for MatchPyramid
+
+        # --- Patch batch run for gradient accumulation & cleanup ---
+        original_run_batch = trainer._run_batch
+        def patched_run_batch(stage, batch):
+            # Expect original returns (y_pred, y_true) or loss dict
+            result = original_run_batch(stage, batch)
+            if aggressive_batch_cleanup:
+                # Free per-batch cached memory aggressively
+                if hasattr(torch.cuda, 'empty_cache') and self.device.type == 'cuda':
+                    try:
+                        torch.cuda.empty_cache()
+                    except Exception:
+                        pass
+                gc.collect()
+            return result
+        trainer._run_batch = patched_run_batch
+
+        # --- Patch epoch run for accumulation and memory stats ---
         original_run_epoch = trainer._run_epoch
         is_matchpyramid = 'MatchPyramid' in str(type(model))
-        
         def memory_optimized_run_epoch(stage):
+            if self.device.type == 'cuda':
+                start_alloc = torch.cuda.memory_allocated(self.device)
+                start_reserved = torch.cuda.memory_reserved(self.device)
             result = original_run_epoch(stage)
-            
-            # Aggressive cleanup for MatchPyramid
-            if is_matchpyramid:
-                # Clear gradients explicitly
-                if hasattr(model, 'zero_grad'):
-                    model.zero_grad()
-                if hasattr(optimizer, 'zero_grad'):
-                    optimizer.zero_grad()
-                
-                # Force cleanup after each epoch
-                if hasattr(torch.cuda, 'empty_cache') and self.device.type == 'cuda':
+            # Epoch-level cleanup
+            if hasattr(model, 'zero_grad'):
+                model.zero_grad(set_to_none=True)
+            if hasattr(optimizer, 'zero_grad'):
+                optimizer.zero_grad(set_to_none=True)
+            if hasattr(torch.cuda, 'empty_cache') and self.device.type == 'cuda':
+                try:
                     torch.cuda.empty_cache()
-                    torch.cuda.synchronize()
-                    # Double cleanup for MatchPyramid
-                    torch.cuda.empty_cache()
-                    
-                # Aggressive garbage collection
-                gc.collect()
-                gc.collect()  # Double GC for MatchPyramid
-                
-            else:
-                # Standard cleanup for other models
-                if hasattr(torch.cuda, 'empty_cache') and self.device.type == 'cuda':
-                    torch.cuda.empty_cache()
-                    torch.cuda.synchronize()
-                    
-                gc.collect()
-            
-            # Print memory usage if verbose
-            if self.verbose and self.device.type == 'cuda':
-                allocated = torch.cuda.memory_allocated(self.device) / 1024**3
-                cached = torch.cuda.memory_reserved(self.device) / 1024**3
-                print(f"   GPU Memory - Allocated: {allocated:.2f}GB, Cached: {cached:.2f}GB")
-                
-                # Warning for MatchPyramid if memory usage is high
-                if is_matchpyramid and allocated > 18.0:  # Warning at 18GB for 22GB VRAM
-                    print(f"   WARNING: High memory usage detected! Consider reducing batch size further.")
-            
+                except Exception:
+                    pass
+            gc.collect()
+            if self.device.type == 'cuda':
+                mid_alloc = torch.cuda.memory_allocated(self.device)
+                mid_reserved = torch.cuda.memory_reserved(self.device)
+                if self.verbose:
+                    print(f"   [Memory] Epoch {trainer.epoch} stage={stage} alloc {start_alloc/1024**3:.2f}GB -> {mid_alloc/1024**3:.2f}GB | reserved {start_reserved/1024**3:.2f}GB -> {mid_reserved/1024**3:.2f}GB")
+                    if is_matchpyramid and mid_alloc/1024**3 > 18.0:
+                        print("   WARNING: High VRAM usage after cleanup. Consider reducing batch size or num_dup.")
             return result
-        
         trainer._run_epoch = memory_optimized_run_epoch
-        
         return trainer
 
 # ===== CLI Functions =====

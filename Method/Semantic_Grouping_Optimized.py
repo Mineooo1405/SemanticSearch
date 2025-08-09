@@ -17,11 +17,17 @@ import torch
 load_dotenv()
 
 def _normalize_device(device) -> str:
-    """Normalize device to 'cuda' or 'cpu'"""
-    if device is None:
-        return "cuda"
-    device_str = str(device).lower()
-    return "cuda" if device_str == "cuda" else "cpu"
+    """Normalize device to 'cuda' or 'cpu', with automatic fallback if CUDA is unavailable."""
+    try:
+        cuda_available = torch.cuda.is_available()
+    except Exception:
+        cuda_available = False
+    device_str = str(device).lower() if device is not None else None
+    if device_str in (None, "auto"):
+        return "cuda" if cuda_available else "cpu"
+    if device_str.startswith("cuda"):
+        return "cuda" if cuda_available else "cpu"
+    return "cpu"
 
 def _optimize_gpu_batch_size(sentences, base_batch_size, device):
     """Optimize batch size based on sentence complexity and GPU memory"""
@@ -82,29 +88,65 @@ def process_sentence_embedding_in_batches(sentences, model_name, batch_size=32, 
         batch = sentences[i:i + batch_size]
         batch_num = i // batch_size + 1
         total_batches = (len(sentences) + batch_size - 1) // batch_size
-        
+
         if not silent and (batch_num % max(1, total_batches // 10) == 0):  # Progress every 10%
             progress = (batch_num / total_batches) * 100
             print(f"  Embedding progress: {progress:.1f}% ({batch_num}/{total_batches})")
-        
-        try:
-            # For GPU, use larger internal batch size for better utilization
-            internal_batch_size = len(batch) if device == "cuda" else min(len(batch), 16)
-            batch_embeddings = embed_text_list(
-                batch, 
-                model_name=model_name, 
-                batch_size=internal_batch_size, 
-                device_preference=device
-            )
-            if batch_embeddings is not None and len(batch_embeddings) > 0:
-                all_embeddings.append(batch_embeddings)
-            else:
-                if not silent:
-                    print(f"Warning: Batch {batch_num} returned no embeddings.")
-        except Exception as e:
-            if not silent:
-                print(f"Error during batched embedding batch {batch_num}: {e}")
-                print(f"Device being used: {device}, Batch size: {len(batch)}")
+
+        # Adaptive sub-batching to avoid OOM
+        internal_batch_size = len(batch) if device == "cuda" else min(len(batch), 16)
+        cur_bs = max(1, internal_batch_size)
+        start_idx = 0
+        batch_embeds_list = []
+        while start_idx < len(batch):
+            end_idx = min(start_idx + cur_bs, len(batch))
+            sub_batch = batch[start_idx:end_idx]
+            try:
+                sub_embeddings = embed_text_list(
+                    sub_batch,
+                    model_name=model_name,
+                    batch_size=cur_bs,
+                    device_preference=device
+                )
+                if sub_embeddings is not None and len(sub_embeddings) > 0:
+                    batch_embeds_list.append(sub_embeddings)
+                    start_idx = end_idx
+                else:
+                    if not silent:
+                        print(f"Warning: Sub-batch returned no embeddings. Indices {start_idx}:{end_idx}")
+                    start_idx = end_idx
+            except Exception as e:
+                message = str(e).lower()
+                is_oom = ("out of memory" in message) or ("cuda" in message and "memory" in message) or (hasattr(torch, "cuda") and isinstance(e, getattr(torch.cuda, "OutOfMemoryError", RuntimeError)))
+                if is_oom and device == "cuda":
+                    if cur_bs <= 1:
+                        if not silent:
+                            print(f"OOM at batch {batch_num} even with batch_size=1, skipping these items.")
+                        start_idx = end_idx
+                        continue
+                    cur_bs = max(1, cur_bs // 2)
+                    try:
+                        torch.cuda.empty_cache()
+                    except Exception:
+                        pass
+                    if not silent:
+                        print(f"    OOM detected. Reducing sub-batch size to {cur_bs} and retrying...")
+                    continue
+                else:
+                    if not silent:
+                        print(f"Error during embedding at batch {batch_num}: {e}")
+                        print(f"Device: {device}, Attempted sub-batch size: {cur_bs}")
+                    # Skip this sub-batch to avoid blocking entire run
+                    start_idx = end_idx
+                    continue
+        if batch_embeds_list:
+            try:
+                all_embeddings.append(np.vstack(batch_embeds_list))
+            except Exception:
+                concatenated = []
+                for be in batch_embeds_list:
+                    concatenated.extend(list(be))
+                all_embeddings.append(np.array(concatenated))
 
     if not all_embeddings:
         if not silent:
@@ -475,7 +517,7 @@ def process_semantic_grouping_with_balanced_chunks(sim_matrix, sentences, initia
         # Split oversized chunks into smaller ones
         if groups:
             print(f"\n--- Splitting oversized chunks (max: {max_chunk_size} chars) ---")
-            groups = split_oversized_chunks(groups, sentences, sentence_lengths, max_chunk_size, silent)
+            groups = split_oversized_chunks(groups, sentences, sentence_lengths, sim_matrix, max_chunk_size, silent)
             print(f"Final result: {len(groups)} chunks after splitting")
         
         # Print size statistics
@@ -487,15 +529,9 @@ def process_semantic_grouping_with_balanced_chunks(sim_matrix, sentences, initia
         if group_sizes:
             print(f"Chunk size stats: min={min(group_sizes)}, max={max(group_sizes)}, avg={sum(group_sizes)/len(group_sizes):.1f}")
     else:
-        # Silent mode - still split oversized chunks but with minimal logging for debugging
+        # Silent mode - still split oversized chunks
         if groups:
-            groups_before = len(groups)
-            groups = split_oversized_chunks(groups, sentences, sentence_lengths, max_chunk_size, True)
-            groups_after = len(groups)
-            
-            # Log if splitting occurred (even in silent mode for debugging)
-            if groups_after > groups_before:
-                print(f"[DEBUG] Auto-split: {groups_before} → {groups_after} chunks (max_size: {max_chunk_size})")
+            groups = split_oversized_chunks(groups, sentences, sentence_lengths, sim_matrix, max_chunk_size, True)
         
     return groups
 
@@ -762,7 +798,7 @@ def find_semantic_cut_points(sorted_group, sim_matrix, sentence_lengths, max_chu
     
     return cut_points
 
-def split_oversized_chunks(groups, sentences, sentence_lengths, max_chunk_size, silent=True):
+def split_oversized_chunks(groups, sentences, sentence_lengths, sim_matrix, max_chunk_size, silent=True):
     """
     Chia các chunk quá lớn thành các chunk nhỏ hơn.
     
@@ -770,6 +806,7 @@ def split_oversized_chunks(groups, sentences, sentence_lengths, max_chunk_size, 
         groups: List các group indices
         sentences: List các câu
         sentence_lengths: List độ dài từng câu
+        sim_matrix: Ma trận tương đồng để hỗ trợ chia theo ngữ nghĩa
         max_chunk_size: Kích thước tối đa cho phép
         silent: Có in log không
     
@@ -798,7 +835,11 @@ def split_oversized_chunks(groups, sentences, sentence_lengths, max_chunk_size, 
             if not silent:
                 print(f"    Chunk {group_idx}: {len(group)} sentences, {group_chars} chars - SPLITTING...")
             
-            sub_groups = split_large_group(group, sentence_lengths, max_chunk_size, silent)
+            # Ưu tiên chia theo ngữ nghĩa nếu có sim_matrix, fallback về chia tuần tự
+            if sim_matrix is not None:
+                sub_groups = smart_split_large_group(group, sentences, sentence_lengths, sim_matrix, max_chunk_size, silent)
+            else:
+                sub_groups = split_large_group(group, sentence_lengths, max_chunk_size, silent)
             final_groups.extend(sub_groups)
             split_count += 1
             
@@ -807,13 +848,8 @@ def split_oversized_chunks(groups, sentences, sentence_lengths, max_chunk_size, 
                 print(f"      → Split into {len(sub_groups)} sub-chunks, total: {total_sub_chars} chars")
     
     # Debug logging even in silent mode if splits occurred
-    if split_count > 0:
-        if not silent:
-            print(f"  Split {split_count} oversized chunks into smaller ones")
-        else:
-            # Minimal debug info for silent mode
-            max_oversized = max(oversized_chunks, key=lambda x: x[1])[1] if oversized_chunks else 0
-            print(f"[AUTO_SPLIT] Split {split_count} chunks (largest was {max_oversized} chars, limit: {max_chunk_size})")
+    if split_count > 0 and not silent:
+        print(f"  Split {split_count} oversized chunks into smaller ones")
     
     return final_groups
 

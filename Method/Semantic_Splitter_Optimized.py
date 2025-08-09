@@ -10,12 +10,110 @@ import hashlib
 import traceback
 from datetime import datetime
 from pathlib import Path
+import torch
 
 load_dotenv()
 
 def _count_tokens_accurate(text: str) -> int:
     """Token counting using spaCy tokenizer"""
     return count_tokens_spacy(text)
+
+def _normalize_device(device: Optional[object]) -> str:
+    """Normalize device to 'cuda' or 'cpu' with automatic fallback if CUDA unavailable."""
+    try:
+        cuda_available = torch.cuda.is_available()
+    except Exception:
+        cuda_available = False
+    device_str = str(device).lower() if device is not None else None
+    if device_str in (None, "auto"):
+        return "cuda" if cuda_available else "cpu"
+    if device_str.startswith("cuda"):
+        return "cuda" if cuda_available else "cpu"
+    return "cpu"
+
+def _estimate_optimal_batch_size(sentences: List[str], base_batch_size: int, device: str) -> int:
+    if device != "cuda":
+        return min(base_batch_size, 16 if len(sentences) >= 50 else max(8, min(base_batch_size, len(sentences))))
+    if not sentences:
+        return base_batch_size
+    avg_len = sum(len(s) for s in sentences) / max(1, len(sentences))
+    if avg_len < 50:
+        return min(256, max(base_batch_size, 64), len(sentences))
+    if avg_len < 100:
+        return min(128, max(base_batch_size, 32), len(sentences))
+    if avg_len < 200:
+        return min(64, max(base_batch_size, 16), len(sentences))
+    return min(32, max(base_batch_size, 8), len(sentences))
+
+def embed_sentences_in_batches(
+    sentences: List[str],
+    model_name: str,
+    base_batch_size: int = 32,
+    device: Optional[object] = None,
+    silent: bool = True,
+) -> Optional[np.ndarray]:
+    """Robust, batched sentence embedding with adaptive sub-batching and OOM handling."""
+    if not sentences:
+        return np.array([])
+    device_pref = _normalize_device(device)
+    batch_size = _estimate_optimal_batch_size(sentences, base_batch_size, device_pref)
+    all_embeddings: List[np.ndarray] = []
+    total = len(sentences)
+    for start in range(0, total, batch_size):
+        end = min(start + batch_size, total)
+        batch = sentences[start:end]
+        # sub-batch loop
+        cur_bs = len(batch) if device_pref == "cuda" else min(len(batch), 16)
+        idx = 0
+        sub_embeds: List[np.ndarray] = []
+        while idx < len(batch):
+            sub_end = min(idx + cur_bs, len(batch))
+            sub_batch = batch[idx:sub_end]
+            try:
+                embeds = embed_text_list(
+                    sub_batch,
+                    model_name=model_name,
+                    batch_size=max(1, cur_bs),
+                    device_preference=device_pref,
+                )
+                if embeds is not None and len(embeds) > 0:
+                    sub_embeds.append(np.asarray(embeds))
+                else:
+                    if not silent:
+                        print(f"Warning: Empty embeddings for sub-batch {start+idx}:{start+sub_end}")
+                idx = sub_end
+            except Exception as e:
+                msg = str(e).lower()
+                is_oom = ("out of memory" in msg) or ("cuda" in msg and "memory" in msg)
+                if is_oom and device_pref == "cuda" and cur_bs > 1:
+                    cur_bs = max(1, cur_bs // 2)
+                    try:
+                        torch.cuda.empty_cache()
+                    except Exception:
+                        pass
+                    if not silent:
+                        print(f"    OOM detected. Reduce sub-batch to {cur_bs} and retry...")
+                    continue
+                if not silent:
+                    print(f"Error embedding sub-batch {start+idx}:{start+sub_end}: {e}")
+                idx = sub_end
+        if sub_embeds:
+            try:
+                all_embeddings.append(np.vstack(sub_embeds))
+            except Exception:
+                concatenated = []
+                for arr in sub_embeds:
+                    concatenated.extend(list(arr))
+                all_embeddings.append(np.asarray(concatenated))
+    if not all_embeddings:
+        return None
+    try:
+        return np.vstack(all_embeddings)
+    except Exception:
+        concatenated = []
+        for arr in all_embeddings:
+            concatenated.extend(list(arr))
+        return np.asarray(concatenated)
 
 def process_sentence_splitting_with_semantics(
     text: str, 
@@ -25,6 +123,7 @@ def process_sentence_splitting_with_semantics(
     min_sentences_per_chunk: int = 1,  # Số câu tối thiểu mỗi chunk
     embedding_model: str = "all-MiniLM-L6-v2",
     device: Optional[object] = None,
+    silent: bool = True,
 ) -> Tuple[List[str], List[str], List[List[int]]]:
     """
     Optimized sentence-based text splitting with semantic control.
@@ -42,22 +141,26 @@ def process_sentence_splitting_with_semantics(
     embeddings: Optional[np.ndarray] = None
     if semantic_threshold is not None and sentences:
         try:
-            device_pref = str(device) if device is not None else "cpu"
-            embeddings = np.array(
-                embed_text_list(
-                    sentences,
-                    model_name=embedding_model,
-                    batch_size=32,
-                    device_preference=device_pref,
-                )
+            device_pref = _normalize_device(device)
+            embeddings = embed_sentences_in_batches(
+                sentences,
+                model_name=embedding_model,
+                base_batch_size=32,
+                device=device_pref,
+                silent=silent,
             )
-            # Note: cosine_similarity handles normalization internally, 
-            # but pre-normalization can still improve numerical stability
-            norms = np.linalg.norm(embeddings, axis=1, keepdims=True)
-            norms[norms == 0] = 1e-9
-            embeddings = embeddings / norms
+            if embeddings is not None and embeddings.size > 0:
+                norms = np.linalg.norm(embeddings, axis=1, keepdims=True)
+                norms[norms == 0] = 1e-9
+                embeddings = embeddings / norms
+            else:
+                if not silent:
+                    print("Semantic embedding returned empty; fallback to length-only splitter")
+                semantic_threshold = None
+                embeddings = None
         except Exception as e:
-            print(f"Semantic embedding failed ({e}); fallback to length-only splitter")
+            if not silent:
+                print(f"Semantic embedding failed ({e}); fallback to length-only splitter")
             semantic_threshold = None
             embeddings = None
     
@@ -342,7 +445,7 @@ def helper_save_raw_oie_data(oie_data: List[Dict], chunk_id: str, output_dir: st
             "method": method_name,
             "chunk_id": chunk_id,
             "raw_oie_relations": oie_data,
-            "total_relations": len(oie_data)
+            "total_relations": sum(e.get('relation_count', 0) for e in oie_data)
         }
         
         if filepath.exists():
@@ -459,6 +562,7 @@ def semantic_splitter_main(
             min_sentences_per_chunk=min_sentences_per_chunk,
             embedding_model=embedding_model,
             device=device,
+            silent=silent,
         )
         
         if not chunk_texts:

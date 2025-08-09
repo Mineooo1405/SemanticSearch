@@ -223,9 +223,20 @@ def extract_relations_from_paragraph(
             logger.setLevel(logging.CRITICAL)
     
     try:
+        # Nếu server chưa sẵn sàng, trả rỗng để tránh treo
+        if not _is_port_open(port):
+            return []
+
         client = _get_global_client(port=port)
 
-        raw_results = client.extract(paragraph_text)
+        # Thêm timeout tạm cho socket để tránh treo lâu
+        import socket as _socket
+        prev_timeout = _socket.getdefaulttimeout()
+        try:
+            _socket.setdefaulttimeout(5.0)
+            raw_results = client.extract(paragraph_text)
+        finally:
+            _socket.setdefaulttimeout(prev_timeout)
         # Chuyển đổi sang định dạng subject / relation / object
         results.extend(_convert_openie5(raw_results))
     except Exception as e:
