@@ -41,6 +41,36 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any, List, Tuple, Optional, Dict
 
+# --- Standardized logging (reuse semantic_common utilities) ---
+try:
+    from Method.semantic_common import log_msg, init_logger
+except Exception:
+    # Fallback dummy if semantic_common not available
+    def init_logger(name: str = "semantic.controller", level: int = logging.INFO):
+        logger = logging.getLogger(name)
+        if not logger.handlers:
+            h = logging.StreamHandler()
+            h.setFormatter(logging.Formatter('[%(asctime)s][%(levelname)s][%(name)s] %(message)s', '%H:%M:%S'))
+            logger.addHandler(h)
+            logger.setLevel(level)
+        return logger
+    def log_msg(silent: bool, msg: str, level: str = 'info', component: str = None):
+        if silent:
+            return
+        lvl_map = {'debug': logging.DEBUG,'info': logging.INFO,'warn': logging.WARNING,'warning': logging.WARNING,'error': logging.ERROR}
+        lvl = lvl_map.get(level.lower(), logging.INFO)
+        logging.getLogger(component or 'semantic.controller').log(lvl, msg)
+
+CONTROLLER_SILENT: bool = False
+def clog(msg: str, level: str = 'info'):
+    """Controller log helper."""
+    log_msg(CONTROLLER_SILENT, msg, level, 'controller')
+
+def set_controller_log_level(level_name: str):
+    level_map = {'debug': logging.DEBUG,'info': logging.INFO,'warn': logging.WARNING,'warning': logging.WARNING,'error': logging.ERROR}
+    lvl = level_map.get(level_name.lower(), logging.INFO)
+    init_logger('semantic.controller', lvl)
+
 import pandas as pd
 max_limit = sys.maxsize
 while True:
@@ -50,15 +80,14 @@ while True:
     except OverflowError:
         max_limit = int(max_limit / 10)
 # ==== Import optimized chunking methods ====
-# Note: Semantic Splitter has been optimized - removed adaptive parameters (target_tokens, tolerance, enable_adaptive)
+# NOTE: Inline OIE extraction removed from semantic methods. Third tuple element is always None.
+# Run external OIE pipeline separately if needed.
+# Semantic Splitter optimized – removed adaptive parameters (target_tokens, tolerance, enable_adaptive)
 from Method.Semantic_Grouping_Optimized import (
     semantic_chunk_passage_from_grouping_logic as semantic_grouping,
 )
 from Method.Semantic_Splitter_Optimized import (
     chunk_passage_text_splitter as semantic_splitter,
-)
-from Method.Text_Splitter_Optimized import (
-    chunk_passage_text_splitter as simple_splitter,
 )
 
 
@@ -77,7 +106,7 @@ python simple_chunk_controller.py -i input.tsv -o output --configs semantic_grou
 Available Chunking Methods:
 1. semantic_grouping_*: Advanced semantic grouping with threshold ranges
 2. semantic_splitter_*: Sequential semantic splitting with similarity detection
-3. simple_splitter: Basic text splitting (fallback)
+3. simple_splitter: Basic text splitting (fallback) [REMOVED – implementation not present]
 
 Content Preservation Features:
 - min_sentences_per_chunk=1: Accepts all chunks including single sentences
@@ -357,7 +386,7 @@ def _worker_init(model_name: str, device_pref: str):
 
     device_obj = _resolve(device_pref)
 
-    print(f"[PID {os.getpid()}] Using device: {device_obj}")
+    clog(f"Worker init device={device_obj}", 'debug')
     _GLOBALS["model"] = SentenceTransformer(model_name, device=device_obj)
 
 
@@ -408,13 +437,13 @@ def _process_batch(
     params = dict(config["params"])  # shallow copy
 
     # map
-    func_map = {"1": semantic_grouping, "2": semantic_splitter, "3": simple_splitter}
+    func_map = {"1": semantic_grouping, "2": semantic_splitter}
     chunk_func = func_map[method_choice]
 
     import os
 
     pid = os.getpid()
-    print(f"[PID {pid}]Processing batch {batch_idx} (rows={len(batch_df)})")
+    clog(f"PID {pid} batch={batch_idx} rows={len(batch_df)} start", 'debug')
 
     for local_idx, row in batch_df.iterrows():
         # Input header: query_id | query_text | document_id | document | label
@@ -440,7 +469,7 @@ def _process_batch(
             
             # Validate cleaning didn't remove too much content
             if not validate_cleaned_text(original_passage, interview_processed):
-                print(f"Warning: Text cleaning may be too aggressive for doc {doc_orig}, using original")
+                clog(f"Text cleaning aggressive doc={doc_orig} reverting original", 'warning')
                 interview_processed = original_passage
             
             # Use preprocessed text for processing
@@ -451,7 +480,7 @@ def _process_batch(
 
         # TREC ROBUST04 FILTER: Skip documents marked as having no information
         if passage.strip() == "This document has no information.":
-            print(f"[PID {pid}] Skipping document {doc_orig} - marked as having no information")
+            clog(f"Skip empty-info doc={doc_orig}", 'debug')
             continue
 
         # doc_id duy nhất cho thuật toán chunking (không dùng làm output)
@@ -485,8 +514,7 @@ def _process_batch(
             if local_idx % 100 == 0:
                 method_name = {
                     "1": "semantic_grouping",
-                    "2": "semantic_splitter", 
-                    "3": "simple_splitter"
+                    "2": "semantic_splitter"
                 }.get(method_choice, "unknown")
                 
                 balanced_info = ""
@@ -494,8 +522,7 @@ def _process_batch(
                     target = params.get('target_chunk_size', 'N/A')
                     balanced_info = f" [AUTO_SPLIT: target={target}, max_actual={max_size}]"
                 
-                print(f"[PID {pid}] Doc {local_idx}: {method_name} → {len(tuples)} chunks "
-                      f"(sizes: avg={avg_size:.0f}, min={min_size}, max={max_size}){balanced_info}")
+                clog(f"doc_idx={local_idx} method={method_name} chunks={len(tuples)} size_avg={avg_size:.0f} min={min_size} max={max_size}{balanced_info}", 'info')
         
         for chunk_id, chunk_text, _ in tuples:
             # CRITICAL: Validate and sanitize chunk_text for TSV writing
@@ -515,12 +542,12 @@ def _process_batch(
             # Limit chunk size to prevent TSV writing issues (max 50KB per chunk)
             MAX_CHUNK_SIZE = 50000
             if len(chunk_text) > MAX_CHUNK_SIZE:
-                print(f"[WARNING] Chunk too large ({len(chunk_text)} chars), truncating to {MAX_CHUNK_SIZE}")
+                clog(f"truncate chunk chars={len(chunk_text)} -> {MAX_CHUNK_SIZE}", 'warning')
                 chunk_text = chunk_text[:MAX_CHUNK_SIZE] + "..."
             
             # Output: query_id  | document_id | chunk_text | label
             results.append([query_id, doc_orig, chunk_text, label])
-    print(f"[PID {pid}]Batch {batch_idx} done – {len(results)} chunks")
+    clog(f"batch={batch_idx} done chunks={len(results)}", 'debug')
     return results
 
 
@@ -612,10 +639,9 @@ def run_config(
                         # Progress update
                         if completed_batches % max(1, len(all_batches) // 10) == 0:
                             progress = (completed_batches / len(all_batches)) * 100
-                            print(f"[{config['name']}] Progress: {progress:.1f}% ({completed_batches}/{len(all_batches)} batches, {total_chunks} chunks)")
+                            clog(f"config={config['name']} progress={progress:.1f}% batches={completed_batches}/{len(all_batches)} chunks={total_chunks}", 'info')
                     except Exception as e:
-                        print(f"[ERROR] Failed to process batch: {e}")
-                        print(f"[ERROR] Error type: {type(e).__name__}")
+                        clog(f"batch error type={type(e).__name__} msg={e}", 'error')
                         completed_batches += 1
         else:
             # Single-threaded with streaming write
@@ -647,10 +673,9 @@ def run_config(
                         # Progress update
                         if batch_num % max(1, len(all_batches) // 10) == 0:
                             progress = (batch_num / len(all_batches)) * 100
-                            print(f"[{config['name']}] Progress: {progress:.1f}% ({batch_num}/{len(all_batches)} batches, {total_chunks} chunks)")
+                            clog(f"config={config['name']} progress={progress:.1f}% batches={batch_num}/{len(all_batches)} chunks={total_chunks}", 'info')
                 except Exception as e:
-                    print(f"[ERROR] Failed to process batch {batch_num}: {e}")
-                    print(f"[ERROR] Error type: {type(e).__name__}")
+                    clog(f"batch={batch_num} error type={type(e).__name__} msg={e}", 'error')
                     continue
 
     elapsed = time.time() - start
@@ -669,9 +694,8 @@ def run_config(
     if config_params.get('min_sentences_per_chunk', 2) == 1:
         preserve_info = " | CONTENT_PRESERVED (no chunks discarded)"
     
-    print(f"[CONFIG DONE] {config['name']} → {outfile}")
-    print(f" {total_chunks} chunks |  {elapsed:.1f}s | {chunks_per_sec:.1f} chunks/sec")
-    print(f"  {avg_chunks_per_doc:.1f} chunks/doc{split_info}{preserve_info}")
+    clog(f"config={config['name']} done file={outfile}", 'info')
+    clog(f"stats chunks={total_chunks} elapsed={elapsed:.1f}s rate={chunks_per_sec:.1f}/s avg_per_doc={avg_chunks_per_doc:.2f}{split_info}{preserve_info}", 'info')
 
 
 # ==== RUN_CONFIGURATIONS =====================================================
@@ -783,7 +807,7 @@ def _recommend_auto_model() -> str:
 def interactive_ui():
     input_path = Path(input("Enter path to input TSV (query_id\tquery_text\tdocument_id\tdocument\tlabel): ").strip())
     if not input_path.exists():
-        print("Input file not found – aborting.")
+        clog("interactive: input file not found", 'error')
         return
 
     out_dir = Path(input("Enter output directory [training_datasets]: ").strip() or "training_datasets")
@@ -795,27 +819,26 @@ def interactive_ui():
     if input("Change model? (y/N): ").strip().lower() == "y":
         print("\nQUICK MODEL PRESETS:")
         for key, (model_name, desc) in _MODEL_PRESETS.items():
-            print(f"  {key}. {model_name} - {desc}")
+            print(f"  {key}. {model_name} - {desc}")  # keep user prompt prints
         choice = input("Select preset (1-5) or press ENTER to keep current: ").strip()
         if choice in _MODEL_PRESETS:
             selected = _MODEL_PRESETS[choice][0]
             if selected == "auto":
                 selected = _recommend_auto_model()
             current_embedding_model = selected
-            print(f"Embedding model set to: {selected}")
+            clog(f"interactive: embedding_model={selected}", 'info')
 
     # ----- Config selection -----
     print("\nAvailable configurations:")
     for i, cfg in enumerate(RUN_CONFIGURATIONS, 1):
         desc = cfg.get('description', 'No description')
         params_info = []
-        
+
         # Extract key parameters for display
         params = cfg.get('params', {})
         if 'min_sentences_per_chunk' in params:
             params_info.append(f"min_sentences={params['min_sentences_per_chunk']}")
-        if 'include_oie' in params and params['include_oie']:
-            params_info.append("OIE=Yes")
+        # include_oie deprecated
         if 'semantic_threshold' in params:
             params_info.append(f"threshold={params['semantic_threshold']}")
         if 'initial_threshold' in params and params['initial_threshold'] != 'auto':
@@ -824,10 +847,10 @@ def interactive_ui():
             params_info.append(f"target_size={params['target_chunk_size']}")
         if 'enable_balanced_chunking' in params and params['enable_balanced_chunking']:
             params_info.append("auto_split=Yes")
-            
-        param_str = f" ({', '.join(params_info)})" if params_info else ""
-        print(f"  {i:2d}. {cfg['name']}{param_str}")
-        print(f"      {desc}")
+
+    param_str = f" ({', '.join(params_info)})" if params_info else ""
+    print(f"  {i:2d}. {cfg['name']}{param_str}")
+    print(f"      {desc}")
     
     cfg_input = input("\nEnter config numbers (comma-separated) or names or ENTER for ALL: ").strip()
     
@@ -846,7 +869,7 @@ def interactive_ui():
         selected_cfgs = RUN_CONFIGURATIONS
     
     if not selected_cfgs:
-        print("No configuration selected – aborting.")
+        clog("interactive: no configuration selected", 'warning')
         return
 
     # ----- Workers per config (batch) -----
@@ -862,14 +885,13 @@ def interactive_ui():
         params = cfg.get('params', {})
         if 'min_sentences_per_chunk' in params:
             params_summary.append(f"min_sentences={params['min_sentences_per_chunk']}")
-        if 'include_oie' in params and params['include_oie']:
-            params_summary.append("OIE")
+        # include_oie deprecated
         if 'target_chunk_size' in params:
             params_summary.append(f"target_size={params['target_chunk_size']}")
         if 'enable_balanced_chunking' in params and params['enable_balanced_chunking']:
             params_summary.append("auto_split")
-        param_str = f" ({', '.join(params_summary)})" if params_summary else ""
-        print(f"  - {cfg['name']}{param_str}")
+    param_str = f" ({', '.join(params_summary)})" if params_summary else ""
+    print(f"  - {cfg['name']}{param_str}")
     print(f"Workers      : per-config={cfg_workers}\n")
 
     # spawn start-method
@@ -877,7 +899,7 @@ def interactive_ui():
 
     # Chạy tất cả configs được chọn - use user selections, not COMMON_DEFAULTS
     for i, cfg in enumerate(selected_cfgs, 1):
-        print(f"\n[CONFIG {i}/{len(selected_cfgs)}] Starting {cfg['name']}...")
+        clog(f"interactive run config {i}/{len(selected_cfgs)} name={cfg['name']}", 'info')
         run_config(
             config=cfg, 
             input_path=input_path, 
@@ -889,7 +911,7 @@ def interactive_ui():
             enable_text_cleaning=COMMON_DEFAULTS["enable_text_cleaning"]
         )
 
-    print(f"\nAll {len(selected_cfgs)} configuration(s) completed! Output in", out_dir)
+    clog(f"interactive all configs completed count={len(selected_cfgs)} out={out_dir}", 'info')
 
 
 # ==== CLI ====================================================================
@@ -930,6 +952,8 @@ def main():
     ap.add_argument("-c", "--config-workers", type=int, default=1, help="Workers per config (process batches)")
     ap.add_argument("--embedding-model", default=COMMON_DEFAULTS["embedding_model"], help="SentenceTransformer model")
     ap.add_argument("--device", default=COMMON_DEFAULTS["device_preference"], help="cpu | cuda | dml")
+    ap.add_argument("--quiet", action="store_true", help="Silence controller logs (still prints interactive prompts)")
+    ap.add_argument("--log-level", default="info", help="Log level: debug|info|warn|error (default: info)")
     ap.add_argument("--enable-text-cleaning", action="store_true", default=True, 
                     help="Enable text cleaning for better SpaCy sentence segmentation (default: True)")
     ap.add_argument("--disable-text-cleaning", action="store_true", 
@@ -947,10 +971,10 @@ def main():
     # Determine text cleaning setting based on user flags
     enable_text_cleaning = args.enable_text_cleaning and not args.disable_text_cleaning
     
-    if enable_text_cleaning:
-        print("Text cleaning enabled for better SpaCy sentence segmentation")
-    else:
-        print("Text cleaning disabled - using raw documents")
+    global CONTROLLER_SILENT
+    CONTROLLER_SILENT = args.quiet
+    set_controller_log_level(args.log_level)
+    clog(f"startup embedding_model={user_embedding_model} device={user_device_preference} text_cleaning={enable_text_cleaning}", 'info')
 
     input_path = Path(args.input)
     out_dir = Path(args.output_dir)
@@ -971,7 +995,7 @@ def main():
         configs = RUN_CONFIGURATIONS
 
     if not configs:
-        print("No configurations selected – exiting.")
+        clog("no configurations selected – exiting", 'warning')
         print("Available configurations:")
         for i, cfg in enumerate(RUN_CONFIGURATIONS, 1):
             print(f"  {i}. {cfg['name']} - {cfg.get('description', 'No description')}")
@@ -999,9 +1023,13 @@ def main():
                 for cfg in configs
             }
             for fut in as_completed(futs):
-                fut.result()
+                try:
+                    fut.result()
+                except Exception as e:
+                    clog(f"config worker error name={futs[fut]} msg={e}", 'error')
     else:
         for cfg in configs:
+            clog(f"starting config name={cfg['name']}", 'info')
             run_config(
                 config=cfg, 
                 input_path=input_path, 
@@ -1013,7 +1041,7 @@ def main():
                 enable_text_cleaning=enable_text_cleaning
             )
 
-    print("All configurations completed!")
+    clog("all configurations completed", 'info')
 
 
 if __name__ == "__main__":

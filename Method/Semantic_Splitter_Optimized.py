@@ -1,16 +1,20 @@
-import json
+import json  # (legacy import – may be removed if unused elsewhere)
 from typing import List, Dict, Union, Optional, Tuple
 from dotenv import load_dotenv
 from Tool.Sentence_Segmenter import extract_sentences_spacy, count_tokens_spacy
-from Tool.OIE import extract_relations_from_paragraph
+from .semantic_common import (
+    normalize_device,
+    estimate_optimal_batch_size,
+    embed_sentences_batched,
+    log_msg,
+)
 import numpy as np
-from Tool.Sentence_Embedding import sentence_embedding as embed_text_list
 from sklearn.metrics.pairwise import cosine_similarity
 import hashlib
 import traceback
+import torch
 from datetime import datetime
 from pathlib import Path
-import torch
 
 load_dotenv()
 
@@ -18,112 +22,27 @@ def _count_tokens_accurate(text: str) -> int:
     """Token counting using spaCy tokenizer"""
     return count_tokens_spacy(text)
 
-def _normalize_device(device: Optional[object]) -> str:
-    """Normalize device to 'cuda' or 'cpu' with automatic fallback if CUDA unavailable."""
-    try:
-        cuda_available = torch.cuda.is_available()
-    except Exception:
-        cuda_available = False
-    device_str = str(device).lower() if device is not None else None
-    if device_str in (None, "auto"):
-        return "cuda" if cuda_available else "cpu"
-    if device_str.startswith("cuda"):
-        return "cuda" if cuda_available else "cpu"
-    return "cpu"
+@DeprecationWarning
+def _normalize_device(device):  # kept for backward compatibility; redirect
+    return normalize_device(device)
 
-def _estimate_optimal_batch_size(sentences: List[str], base_batch_size: int, device: str) -> int:
-    if device != "cuda":
-        return min(base_batch_size, 16 if len(sentences) >= 50 else max(8, min(base_batch_size, len(sentences))))
-    if not sentences:
-        return base_batch_size
-    avg_len = sum(len(s) for s in sentences) / max(1, len(sentences))
-    if avg_len < 50:
-        return min(256, max(base_batch_size, 64), len(sentences))
-    if avg_len < 100:
-        return min(128, max(base_batch_size, 32), len(sentences))
-    if avg_len < 200:
-        return min(64, max(base_batch_size, 16), len(sentences))
-    return min(32, max(base_batch_size, 8), len(sentences))
+@DeprecationWarning
+def _estimate_optimal_batch_size(sentences, base_batch_size, device):
+    return estimate_optimal_batch_size(sentences, base_batch_size, device)
 
-def embed_sentences_in_batches(
-    sentences: List[str],
-    model_name: str,
-    base_batch_size: int = 32,
-    device: Optional[object] = None,
-    silent: bool = True,
-) -> Optional[np.ndarray]:
-    """Robust, batched sentence embedding with adaptive sub-batching and OOM handling."""
-    if not sentences:
-        return np.array([])
-    device_pref = _normalize_device(device)
-    batch_size = _estimate_optimal_batch_size(sentences, base_batch_size, device_pref)
-    all_embeddings: List[np.ndarray] = []
-    total = len(sentences)
-    for start in range(0, total, batch_size):
-        end = min(start + batch_size, total)
-        batch = sentences[start:end]
-        # sub-batch loop
-        cur_bs = len(batch) if device_pref == "cuda" else min(len(batch), 16)
-        idx = 0
-        sub_embeds: List[np.ndarray] = []
-        while idx < len(batch):
-            sub_end = min(idx + cur_bs, len(batch))
-            sub_batch = batch[idx:sub_end]
-            try:
-                embeds = embed_text_list(
-                    sub_batch,
-                    model_name=model_name,
-                    batch_size=max(1, cur_bs),
-                    device_preference=device_pref,
-                )
-                if embeds is not None and len(embeds) > 0:
-                    sub_embeds.append(np.asarray(embeds))
-                else:
-                    if not silent:
-                        print(f"Warning: Empty embeddings for sub-batch {start+idx}:{start+sub_end}")
-                idx = sub_end
-            except Exception as e:
-                msg = str(e).lower()
-                is_oom = ("out of memory" in msg) or ("cuda" in msg and "memory" in msg)
-                if is_oom and device_pref == "cuda" and cur_bs > 1:
-                    cur_bs = max(1, cur_bs // 2)
-                    try:
-                        torch.cuda.empty_cache()
-                    except Exception:
-                        pass
-                    if not silent:
-                        print(f"    OOM detected. Reduce sub-batch to {cur_bs} and retry...")
-                    continue
-                if not silent:
-                    print(f"Error embedding sub-batch {start+idx}:{start+sub_end}: {e}")
-                idx = sub_end
-        if sub_embeds:
-            try:
-                all_embeddings.append(np.vstack(sub_embeds))
-            except Exception:
-                concatenated = []
-                for arr in sub_embeds:
-                    concatenated.extend(list(arr))
-                all_embeddings.append(np.asarray(concatenated))
-    if not all_embeddings:
-        return None
-    try:
-        return np.vstack(all_embeddings)
-    except Exception:
-        concatenated = []
-        for arr in all_embeddings:
-            concatenated.extend(list(arr))
-        return np.asarray(concatenated)
+def embed_sentences_in_batches(sentences: List[str], model_name: str, base_batch_size: int = 32, device: Optional[object] = None, silent: bool = True) -> Optional[np.ndarray]:
+    return embed_sentences_batched(sentences, model_name, base_batch_size=base_batch_size, device=device, silent=silent)
 
 def process_sentence_splitting_with_semantics(
-    text: str, 
-    chunk_size: Optional[int] = None,  # None = không giới hạn kích thước dựa ký tự
+    text: str,
+    chunk_size: Optional[int] = None,  # Giới hạn theo ký tự (None = bỏ qua)
     chunk_overlap: int = 0,
     semantic_threshold: Optional[float] = None,
-    min_sentences_per_chunk: int = 1,  # Số câu tối thiểu mỗi chunk
+    min_sentences_per_chunk: int = 1,  # Số câu tối thiểu mỗi chunk (áp dụng cả hai chế độ)
     embedding_model: str = "all-MiniLM-L6-v2",
     device: Optional[object] = None,
     silent: bool = True,
+    target_sentences_per_chunk: Optional[int] = None,  # Mục tiêu số câu mỗi chunk (ưu tiên hơn chunk_size)
 ) -> Tuple[List[str], List[str], List[List[int]]]:
     """
     Optimized sentence-based text splitting with semantic control.
@@ -137,18 +56,61 @@ def process_sentence_splitting_with_semantics(
     # Extract sentences
     sentences = extract_sentences_spacy(text)
 
+    # ---------------- New balanced sentence-count mode ----------------
+    # Nếu đặt target_sentences_per_chunk thì ưu tiên chế độ chia theo số câu, đảm bảo không tạo chunk cuối quá nhỏ.
+    if target_sentences_per_chunk is not None and target_sentences_per_chunk > 0:
+        total_sent = len(sentences)
+        if total_sent == 0:
+            return [], [], []
+        # Nếu tổng số câu < min_sentences_per_chunk => giữ nguyên 1 chunk
+        if total_sent < min_sentences_per_chunk:
+            return [text] if text.strip() else [], sentences, [list(range(total_sent))] if sentences else []
+
+        # Tính số chunk ban đầu dựa trên target
+        # k làm tròn gần nhất n / target
+        k = max(1, round(total_sent / target_sentences_per_chunk))
+        # Đảm bảo mỗi chunk >= min_sentences_per_chunk; nếu không thì giảm k
+        while k > 1 and total_sent < k * min_sentences_per_chunk:
+            k -= 1
+
+        # Phân phối đều: các chunk đầu nhận (base_size+1) nếu còn dư
+        base_size = total_sent // k
+        extras = total_sent % k
+        # Nếu base_size < min_sentences_per_chunk (trường hợp target < min) thì nâng lên
+        if base_size < min_sentences_per_chunk:
+            # Khi này k đã tối ưu nhỏ nhất đảm bảo mỗi chunk >= min_min, nên gom thành 1 chunk
+            return [" ".join(sentences)], sentences, [list(range(total_sent))]
+
+        chunk_sizes = []
+        for i in range(k):
+            size = base_size + (1 if i < extras else 0)
+            chunk_sizes.append(size)
+
+        # Sanity check cuối: nếu chunk cuối < min_sentences_per_chunk thì nhập vào chunk trước
+        if chunk_sizes and chunk_sizes[-1] < min_sentences_per_chunk and len(chunk_sizes) > 1:
+            chunk_sizes[-2] += chunk_sizes[-1]
+            chunk_sizes.pop()
+
+        # Tạo chunks
+        chunks: List[str] = []
+        sentence_groups: List[List[int]] = []
+        cursor = 0
+        for sz in chunk_sizes:
+            group_indices = list(range(cursor, cursor + sz))
+            chunk_text = " ".join(sentences[cursor:cursor + sz])
+            chunks.append(chunk_text)
+            sentence_groups.append(group_indices)
+            cursor += sz
+
+        return chunks, sentences, sentence_groups
+    # ---------------- End new mode ----------------
+
     # Compute embeddings when semantic_threshold is set
     embeddings: Optional[np.ndarray] = None
     if semantic_threshold is not None and sentences:
         try:
             device_pref = _normalize_device(device)
-            embeddings = embed_sentences_in_batches(
-                sentences,
-                model_name=embedding_model,
-                base_batch_size=32,
-                device=device_pref,
-                silent=silent,
-            )
+            embeddings = embed_sentences_in_batches(sentences, model_name=embedding_model, base_batch_size=32, device=device_pref, silent=silent)
             if embeddings is not None and embeddings.size > 0:
                 norms = np.linalg.norm(embeddings, axis=1, keepdims=True)
                 norms[norms == 0] = 1e-9
@@ -383,86 +345,9 @@ def helper_find_good_break_point(text: str, target: int, max_size: int) -> int:
     # Last resort: break at max_size
     return min(max_size, len(text))
 
-def transform_oie_triples_to_string(triples_list: List[Dict[str, str]], max_triples: Optional[int] = None) -> Optional[str]:
-    """Format OIE triples into a readable string format"""
-    if not triples_list:
-        return None
-    
-    formatted_sentences = []
-    triples_to_process = triples_list[:max_triples] if max_triples is not None else triples_list
+## OIE formatting helper removed (OIE generation handled externally)
 
-    for triple in triples_to_process:
-        s = str(triple.get('subject', '')).replace('\t', ' ').replace('\n', ' ').strip()
-        r = str(triple.get('relation', '')).replace('\t', ' ').replace('\n', ' ').strip()
-        o = str(triple.get('object', '')).replace('\t', ' ').replace('\n', ' ').strip()
-        
-        if s and r and o:  # Only include if all parts are non-empty
-            formatted_sentences.append(f"{s} {r} {o}.")
-    
-    if not formatted_sentences:
-        return None
-
-    return " ".join(formatted_sentences).strip()
-
-def process_oie_extraction(chunk_text: str, max_triples: Optional[int] = None, silent: bool = True) -> Optional[str]:
-    """Extract OIE relations for a chunk and format them"""
-    if not chunk_text or not chunk_text.strip():
-        return None
-    
-    try:
-        if not silent:
-            print(f"    Extracting OIE for chunk ({_count_tokens_accurate(chunk_text)} tokens)...")
-        
-        relations = extract_relations_from_paragraph(chunk_text)
-        
-        if relations:
-            oie_string = transform_oie_triples_to_string(relations, max_triples=max_triples)
-            if not silent and oie_string:
-                print(f"      Found {len(relations)} OIE relations")
-            return oie_string
-        else:
-            if not silent:
-                print(f"      No OIE relations found")
-            return None
-            
-    except Exception as e:
-        if not silent:
-            print(f"      Error during OIE extraction: {e}")
-        return None
-
-def helper_save_raw_oie_data(oie_data: List[Dict], chunk_id: str, output_dir: str, method_name: str = "text_splitter") -> Optional[str]:
-    """Save raw OIE data to JSON file for analysis"""
-    try:
-        raw_oie_dir = Path(output_dir) / "raw_oie_data"
-        raw_oie_dir.mkdir(exist_ok=True)
-        
-        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-        filename = f"{method_name}_raw_oie_{timestamp}.json"
-        filepath = raw_oie_dir / filename
-        
-        oie_entry = {
-            "timestamp": datetime.now().isoformat(),
-            "method": method_name,
-            "chunk_id": chunk_id,
-            "raw_oie_relations": oie_data,
-            "total_relations": sum(e.get('relation_count', 0) for e in oie_data)
-        }
-        
-        if filepath.exists():
-            with open(filepath, 'r', encoding='utf-8') as f:
-                existing_data = json.load(f)
-            existing_data.append(oie_entry)
-        else:
-            existing_data = [oie_entry]
-        
-        with open(filepath, 'w', encoding='utf-8') as f:
-            json.dump(existing_data, f, indent=2, ensure_ascii=False)
-        
-        return str(filepath)
-        
-    except Exception as e:
-        print(f"Warning: Could not save raw OIE data: {e}")
-        return None
+## Removed local process_oie_extraction & helper_save_raw_oie_data (use shared extract_oie_for_chunk & save_raw_oie_data)
 
 def helper_merge_small_chunks(buffer: List[Tuple[str, str, Optional[str]]], context_id: str) -> Optional[Tuple[str, str, Optional[str]]]:
     """Merge small chunks in buffer"""
@@ -525,34 +410,35 @@ def semantic_splitter_main(
     passage_text: str,
     chunk_size: int = 1000,
     chunk_overlap: int = 0,
-    include_oie: bool = False,
-    save_raw_oie: bool = False,
-    output_dir: str = "./output",
+    include_oie: bool = False,   # Kept for backward compatibility – ignored
+    save_raw_oie: bool = False,  # Kept for backward compatibility – ignored
+    output_dir: str = "./output",  # Unused now (no OIE saving) but retained for API stability
     device: Optional[object] = None,
     semantic_threshold: float = 0.30,
-    min_sentences_per_chunk: int = 1,  # Số câu tối thiểu mỗi chunk
+    min_sentences_per_chunk: int = 1,
     embedding_model: str = "all-MiniLM-L6-v2",
     silent: bool = False,
+    target_sentences_per_chunk: Optional[int] = None,
     **kwargs 
 ) -> List[Tuple[str, str, Optional[str]]]:
-    """
-    Enhanced Text Splitter with improved OIE integration.
-    
+    """Semantic text splitter.
+
+    NOTE: OIE extraction has been removed from this method. The tuple third element
+    (previously OIE string) is now always None so that downstream pipelines relying
+    on the 3‑tuple structure remain compatible. Any request with include_oie=True
+    will log a debug notice that OIE is externally generated.
+
     Returns:
-        List of tuples: (chunk_id, chunk_text_with_oie, oie_string_only)
+        List[Tuple[str, str, Optional[str]]]: (chunk_id, chunk_text, None)
     """
-    
-    if not silent:
-        print(f"    Processing passage {doc_id} with Enhanced Text Splitter")
-        print(f"   Chunk size: {chunk_size} chars, Overlap: {chunk_overlap} chars")
-        print(f"   Min sentences per chunk: {min_sentences_per_chunk}")
-        print(f"   Semantic threshold: {semantic_threshold}")
-        print(f"   OIE enabled: {include_oie}")
+    if include_oie and not silent:
+        log_msg(silent, "OIE generation disabled in splitter (handled externally)", 'debug', 'split')
+
+    log_msg(silent, f"Splitter doc={doc_id} size={chunk_size} overlap={chunk_overlap} min_sent={min_sentences_per_chunk} sem_th={semantic_threshold}", 'info', 'split')
 
     try:
         # Split text into chunks using optimized algorithm
-        if not silent:
-            print(f"   Splitting into chunks...")
+        log_msg(silent, "Splitting into chunks...", 'info', 'split')
         
         chunk_texts, sentences, sentence_groups = process_sentence_splitting_with_semantics(
             text=passage_text,
@@ -563,126 +449,37 @@ def semantic_splitter_main(
             embedding_model=embedding_model,
             device=device,
             silent=silent,
+            target_sentences_per_chunk=target_sentences_per_chunk,
         )
         
         if not chunk_texts:
-            if not silent:
-                print(f"   No chunks generated, returning original passage")
-            
-            oie_string = None
-            final_text = passage_text
-            if include_oie:
-                oie_string = process_oie_extraction(passage_text, silent=silent)
-                if oie_string:
-                    final_text = f"{passage_text} {oie_string}"
-            
-            return [(f"{doc_id}_single_fallback", final_text, oie_string)]
+            log_msg(silent, "No chunks generated – fallback to original text", 'warning', 'split')
+            return [(f"{doc_id}_single_fallback", passage_text, None)]
         
-        if not silent:
-            print(f"   Generated {len(chunk_texts)} initial chunks")
-        
-        # Process chunks with OIE
-        chunks_with_oie = []
-        all_raw_oie_data = []
-        
+        log_msg(silent, f"Initial chunks={len(chunk_texts)}", 'info', 'split')
+
+        # Build chunk tuples (OIE removed)
+        chunks_with_oie: List[Tuple[str, str, Optional[str]]] = []
+
         for chunk_idx, chunk_text_content in enumerate(chunk_texts):
-            chunk_id = f"{doc_id}_textsplit_{chunk_idx}"
-            oie_string = None
-            raw_oie_relations = None
-            
-            # Generate chunk hash for uniqueness
+            oie_string: Optional[str] = None  # placeholder
             chunk_hash = hashlib.sha1(chunk_text_content.encode('utf-8', errors='ignore')).hexdigest()[:8]
             chunk_id = f"{doc_id}_chunk{chunk_idx}_hash{chunk_hash}"
-            
-            # Extract OIE if requested
-            final_chunk_text = chunk_text_content
-            
-            if include_oie and chunk_text_content.strip():
-                try:
-                    if not silent:
-                        print(f"     Processing OIE for chunk {chunk_idx}...")
-                    
-                    raw_oie_relations = extract_relations_from_paragraph(chunk_text_content)
-                    
-                    if raw_oie_relations:
-                        oie_string = transform_oie_triples_to_string(raw_oie_relations)
-                        
-                        if oie_string:
-                            final_chunk_text = f"{chunk_text_content} {oie_string}"
-                            if not silent:
-                                print(f"       Added {len(raw_oie_relations)} OIE relations")
-                        
-                        # Save raw OIE data for analysis
-                        if save_raw_oie:
-                            all_raw_oie_data.append({
-                                "chunk_id": chunk_id,
-                                "relations": raw_oie_relations,
-                                "relation_count": len(raw_oie_relations),
-                                "chunk_text_preview": chunk_text_content[:100] + "..." if len(chunk_text_content) > 100 else chunk_text_content
-                            })
-                    else:
-                        if not silent:
-                            print(f"       No OIE relations found")
-                            
-                except Exception as e_oie:
-                    if not silent:
-                        print(f"       Error during OIE extraction: {e_oie}")
-                    oie_string = None
-            
-            chunks_with_oie.append((chunk_id, final_chunk_text, oie_string))        
-        
-        # Save raw OIE data if requested
-        if save_raw_oie and all_raw_oie_data:
-            try:
-                raw_oie_filepath = helper_save_raw_oie_data(all_raw_oie_data, doc_id, output_dir, "text_splitter")
-                if raw_oie_filepath and not silent:
-                    print(f" Raw OIE data saved to: {raw_oie_filepath}")
-                    total_relations = sum(entry['relation_count'] for entry in all_raw_oie_data)
-                    print(f"   Total chunks with OIE: {len(all_raw_oie_data)}")
-                    print(f"   Total relations extracted: {total_relations}")
-            except Exception as e:
-                if not silent:
-                    print(f"Warning: Failed to save raw OIE data: {e}")
+            chunks_with_oie.append((chunk_id, chunk_text_content, oie_string))
         
         # Final validation and logging
         if not chunks_with_oie:
-            if not silent:
-                print(f"   No valid chunks after processing, returning original passage")
-            
-            oie_string = None
-            final_text = passage_text
-            if include_oie:
-                oie_string = process_oie_extraction(passage_text, silent=silent)
-                if oie_string:
-                    final_text = f"{passage_text} {oie_string}"
-            
-            return [(f"{doc_id}_fallback_complete", final_text, oie_string)]
-        
+            log_msg(silent, "No valid chunks after processing – fallback", 'warning', 'split')
+            return [(f"{doc_id}_fallback_complete", passage_text, None)]
+
         # Log final statistics
-        if not silent:
-            token_counts = [_count_tokens_accurate(chunk[1]) for chunk in chunks_with_oie]
-            print(f"   Created {len(chunks_with_oie)} chunks")
-            print(f"   Token distribution: {min(token_counts)}-{max(token_counts)} (avg: {sum(token_counts)/len(token_counts):.1f})")
-        
+        token_counts = [_count_tokens_accurate(chunk[1]) for chunk in chunks_with_oie]
+        log_msg(silent, f"Final chunks={len(chunks_with_oie)} tokens min={min(token_counts)} max={max(token_counts)} avg={sum(token_counts)/len(token_counts):.1f}", 'info', 'split')
         return chunks_with_oie
 
     except Exception as e:
-        if not silent:
-            print(f"Error chunking doc {doc_id} with Text Splitter: {e}")
-            traceback.print_exc()
-        
-        # Return original passage as single chunk in case of error
-        oie_string = None
-        final_text = passage_text
-        if include_oie:
-            try:
-                oie_string = process_oie_extraction(passage_text, silent=True)
-                if oie_string:
-                    final_text = f"{passage_text} {oie_string}"
-            except:
-                pass  # Ignore OIE errors in fallback
-        
-        return [(f"{doc_id}_error_fallback", final_text, oie_string)]
+        log_msg(silent, f"Splitter error doc={doc_id} {e}", 'error', 'split')
+        return [(f"{doc_id}_error_fallback", passage_text, None)]
 
 # Compatibility function to match the interface expected by data_create_controller
 def chunk_passage_text_splitter(
@@ -695,9 +492,10 @@ def chunk_passage_text_splitter(
     output_dir: str = "./output",
     device: Optional[object] = None,
     semantic_threshold: float = 0.5,
-    min_sentences_per_chunk: int = 1,  # Số câu tối thiểu mỗi chunk
+    min_sentences_per_chunk: int = 1,
     embedding_model: str = "all-MiniLM-L6-v2",
     silent: bool = False,
+    target_sentences_per_chunk: Optional[int] = None,
     **kwargs 
 ) -> List[Tuple[str, str, Optional[str]]]:
     """
@@ -718,5 +516,6 @@ def chunk_passage_text_splitter(
         min_sentences_per_chunk=min_sentences_per_chunk,
         embedding_model=embedding_model,
         silent=silent,
+        target_sentences_per_chunk=target_sentences_per_chunk,
         **kwargs
     )
