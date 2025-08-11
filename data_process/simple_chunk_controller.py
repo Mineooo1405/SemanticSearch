@@ -95,13 +95,15 @@ from Method.Semantic_Splitter_Optimized import (
 Usage Examples:
 
 # Enable text cleaning (default) with balanced chunking
-python simple_chunk_controller.py -i input.tsv -o output --configs semantic_grouping_balanced
 
-# Disable text cleaning (raw documents) with no size limits
-python simple_chunk_controller.py -i input.tsv -o output --configs semantic_grouping_no_limit --disable-text-cleaning
+# (Character size auto-splitting removed; sentence-count control only)
 
 # Use large chunks with automatic splitting
-python simple_chunk_controller.py -i input.tsv -o output --configs semantic_grouping_large_chunks
+# Example: semantic grouping with 5-sentence target (±30%)
+# python simple_chunk_controller.py -i input.tsv -o output --configs semantic_grouping_sent_5
+
+# Disable text cleaning (raw documents)
+# python simple_chunk_controller.py -i input.tsv -o output --configs semantic_grouping_no_limit --disable-text-cleaning
 
 Available Chunking Methods:
 1. semantic_grouping_*: Advanced semantic grouping with threshold ranges
@@ -518,9 +520,7 @@ def _process_batch(
                 }.get(method_choice, "unknown")
                 
                 balanced_info = ""
-                if params.get('enable_balanced_chunking'):
-                    target = params.get('target_chunk_size', 'N/A')
-                    balanced_info = f" [AUTO_SPLIT: target={target}, max_actual={max_size}]"
+                # Removed char-size control: only sentence-based statistics remain
                 
                 clog(f"doc_idx={local_idx} method={method_name} chunks={len(tuples)} size_avg={avg_size:.0f} min={min_size} max={max_size}{balanced_info}", 'info')
         
@@ -684,18 +684,80 @@ def run_config(
     avg_chunks_per_doc = total_chunks / max(1, len(all_batches) * batch_size)
     chunks_per_sec = total_chunks / max(1, elapsed)
     
-    split_info = ""
-    config_params = config.get('params', {})
-    if config_params.get('enable_balanced_chunking'):
-        target_size = config_params.get('target_chunk_size', 'N/A')
-        split_info = f" | AUTO_SPLIT enabled (target: {target_size} chars)"
+    split_info = ""  # character-based split info removed
     
     preserve_info = ""
+    config_params = config.get('params', {})
     if config_params.get('min_sentences_per_chunk', 2) == 1:
-        preserve_info = " | CONTENT_PRESERVED (no chunks discarded)"
+        preserve_info = " | CONTENT_PRESERVED"
     
     clog(f"config={config['name']} done file={outfile}", 'info')
     clog(f"stats chunks={total_chunks} elapsed={elapsed:.1f}s rate={chunks_per_sec:.1f}/s avg_per_doc={avg_chunks_per_doc:.2f}{split_info}{preserve_info}", 'info')
+
+    # --- Automatic sentence-count quality summary (Option 1) ---
+    try:
+        params = config.get('params', {})
+        params_min = params.get('min_sentences_per_chunk')
+        params_max = params.get('max_sentences_per_chunk')
+        target_sent = params.get('target_sentences_per_chunk')
+        tolerance = params.get('sentence_target_tolerance')
+        # Run if any sentence control param provided
+        if params_min or params_max or target_sent:
+            import re, csv as _csv, math
+            sent_re = re.compile(r'(?<=[\.!?！？。])\s+')
+            sub_min = over_max = total = 0
+            below_win = in_win = above_win = 0
+            counts = []
+            lower_win = upper_win = None
+            if target_sent and tolerance:
+                lower_win = max(1, math.floor(target_sent * (1 - tolerance)))
+                upper_win = math.ceil(target_sent * (1 + tolerance))
+                # If explicit hard max tighter than computed upper window
+                if params_max and upper_win:
+                    upper_win = min(upper_win, params_max)
+            # Stream read once
+            with open(outfile, 'r', encoding='utf-8', errors='ignore') as rf:
+                reader = _csv.DictReader(rf, delimiter='\t')
+                for row in reader:
+                    txt = (row.get('chunk_text') or '').strip()
+                    if not txt:
+                        continue
+                    sents = [s.strip() for s in sent_re.split(txt) if s.strip()]
+                    if not sents:
+                        continue
+                    c = len(sents)
+                    counts.append(c)
+                    total += 1
+                    if params_min and params_min > 1 and c < params_min:
+                        sub_min += 1
+                    if params_max and params_max > 0 and c > params_max:
+                        over_max += 1
+                    if lower_win and upper_win:
+                        if c < lower_win:
+                            below_win += 1
+                        elif c > upper_win:
+                            above_win += 1
+                        else:
+                            in_win += 1
+            if total:
+                ratio_sub = sub_min / total if total else 0
+                ratio_over = over_max / total if total else 0
+                msg = f"quality sentences total_chunks={total} sub_min={sub_min} ({ratio_sub:.4%}) over_max={over_max} ({ratio_over:.4%}) min={params_min} max={params_max}"
+                if lower_win and upper_win:
+                    msg += f" window[{lower_win},{upper_win}] below={below_win} in={in_win} above={above_win}"
+                # Basic percentiles for grouping diagnostics
+                if counts:
+                    sc_sorted = sorted(counts)
+                    def pct(p):
+                        if not sc_sorted: return None
+                        k = (p/100)*(len(sc_sorted)-1)
+                        f = math.floor(k); cidx = math.ceil(k)
+                        if f == cidx: return sc_sorted[int(k)]
+                        return sc_sorted[f] + (sc_sorted[cidx]-sc_sorted[f])*(k-f)
+                    msg += f" dist_min={sc_sorted[0]} dist_p25={pct(25)} dist_med={pct(50)} dist_p75={pct(75)} dist_max={sc_sorted[-1]}"
+                clog(msg, 'info')
+    except Exception as _e:
+        clog(f"quality summary failed: {_e}", 'warning')
 
 
 # ==== RUN_CONFIGURATIONS =====================================================
@@ -714,15 +776,17 @@ RUN_CONFIGURATIONS: List[Dict[str, Any]] = [
         "description": "Semantic splitter without size limits - preserves ALL content"
     },
     {
-        "name": "semantic_splitter_balanced",
+        "name": "semantic_splitter_sent_5",
         "method_choice": "2",
         "params": {
-            "chunk_size": 300,  # Character limit with automatic splitting
-            "chunk_overlap": 20,
+            "chunk_size": None,  # Disable character-based control (sentence-target mode)
+            "chunk_overlap": 0,
             "semantic_threshold": 0.4,
-            "min_sentences_per_chunk": 1,  # Accept all chunks to preserve content
+            "min_sentences_per_chunk": 5,
+            "target_sentences_per_chunk": 5,  # NEW: sentence count target
+            "max_sentences_per_chunk": 7,  # NEW: hard upper cap
         },
-        "description": "Semantic splitter with size control - splits oversized chunks while preserving content"
+        "description": "Semantic splitter target 5 sentences (no char limit, equal distribution)"
     },
     {
         "name": "semantic_grouping_no_limit",
@@ -730,53 +794,50 @@ RUN_CONFIGURATIONS: List[Dict[str, Any]] = [
         "params": {
             "initial_threshold": 0.9,
             "decay_factor": 0.85,
-            "min_threshold": 0.3, 
-            "min_sentences_per_chunk": 1,  # Accept all chunks to preserve content
-            "enable_balanced_chunking": False,  # Disable balanced chunking to remove size constraints
+            "min_threshold": 0.3,
+            "min_sentences_per_chunk": 1,
         },
-        "description": "Semantic grouping with NO size limits - preserves ALL content, pure semantic coherence"
+        "description": "Semantic grouping pure semantic coherence (no sentence target)"
     },
     {
-        "name": "semantic_grouping_balanced",
+        "name": "semantic_grouping_sent_5",
         "method_choice": "1",
         "params": {
             "initial_threshold": 0.85,
             "decay_factor": 0.75,
             "min_threshold": 0.25,
-            "min_sentences_per_chunk": 3,  # Accept all chunks to preserve content
-            "target_chunk_size": 200,      # Target character count per chunk
-            "size_tolerance": 0.4,         # ±40% tolerance for chunk size
-            "enable_balanced_chunking": True,  # Enable the new balanced algorithm with splitting
+            "min_sentences_per_chunk": 5,
+            "target_sentences_per_chunk": 5,
+            "sentence_target_tolerance": 0.3,
+            "max_sentences_per_chunk": 7,  # NEW: hard upper cap
         },
-        "description": "Balanced semantic grouping - controls max chunk size with automatic splitting of oversized chunks"
+        "description": "Semantic grouping target 5 sentences per chunk (±30%)"
     },
     {
-        "name": "semantic_grouping_large_chunks",
-        "method_choice": "1", 
+        "name": "semantic_grouping_sent_8",
+        "method_choice": "1",
         "params": {
             "initial_threshold": 0.8,
             "decay_factor": 0.8,
             "min_threshold": 0.2,
-            "min_sentences_per_chunk": 3,  # Accept all chunks to preserve content
-            "target_chunk_size": 400,      # Larger target for longer documents
-            "size_tolerance": 0.3,         # ±30% tolerance (reduced from 0.5 for stricter splitting)
-            "enable_balanced_chunking": True,  # Enable with larger chunks
+            "min_sentences_per_chunk": 2,
+            "target_sentences_per_chunk": 8,
+            "sentence_target_tolerance": 0.25,
         },
-        "description": "Semantic grouping for larger chunks (400 chars target) with automatic splitting - stricter size control"
+        "description": "Semantic grouping target 8 sentences per chunk (±25%)"
     },
     {
-        "name": "semantic_grouping_strict",
+        "name": "semantic_grouping_sent_strict4",
         "method_choice": "1",
         "params": {
             "initial_threshold": 0.8,
             "decay_factor": 0.75,
             "min_threshold": 0.25,
-            "min_sentences_per_chunk": 1,  # Accept all chunks to preserve content
-            "target_chunk_size": 300,      # Smaller target for more frequent splitting
-            "size_tolerance": 0.2,         # ±20% tolerance (very strict splitting)
-            "enable_balanced_chunking": True,  # Enable with strict control
+            "min_sentences_per_chunk": 1,
+            "target_sentences_per_chunk": 4,
+            "sentence_target_tolerance": 0.2,
         },
-        "description": "Strict semantic grouping (300 chars, ±20%) - aggressive chunk splitting for consistent sizes"
+        "description": "Semantic grouping target 4 sentences (±20%) stricter"
     },
 ]
 
@@ -843,14 +904,14 @@ def interactive_ui():
             params_info.append(f"threshold={params['semantic_threshold']}")
         if 'initial_threshold' in params and params['initial_threshold'] != 'auto':
             params_info.append(f"init_th={params['initial_threshold']}")
-        if 'target_chunk_size' in params:
-            params_info.append(f"target_size={params['target_chunk_size']}")
-        if 'enable_balanced_chunking' in params and params['enable_balanced_chunking']:
-            params_info.append("auto_split=Yes")
+        if 'target_sentences_per_chunk' in params:
+            params_info.append(f"target_sent={params['target_sentences_per_chunk']}")
+        if 'max_sentences_per_chunk' in params:
+            params_info.append(f"max_sent={params['max_sentences_per_chunk']}")
 
-    param_str = f" ({', '.join(params_info)})" if params_info else ""
-    print(f"  {i:2d}. {cfg['name']}{param_str}")
-    print(f"      {desc}")
+        param_str = f" ({', '.join(params_info)})" if params_info else ""
+        print(f"  {i:2d}. {cfg['name']}{param_str}")
+        print(f"      {desc}")
     
     cfg_input = input("\nEnter config numbers (comma-separated) or names or ENTER for ALL: ").strip()
     
@@ -886,10 +947,10 @@ def interactive_ui():
         if 'min_sentences_per_chunk' in params:
             params_summary.append(f"min_sentences={params['min_sentences_per_chunk']}")
         # include_oie deprecated
-        if 'target_chunk_size' in params:
-            params_summary.append(f"target_size={params['target_chunk_size']}")
-        if 'enable_balanced_chunking' in params and params['enable_balanced_chunking']:
-            params_summary.append("auto_split")
+        if 'target_sentences_per_chunk' in params:
+            params_summary.append(f"target_sent={params['target_sentences_per_chunk']}")
+        if 'max_sentences_per_chunk' in params:
+            params_summary.append(f"max_sent={params['max_sentences_per_chunk']}")
     param_str = f" ({', '.join(params_summary)})" if params_summary else ""
     print(f"  - {cfg['name']}{param_str}")
     print(f"Workers      : per-config={cfg_workers}\n")
@@ -926,11 +987,10 @@ def main():
         
         # Extract key features for display
         features = []
-        if not params.get('enable_balanced_chunking', False):
-            features.append("NO_SIZE_LIMITS")
-        else:
-            target = params.get('target_chunk_size', 'N/A')
-            features.append(f"AUTO_SPLIT(target={target})")
+        if 'target_sentences_per_chunk' in params:
+            features.append(f"SENT_TARGET={params['target_sentences_per_chunk']}")
+        if 'max_sentences_per_chunk' in params:
+            features.append(f"MAX_SENT={params['max_sentences_per_chunk']}")
         
         if params.get('min_sentences_per_chunk', 2) == 1:
             features.append("PRESERVES_ALL")
@@ -942,8 +1002,8 @@ def main():
     config_display = "\n".join(config_list)
     
     ap = argparse.ArgumentParser(
-        description="Enhanced chunking controller with content preservation and automatic chunk splitting",
-        epilog=f"Available configurations:\n{config_display}\n\nKey Features:\n  ✅ Preserves ALL content (no chunks discarded)\n  ✅ Automatic splitting of oversized chunks\n  ✅ Semantic coherence with size control\n  ✅ Advanced text cleaning for better sentence detection",
+        description="Enhanced chunking controller with sentence-target semantic grouping",
+        epilog=f"Available configurations:\n{config_display}\n\nKey Features:\n  ✅ Sentence-count based semantic grouping\n  ✅ Preserves ALL content (no chunks discarded)\n  ✅ Optional sentence target window control\n  ✅ Advanced text cleaning for better sentence detection",
         formatter_class=argparse.RawDescriptionHelpFormatter
     )
     ap.add_argument("-i", "--input", required=True, help="Input TSV path")

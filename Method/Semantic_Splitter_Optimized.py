@@ -43,10 +43,10 @@ def process_sentence_splitting_with_semantics(
     device: Optional[object] = None,
     silent: bool = True,
     target_sentences_per_chunk: Optional[int] = None,  # Mục tiêu số câu mỗi chunk (ưu tiên hơn chunk_size)
+    max_sentences_per_chunk: Optional[int] = None,  # NEW: hard upper cap for sentence-target mode
 ) -> Tuple[List[str], List[str], List[List[int]]]:
     """
     Optimized sentence-based text splitting with semantic control.
-    
     Returns:
         - chunks: List of chunk texts
         - sentences: List of original sentences
@@ -62,46 +62,85 @@ def process_sentence_splitting_with_semantics(
         total_sent = len(sentences)
         if total_sent == 0:
             return [], [], []
-        # Nếu tổng số câu < min_sentences_per_chunk => giữ nguyên 1 chunk
         if total_sent < min_sentences_per_chunk:
+            # Whole doc shorter than minimum -> single chunk (inevitable)
             return [text] if text.strip() else [], sentences, [list(range(total_sent))] if sentences else []
 
-        # Tính số chunk ban đầu dựa trên target
-        # k làm tròn gần nhất n / target
-        k = max(1, round(total_sent / target_sentences_per_chunk))
-        # Đảm bảo mỗi chunk >= min_sentences_per_chunk; nếu không thì giảm k
-        while k > 1 and total_sent < k * min_sentences_per_chunk:
-            k -= 1
+        min_s = max(1, min_sentences_per_chunk)
+        max_s = max_sentences_per_chunk if (max_sentences_per_chunk and max_sentences_per_chunk > 0) else None
 
-        # Phân phối đều: các chunk đầu nhận (base_size+1) nếu còn dư
-        base_size = total_sent // k
-        extras = total_sent % k
-        # Nếu base_size < min_sentences_per_chunk (trường hợp target < min) thì nâng lên
-        if base_size < min_sentences_per_chunk:
-            # Khi này k đã tối ưu nhỏ nhất đảm bảo mỗi chunk >= min_min, nên gom thành 1 chunk
-            return [" ".join(sentences)], sentences, [list(range(total_sent))]
+        # Determine feasible number of chunks k so that k*min_s <= total <= k*max_s
+        def choose_k(n: int, target: int, min_s: int, max_s: Optional[int]) -> int:
+            if not max_s:
+                # No hard cap: use target but ensure feasibility
+                k = max(1, round(n / target))
+                while k > 1 and n < k * min_s:
+                    k -= 1
+                return k
+            import math
+            k_min = math.ceil(n / max_s)
+            k_max = n // min_s
+            if k_min > k_max:
+                # Infeasible constraints (e.g., max too small); relax max by ignoring it
+                return choose_k(n, target, min_s, None)
+            # Start near target-based k
+            k_target = max(1, round(n / target))
+            k = min(max(k_min, k_target), k_max)
+            # Adjust downward if still infeasible due to rounding
+            while k > k_min and n < k * min_s:
+                k -= 1
+            return max(k_min, min(k, k_max))
 
-        chunk_sizes = []
-        for i in range(k):
-            size = base_size + (1 if i < extras else 0)
-            chunk_sizes.append(size)
+        k = choose_k(total_sent, target_sentences_per_chunk, min_s, max_s)
 
-        # Sanity check cuối: nếu chunk cuối < min_sentences_per_chunk thì nhập vào chunk trước
-        if chunk_sizes and chunk_sizes[-1] < min_sentences_per_chunk and len(chunk_sizes) > 1:
-            chunk_sizes[-2] += chunk_sizes[-1]
-            chunk_sizes.pop()
+        # Build initial sizes all = min_s then distribute remainder
+        sizes = [min_s] * k
+        remainder = total_sent - k * min_s
+        i = 0
+        while remainder > 0:
+            if max_s and sizes[i] >= max_s:
+                i = (i + 1) % k
+                # Safety break if all at cap (should not happen if constraints feasible)
+                if all((not max_s) or s >= max_s for s in sizes):
+                    break
+                continue
+            sizes[i] += 1
+            remainder -= 1
+            i = (i + 1) % k
 
-        # Tạo chunks
+        # If remainder still >0 (rare infeasible case) append to last
+        if remainder > 0:
+            sizes[-1] += remainder
+
+        # Sanity: merge if any size < min (shouldn't happen)
+        merged_sizes: List[int] = []
+        for sz in sizes:
+            if sz < min_s and merged_sizes:
+                merged_sizes[-1] += sz
+            else:
+                merged_sizes.append(sz)
+        sizes = merged_sizes
+
+        # Construct chunks from sizes
         chunks: List[str] = []
         sentence_groups: List[List[int]] = []
         cursor = 0
-        for sz in chunk_sizes:
-            group_indices = list(range(cursor, cursor + sz))
-            chunk_text = " ".join(sentences[cursor:cursor + sz])
-            chunks.append(chunk_text)
-            sentence_groups.append(group_indices)
-            cursor += sz
-
+        for sz in sizes:
+            end = min(cursor + sz, total_sent)
+            idxs = list(range(cursor, end))
+            chunks.append(" ".join(sentences[cursor:end]))
+            sentence_groups.append(idxs)
+            cursor = end
+        # If leftover sentences due to constraint rounding, append them to last chunk (respecting max if possible)
+        if cursor < total_sent:
+            leftovers = list(range(cursor, total_sent))
+            if leftovers:
+                if sentence_groups and (not max_s or len(sentence_groups[-1]) + len(leftovers) <= max_s):
+                    sentence_groups[-1].extend(leftovers)
+                    chunks[-1] = " ".join(sentences[i] for i in sentence_groups[-1])
+                else:
+                    sentence_groups.append(leftovers)
+                    chunks.append(" ".join(sentences[i] for i in leftovers))
         return chunks, sentences, sentence_groups
     # ---------------- End new mode ----------------
 
@@ -207,6 +246,22 @@ def process_sentence_splitting_with_semantics(
             # Save current chunk
             chunk_text = ' '.join(current_chunk_sentences)
             chunks.append(chunk_text)
+        if max_sentences_per_chunk and max_sentences_per_chunk > 0:
+            capped_chunks: List[str] = []
+            capped_groups: List[List[int]] = []
+            cap = max_sentences_per_chunk
+            for c_text, g_indices in zip(chunks, sentence_groups):
+                if len(g_indices) <= cap:
+                    capped_chunks.append(c_text)
+                    capped_groups.append(g_indices)
+                    continue
+                for i in range(0, len(g_indices), cap):
+                    sub_idx = g_indices[i:i+cap]
+                    sub_text = " ".join(sentences[j] for j in sub_idx)
+                    capped_chunks.append(sub_text)
+                    capped_groups.append(sub_idx)
+            chunks = capped_chunks
+            sentence_groups = capped_groups
             sentence_groups.append(list(current_group_indices))
             
             # Handle overlap (create overlap from end of current chunk)
@@ -419,6 +474,7 @@ def semantic_splitter_main(
     embedding_model: str = "all-MiniLM-L6-v2",
     silent: bool = False,
     target_sentences_per_chunk: Optional[int] = None,
+    max_sentences_per_chunk: Optional[int] = None,
     **kwargs 
 ) -> List[Tuple[str, str, Optional[str]]]:
     """Semantic text splitter.
@@ -450,13 +506,236 @@ def semantic_splitter_main(
             device=device,
             silent=silent,
             target_sentences_per_chunk=target_sentences_per_chunk,
+            max_sentences_per_chunk=max_sentences_per_chunk,
         )
         
         if not chunk_texts:
             log_msg(silent, "No chunks generated – fallback to original text", 'warning', 'split')
             return [(f"{doc_id}_single_fallback", passage_text, None)]
+
+        # --- Post enforcement of min/max (covers both modes) ---
+        if (max_sentences_per_chunk and max_sentences_per_chunk > 0) or min_sentences_per_chunk > 1:
+            cap = max_sentences_per_chunk if (max_sentences_per_chunk and max_sentences_per_chunk > 0) else None
+
+            # 1. Rebuild groups defensively if lengths mismatch (safety)
+            # (Should not happen in target mode, but older path may desync.)
+            if len(sentence_groups) != len(chunk_texts):
+                sentence_groups = []
+                cursor = 0
+                for ct in chunk_texts:
+                    # Approximate by counting sentences via extract_sentences_spacy on chunk
+                    local_sents = extract_sentences_spacy(ct)
+                    nloc = len(local_sents)
+                    sentence_groups.append(list(range(cursor, cursor + nloc)))
+                    cursor += nloc
+                # If cursor != len(sentences), fallback to single group of all
+                if cursor != len(sentences):
+                    sentence_groups = [list(range(len(sentences)))]
+
+            # 2. Split oversized groups strictly
+            new_groups: List[List[int]] = []
+            for g in sentence_groups:
+                if cap and len(g) > cap:
+                    for i in range(0, len(g), cap):
+                        sub = g[i:i+cap]
+                        if sub:
+                            new_groups.append(sub)
+                else:
+                    new_groups.append(g)
+
+            # 3. Merge undersized groups forward until >= min (greedy)
+            if min_sentences_per_chunk > 1:
+                merged: List[List[int]] = []
+                buffer: List[int] = []
+                for g in new_groups:
+                    if not buffer:
+                        buffer.extend(g)
+                    else:
+                        # If buffer already big enough, flush before adding new
+                        if len(buffer) >= min_sentences_per_chunk:
+                            merged.append(buffer)
+                            buffer = []
+                        buffer.extend(g)
+                    # While buffer still too small, continue accumulating
+                    if len(buffer) >= min_sentences_per_chunk:
+                        merged.append(buffer)
+                        buffer = []
+                if buffer:
+                    # If leftover buffer < min and we already have at least one group, append to last
+                    if merged and len(buffer) < min_sentences_per_chunk:
+                        merged[-1].extend(buffer)
+                    else:
+                        merged.append(buffer)
+            else:
+                merged = new_groups  # type: ignore
+
+            # 4. After merges, re-split any group that now exceeds cap
+            if cap:
+                final_groups: List[List[int]] = []
+                for g in merged:  # type: ignore
+                    if len(g) > cap:
+                        for i in range(0, len(g), cap):
+                            sub = g[i:i+cap]
+                            if sub:
+                                final_groups.append(sub)
+                    else:
+                        final_groups.append(g)
+            else:
+                final_groups = merged  # type: ignore
+
+            # 5. Guarantee ordering & rebuild texts
+            sentence_groups = [sorted(g) for g in final_groups]
+            chunk_texts = [" ".join(sentences[idx] for idx in g) for g in sentence_groups]
+
+            # 6. Optional sanity check (silent-safe)
+            if not silent:
+                lengths = [len(g) for g in sentence_groups]
+                log_msg(silent, f"Enforced groups count={len(sentence_groups)} sent_min={min(lengths)} sent_max={max(lengths)}", 'debug', 'split')
         
         log_msg(silent, f"Initial chunks={len(chunk_texts)}", 'info', 'split')
+
+        # --- Secondary enforcement using simple regex sentence split to align with analyzer ---
+        if (max_sentences_per_chunk and max_sentences_per_chunk > 0) or min_sentences_per_chunk > 1:
+            import re
+            sent_regex = re.compile(r'(?<=[\.!?！？。])\s+')
+            final_chunks: List[str] = []
+            for chunk in chunk_texts:
+                # Split into naive sentences (analyzer style)
+                naive_sents = [s.strip() for s in sent_regex.split(chunk.strip()) if s.strip()]
+                if not naive_sents:
+                    continue
+                # Oversized: split into slices of cap
+                if max_sentences_per_chunk and max_sentences_per_chunk > 0 and len(naive_sents) > max_sentences_per_chunk:
+                    for i in range(0, len(naive_sents), max_sentences_per_chunk):
+                        sub = naive_sents[i:i+max_sentences_per_chunk]
+                        if len(sub) < min_sentences_per_chunk and final_chunks:
+                            # merge with previous if too small
+                            final_chunks[-1] = final_chunks[-1] + ' ' + ' '.join(sub)
+                        else:
+                            final_chunks.append(' '.join(sub))
+                else:
+                    # Too small: attempt merge with previous
+                    if len(naive_sents) < min_sentences_per_chunk and final_chunks:
+                        prev_naive = [s.strip() for s in sent_regex.split(final_chunks[-1]) if s.strip()]
+                        combined = prev_naive + naive_sents
+                        if max_sentences_per_chunk and max_sentences_per_chunk > 0 and len(combined) > max_sentences_per_chunk:
+                            # Can't merge without exceeding cap: keep as is (will violate)
+                            final_chunks.append(' '.join(naive_sents))
+                        else:
+                            final_chunks[-1] = ' '.join(combined)
+                    else:
+                        final_chunks.append(' '.join(naive_sents))
+            # One more pass: split any final overflow
+            if max_sentences_per_chunk and max_sentences_per_chunk > 0:
+                adjusted: List[str] = []
+                cap = max_sentences_per_chunk
+                for ch in final_chunks:
+                    naive_sents = [s.strip() for s in sent_regex.split(ch.strip()) if s.strip()]
+                    if len(naive_sents) <= cap:
+                        adjusted.append(ch)
+                    else:
+                        for i in range(0, len(naive_sents), cap):
+                            sub = naive_sents[i:i+cap]
+                            adjusted.append(' '.join(sub))
+                final_chunks = adjusted
+            # Filter chunks still below min if possible by merging forward
+            if min_sentences_per_chunk > 1:
+                filtered: List[str] = []
+                buffer = ''
+                def count_s(ch:str):
+                    return len([s for s in sent_regex.split(ch.strip()) if s.strip()])
+                for ch in final_chunks:
+                    if count_s(ch) >= min_sentences_per_chunk:
+                        if buffer:
+                            # merge buffer first
+                            merged = buffer + ' ' + ch
+                            if (not max_sentences_per_chunk) or count_s(merged) <= max_sentences_per_chunk:
+                                filtered.append(merged)
+                                buffer = ''
+                            else:
+                                filtered.append(buffer)
+                                filtered.append(ch)
+                                buffer = ''
+                        else:
+                            filtered.append(ch)
+                    else:
+                        if not buffer:
+                            buffer = ch
+                        else:
+                            tentative = buffer + ' ' + ch
+                            if (not max_sentences_per_chunk) or count_s(tentative) <= max_sentences_per_chunk:
+                                buffer = tentative
+                            else:
+                                filtered.append(buffer)
+                                buffer = ch
+                if buffer:
+                    filtered.append(buffer)
+                final_chunks = filtered
+            # Pass A: assign preliminary result
+            chunk_texts = final_chunks
+
+            # Pass B: merge sub-min chunks (naive sentence counts) with neighbors
+            if min_sentences_per_chunk > 1:
+                import re
+                sent_regex2 = re.compile(r'(?<=[\.!?！？。])\s+')
+                def naive_sent_count(t: str) -> int:
+                    return len([s for s in sent_regex2.split(t.strip()) if s.strip()])
+
+                changed = True
+                # Prevent infinite loops
+                safety = 0
+                while changed and safety < 5:
+                    changed = False
+                    safety += 1
+                    new_list: List[str] = []
+                    i = 0
+                    while i < len(chunk_texts):
+                        ch = chunk_texts[i]
+                        sc = naive_sent_count(ch)
+                        # If document overall is shorter than min, keep as-is
+                        if sc >= min_sentences_per_chunk or len(chunk_texts) == 1:
+                            new_list.append(ch)
+                            i += 1
+                            continue
+                        # Attempt merge with next first (forward merge preferred)
+                        merged = False
+                        if i + 1 < len(chunk_texts):
+                            candidate = ch + ' ' + chunk_texts[i+1]
+                            cand_sc = naive_sent_count(candidate)
+                            # Allow merge even if exceeding cap; will re-split below
+                            if cand_sc >= min_sentences_per_chunk:
+                                new_list.append(candidate)
+                                i += 2
+                                changed = True
+                                merged = True
+                        if not merged:
+                            # Try merge with previous (append to last element of new_list)
+                            if new_list:
+                                prev = new_list.pop()
+                                candidate = prev + ' ' + ch
+                                # Accept regardless; we'll re-split if overflow
+                                new_list.append(candidate)
+                                i += 1
+                                changed = True
+                            else:
+                                # Edge: first chunk sub-min and no next; keep
+                                new_list.append(ch)
+                                i += 1
+                    chunk_texts = new_list
+
+                # Re-split any overflow > cap after merges
+                if max_sentences_per_chunk and max_sentences_per_chunk > 0:
+                    cap = max_sentences_per_chunk
+                    adjusted: List[str] = []
+                    for ch in chunk_texts:
+                        sents = [s for s in sent_regex2.split(ch.strip()) if s.strip()]
+                        if len(sents) <= cap:
+                            adjusted.append(ch)
+                        else:
+                            for j in range(0, len(sents), cap):
+                                slice_s = sents[j:j+cap]
+                                adjusted.append(' '.join(slice_s))
+                    chunk_texts = adjusted
 
         # Build chunk tuples (OIE removed)
         chunks_with_oie: List[Tuple[str, str, Optional[str]]] = []
@@ -496,6 +775,7 @@ def chunk_passage_text_splitter(
     embedding_model: str = "all-MiniLM-L6-v2",
     silent: bool = False,
     target_sentences_per_chunk: Optional[int] = None,
+    max_sentences_per_chunk: Optional[int] = None,
     **kwargs 
 ) -> List[Tuple[str, str, Optional[str]]]:
     """
@@ -517,5 +797,6 @@ def chunk_passage_text_splitter(
         embedding_model=embedding_model,
         silent=silent,
         target_sentences_per_chunk=target_sentences_per_chunk,
+    max_sentences_per_chunk=max_sentences_per_chunk,
         **kwargs
     )
