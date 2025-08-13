@@ -88,28 +88,6 @@ def analyze_file(path: Path, limit_docs=None):
             if words:
                 top_longest.append((len(words), q, d, t_norm[:130].replace('\n',' ')))
 
-    # Optional debugging: show violating chunks if MIN_SENT or MAX_SENT env provided
-    import os
-    dbg_min = os.getenv('ANALYZE_MIN_SENT')
-    dbg_max = os.getenv('ANALYZE_MAX_SENT')
-    violating_examples = []
-    if dbg_min or dbg_max:
-        try:
-            dbg_min_v = int(dbg_min) if dbg_min else None
-            dbg_max_v = int(dbg_max) if dbg_max else None
-        except ValueError:
-            dbg_min_v = dbg_max_v = None
-        if dbg_min_v or dbg_max_v:
-            for (q,d), texts in list(by_doc.items())[:50]:  # limit scanning
-                for t in texts:
-                    sents = simple_sent_tokenize(t)
-                    if (dbg_min_v and len(sents) < dbg_min_v) or (dbg_max_v and len(sents) > dbg_max_v):
-                        violating_examples.append((len(sents), q, d, t[:120].replace('\n',' ')))
-                        if len(violating_examples) >= 15:
-                            break
-                if len(violating_examples) >= 15:
-                    break
-
     # Sort and keep top 10
     top_longest = sorted(top_longest, key=lambda x: x[0], reverse=True)[:10]
 
@@ -136,15 +114,14 @@ def analyze_file(path: Path, limit_docs=None):
         "avg_tokens_per_chunk": round(chunk_lengths_words and (sum(chunk_lengths_words)/total_chunks) or 0,3),
         "token_type_ratio": round(vocab_size/total_tokens,4) if total_tokens else 0,
         "top_tokens": top_vocab,
-    "top_longest_chunks": [
+        "top_longest_chunks": [
             {
                 "words": w,
                 "query_id": q,
                 "document_id": d,
                 "preview": p
             } for w,q,d,p in top_longest
-    ],
-    "violating_examples": violating_examples
+        ]
     }
 
 def compare(files_stats):

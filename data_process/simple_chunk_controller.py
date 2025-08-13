@@ -40,6 +40,27 @@ import multiprocessing as mp
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any, List, Tuple, Optional, Dict
+from statistics import mean
+try:
+    import numpy as np
+except Exception:
+    np = None  # numpy optional for percentile stats
+
+# Sentence & token utilities for evaluation
+try:
+    from Tool.Sentence_Segmenter import extract_sentences_spacy, count_tokens_spacy
+except Exception:
+    # Lightweight fallbacks
+    import re
+    def extract_sentences_spacy(text: str) -> List[str]:
+        if not isinstance(text, str) or not text.strip():
+            return []
+        parts = re.split(r'(?<=[.!?])\s+(?=[A-Z])', text.strip())
+        return [p.strip() for p in parts if p.strip()]
+    def count_tokens_spacy(text: str) -> int:
+        if not isinstance(text, str):
+            return 0
+        return len(re.findall(r'\b\w+\b', text))
 
 # --- Standardized logging (reuse semantic_common utilities) ---
 try:
@@ -92,28 +113,24 @@ from Method.Semantic_Splitter_Optimized import (
 
 
 """
-Usage Examples:
+Usage Overview:
 
-# Enable text cleaning (default) with balanced chunking
+This controller now supports:
+    - semantic_splitter_* : Sequential semantic sentence splitter variants (dynamic heuristics)
+    - semantic_grouping_anchor_greedy : Non‑contiguous anchor greedy semantic grouping (ONLY grouping mode retained)
 
-# (Character size auto-splitting removed; sentence-count control only)
+Removed: all legacy threshold-based semantic_grouping variants (initial_threshold / decay / min_threshold logic).
 
-# Use large chunks with automatic splitting
-# Example: semantic grouping with 5-sentence target (±30%)
-# python simple_chunk_controller.py -i input.tsv -o output --configs semantic_grouping_sent_5
+Examples:
+    python simple_chunk_controller.py -i input.tsv -o output \
+            --configs semantic_grouping_anchor_greedy
+    python simple_chunk_controller.py -i input.tsv -o output \
+            --configs semantic_splitter_dynamic_drop
 
-# Disable text cleaning (raw documents)
-# python simple_chunk_controller.py -i input.tsv -o output --configs semantic_grouping_no_limit --disable-text-cleaning
-
-Available Chunking Methods:
-1. semantic_grouping_*: Advanced semantic grouping with threshold ranges
-2. semantic_splitter_*: Sequential semantic splitting with similarity detection
-3. simple_splitter: Basic text splitting (fallback) [REMOVED – implementation not present]
-
-Content Preservation Features:
-- min_sentences_per_chunk=1: Accepts all chunks including single sentences
-- enable_balanced_chunking=True: Automatically splits oversized chunks
-- Intelligent text cleaning preserves essential content while improving sentence detection
+Notes:
+ - Character size limits removed; only sentence counts enforced.
+ - Short documents (< min_sentences_per_chunk) are preserved whole.
+ - Anchor greedy groups are non‑contiguous: each chunk = central "hub" sentence + top similar sentences.
 """
 # ==== Default constants ====
 BATCH_SIZE = 600  # dòng/đợt đọc pandas
@@ -401,6 +418,7 @@ def _process_batch(
     embedding_model: str,
     device_preference: str,
     enable_text_cleaning: bool = True,
+    max_chunk_chars: Optional[int] = 50000,
 ) -> List[List[Any]]:
     """Chunk các dòng trong batch và trả về list row cho TSV output."""
     results: List[List[Any]] = []
@@ -496,12 +514,20 @@ def _process_batch(
         else:
             extra = {}
 
+        # Decide silent flag: allow verbose logs for dynamic semantic configs when logging requested
+        local_silent = True
+        try:
+            if params.get('dynamic_semantic') and params.get('dynamic_log_cuts'):
+                local_silent = False
+        except Exception:
+            pass
+
         tuples: List[Tuple[str, str, Optional[str]]] = chunk_func(
             doc_id=doc_id,
             passage_text=passage,
             **params,
             **extra,
-            silent=True,
+            silent=local_silent,
             output_dir=None,
         )
         
@@ -513,7 +539,9 @@ def _process_batch(
             min_size = min(chunk_sizes)
             
             # Log statistics every 100 documents for monitoring
-            if local_idx % 100 == 0:
+            # Adaptive logging frequency: for small batches (<200 docs) log every doc; otherwise every 100
+            log_every = 1 if len(batch_df) <= 200 else 100
+            if local_idx % log_every == 0:
                 method_name = {
                     "1": "semantic_grouping",
                     "2": "semantic_splitter"
@@ -539,11 +567,10 @@ def _process_batch(
             if not chunk_text:
                 continue
                 
-            # Limit chunk size to prevent TSV writing issues (max 50KB per chunk)
-            MAX_CHUNK_SIZE = 50000
-            if len(chunk_text) > MAX_CHUNK_SIZE:
-                clog(f"truncate chunk chars={len(chunk_text)} -> {MAX_CHUNK_SIZE}", 'warning')
-                chunk_text = chunk_text[:MAX_CHUNK_SIZE] + "..."
+            # Optional truncation safeguard (disable with max_chunk_chars <= 0)
+            if max_chunk_chars is not None and max_chunk_chars > 0 and len(chunk_text) > max_chunk_chars:
+                clog(f"truncate chunk chars={len(chunk_text)} -> {max_chunk_chars}", 'warning')
+                chunk_text = chunk_text[:max_chunk_chars] + "..."
             
             # Output: query_id  | document_id | chunk_text | label
             results.append([query_id, doc_orig, chunk_text, label])
@@ -562,6 +589,7 @@ def run_config(
     embedding_model: Optional[str] = None,
     device_preference: Optional[str] = None,
     enable_text_cleaning: Optional[bool] = None,
+    max_chunk_chars: Optional[int] = 50000,
 ):
     """Chạy chunking cho 1 cấu hình."""
     import time
@@ -592,9 +620,38 @@ def run_config(
     outfile.parent.mkdir(exist_ok=True)
     total_chunks = 0
     
-    with open(outfile, "w", encoding="utf-8", newline="") as f:
+    eval_file = output_dir / f"{config['name']}_eval_chunks.tsv"
+    summary_file = output_dir / f"{config['name']}_eval_summary.txt"
+
+    # Accumulators for evaluation stats
+    eval_sent_counts: List[int] = []
+    eval_word_counts: List[int] = []
+    eval_token_counts: List[int] = []
+    eval_char_counts: List[int] = []
+    doc_chunk_counter: Dict[str, int] = {}
+
+    def _percentiles(values: List[int], ps=(50, 90, 95)) -> Dict[str, float]:
+        if not values:
+            return {f"p{p}": 0 for p in ps}
+        if np is None:
+            # simple manual approach
+            sorted_vals = sorted(values)
+            out = {}
+            for p in ps:
+                if not sorted_vals:
+                    out[f"p{p}"] = 0
+                else:
+                    k = int(round((p/100)*(len(sorted_vals)-1)))
+                    out[f"p{p}"] = float(sorted_vals[k])
+            return out
+        arr = np.array(values)
+        return {f"p{p}": float(np.percentile(arr, p)) for p in ps}
+
+    with open(outfile, "w", encoding="utf-8", newline="") as f, open(eval_file, "w", encoding="utf-8", newline="") as feval:
         w = csv.writer(f, delimiter="\t")
         w.writerow(["query_id", "document_id", "chunk_text", "label"])
+        w_eval = csv.writer(feval, delimiter="\t")
+        w_eval.writerow(["query_id", "document_id", "sentences", "words", "tokens", "chars", "label"])  # per-chunk metrics
         
         # pool xử lý batch with streaming write
         if config_workers > 1:
@@ -604,7 +661,7 @@ def run_config(
                 initargs=(actual_embedding_model, actual_device_preference),
             ) as exe:
                 futures = {
-                    exe.submit(_process_batch, df, config, idx, actual_embedding_model, actual_device_preference, actual_enable_text_cleaning): idx 
+                    exe.submit(_process_batch, df, config, idx, actual_embedding_model, actual_device_preference, actual_enable_text_cleaning, max_chunk_chars): idx 
                     for idx, df in all_batches
                 }
                 
@@ -631,8 +688,23 @@ def run_config(
                                     continue
                             
                             if validated_results:
+                                # Write main chunks
                                 w.writerows(validated_results)
-                                f.flush()  # Ensure data is written to disk immediately
+                                # Evaluation per chunk
+                                for row in validated_results:
+                                    qid, doc_id_row, chunk_text_row, lbl = row
+                                    # Update doc chunk counter
+                                    doc_chunk_counter[doc_id_row] = doc_chunk_counter.get(doc_id_row, 0) + 1
+                                    sent_ct = len(extract_sentences_spacy(chunk_text_row))
+                                    word_ct = len(chunk_text_row.split())
+                                    tok_ct = count_tokens_spacy(chunk_text_row)
+                                    char_ct = len(chunk_text_row)
+                                    eval_sent_counts.append(sent_ct)
+                                    eval_word_counts.append(word_ct)
+                                    eval_token_counts.append(tok_ct)
+                                    eval_char_counts.append(char_ct)
+                                    w_eval.writerow([qid, doc_id_row, sent_ct, word_ct, tok_ct, char_ct, lbl])
+                                f.flush(); feval.flush()
                                 total_chunks += len(validated_results)
                         completed_batches += 1
                         
@@ -647,7 +719,7 @@ def run_config(
             # Single-threaded with streaming write
             for batch_num, (idx, df) in enumerate(all_batches, 1):
                 try:
-                    batch_results = _process_batch(df, config, idx, actual_embedding_model, actual_device_preference, actual_enable_text_cleaning)
+                    batch_results = _process_batch(df, config, idx, actual_embedding_model, actual_device_preference, actual_enable_text_cleaning, max_chunk_chars)
                     if batch_results:
                         # CRITICAL: Validate each row before writing to prevent TSV corruption
                         validated_results = []
@@ -667,7 +739,19 @@ def run_config(
                         
                         if validated_results:
                             w.writerows(validated_results)
-                            f.flush()  # Ensure data is written to disk immediately
+                            for row in validated_results:
+                                qid, doc_id_row, chunk_text_row, lbl = row
+                                doc_chunk_counter[doc_id_row] = doc_chunk_counter.get(doc_id_row, 0) + 1
+                                sent_ct = len(extract_sentences_spacy(chunk_text_row))
+                                word_ct = len(chunk_text_row.split())
+                                tok_ct = count_tokens_spacy(chunk_text_row)
+                                char_ct = len(chunk_text_row)
+                                eval_sent_counts.append(sent_ct)
+                                eval_word_counts.append(word_ct)
+                                eval_token_counts.append(tok_ct)
+                                eval_char_counts.append(char_ct)
+                                w_eval.writerow([qid, doc_id_row, sent_ct, word_ct, tok_ct, char_ct, lbl])
+                            f.flush(); feval.flush()
                             total_chunks += len(validated_results)
                         
                         # Progress update
@@ -681,7 +765,8 @@ def run_config(
     elapsed = time.time() - start
     
     # Enhanced completion message with statistics
-    avg_chunks_per_doc = total_chunks / max(1, len(all_batches) * batch_size)
+    # Correct average: divide by actual number of unique processed documents (doc_chunk_counter)
+    avg_chunks_per_doc = total_chunks / max(1, len(doc_chunk_counter))
     chunks_per_sec = total_chunks / max(1, elapsed)
     
     split_info = ""  # character-based split info removed
@@ -691,73 +776,33 @@ def run_config(
     if config_params.get('min_sentences_per_chunk', 2) == 1:
         preserve_info = " | CONTENT_PRESERVED"
     
-    clog(f"config={config['name']} done file={outfile}", 'info')
-    clog(f"stats chunks={total_chunks} elapsed={elapsed:.1f}s rate={chunks_per_sec:.1f}/s avg_per_doc={avg_chunks_per_doc:.2f}{split_info}{preserve_info}", 'info')
-
-    # --- Automatic sentence-count quality summary (Option 1) ---
+    # ----- Evaluation summary -----
+    unique_docs = len(doc_chunk_counter)
+    chunks_per_doc = list(doc_chunk_counter.values())
+    def _summ(name: str, values: List[int]) -> str:
+        if not values:
+            return f"{name}: count=0"
+        pct = _percentiles(values)
+        return (f"{name}: count={len(values)} min={min(values)} max={max(values)} "
+                f"mean={mean(values):.2f} median={pct['p50']:.2f} p90={pct['p90']:.2f} p95={pct['p95']:.2f}")
+    summary_lines = [
+        f"CONFIG: {config['name']}",
+        f"Total chunks: {total_chunks}",
+        f"Unique documents: {unique_docs}",
+        _summ("Sentences per chunk", eval_sent_counts),
+        _summ("Words per chunk", eval_word_counts),
+        _summ("Tokens per chunk", eval_token_counts),
+        _summ("Chars per chunk", eval_char_counts),
+        _summ("Chunks per document", chunks_per_doc),
+    ]
     try:
-        params = config.get('params', {})
-        params_min = params.get('min_sentences_per_chunk')
-        params_max = params.get('max_sentences_per_chunk')
-        target_sent = params.get('target_sentences_per_chunk')
-        tolerance = params.get('sentence_target_tolerance')
-        # Run if any sentence control param provided
-        if params_min or params_max or target_sent:
-            import re, csv as _csv, math
-            sent_re = re.compile(r'(?<=[\.!?！？。])\s+')
-            sub_min = over_max = total = 0
-            below_win = in_win = above_win = 0
-            counts = []
-            lower_win = upper_win = None
-            if target_sent and tolerance:
-                lower_win = max(1, math.floor(target_sent * (1 - tolerance)))
-                upper_win = math.ceil(target_sent * (1 + tolerance))
-                # If explicit hard max tighter than computed upper window
-                if params_max and upper_win:
-                    upper_win = min(upper_win, params_max)
-            # Stream read once
-            with open(outfile, 'r', encoding='utf-8', errors='ignore') as rf:
-                reader = _csv.DictReader(rf, delimiter='\t')
-                for row in reader:
-                    txt = (row.get('chunk_text') or '').strip()
-                    if not txt:
-                        continue
-                    sents = [s.strip() for s in sent_re.split(txt) if s.strip()]
-                    if not sents:
-                        continue
-                    c = len(sents)
-                    counts.append(c)
-                    total += 1
-                    if params_min and params_min > 1 and c < params_min:
-                        sub_min += 1
-                    if params_max and params_max > 0 and c > params_max:
-                        over_max += 1
-                    if lower_win and upper_win:
-                        if c < lower_win:
-                            below_win += 1
-                        elif c > upper_win:
-                            above_win += 1
-                        else:
-                            in_win += 1
-            if total:
-                ratio_sub = sub_min / total if total else 0
-                ratio_over = over_max / total if total else 0
-                msg = f"quality sentences total_chunks={total} sub_min={sub_min} ({ratio_sub:.4%}) over_max={over_max} ({ratio_over:.4%}) min={params_min} max={params_max}"
-                if lower_win and upper_win:
-                    msg += f" window[{lower_win},{upper_win}] below={below_win} in={in_win} above={above_win}"
-                # Basic percentiles for grouping diagnostics
-                if counts:
-                    sc_sorted = sorted(counts)
-                    def pct(p):
-                        if not sc_sorted: return None
-                        k = (p/100)*(len(sc_sorted)-1)
-                        f = math.floor(k); cidx = math.ceil(k)
-                        if f == cidx: return sc_sorted[int(k)]
-                        return sc_sorted[f] + (sc_sorted[cidx]-sc_sorted[f])*(k-f)
-                    msg += f" dist_min={sc_sorted[0]} dist_p25={pct(25)} dist_med={pct(50)} dist_p75={pct(75)} dist_max={sc_sorted[-1]}"
-                clog(msg, 'info')
-    except Exception as _e:
-        clog(f"quality summary failed: {_e}", 'warning')
+        with open(summary_file, 'w', encoding='utf-8') as sf:
+            sf.write("\n".join(summary_lines))
+    except Exception as e:
+        clog(f"Failed to write evaluation summary: {e}", 'error')
+
+    clog(f"config={config['name']} done file={outfile} eval={eval_file} summary={summary_file}", 'info')
+    clog(f"stats chunks={total_chunks} elapsed={elapsed:.1f}s rate={chunks_per_sec:.1f}/s avg_per_doc={avg_chunks_per_doc:.2f}{split_info}{preserve_info}", 'info')
 
 
 # ==== RUN_CONFIGURATIONS =====================================================
@@ -771,73 +816,62 @@ RUN_CONFIGURATIONS: List[Dict[str, Any]] = [
             "chunk_size": None,  # No character limit
             "chunk_overlap": 0,
             "semantic_threshold": 0.35,
-            "min_sentences_per_chunk": 1,  # Accept all chunks to preserve content
+            "min_sentences_per_chunk": 6,  # Enforce >5 sentences per chunk
+            "semantic_focus": True,        # Pure semantic boundaries only (no size/target enforcement)
         },
-        "description": "Semantic splitter without size limits - preserves ALL content"
+        "description": "Semantic splitter PURE semantic mode (no size limits) - each chunk >5 sentences"
     },
     {
-        "name": "semantic_splitter_sent_5",
+        "name": "semantic_splitter_dynamic_drop",
         "method_choice": "2",
         "params": {
-            "chunk_size": None,  # Disable character-based control (sentence-target mode)
+            "chunk_size": None,
             "chunk_overlap": 0,
-            "semantic_threshold": 0.4,
-            "min_sentences_per_chunk": 5,
-            "target_sentences_per_chunk": 5,  # NEW: sentence count target
-            "max_sentences_per_chunk": 7,  # NEW: hard upper cap
+            "min_sentences_per_chunk": 6,
+            "semantic_focus": True,
+            "dynamic_semantic": True,
+            "dynamic_mode": "zscore",
+            "dynamic_k": 0.45,              # lowered for higher sensitivity
+            "dynamic_window": 5,
+            "dynamic_min_drop": 0.08,       # allow smaller relative drops
+            "max_sentences_per_chunk": 18,
+            "dynamic_adaptive": True,
+            "dynamic_percentile": 0.30,     # slightly higher percentile for fallback
+            "dynamic_log_cuts": True,       # enable verbose logging
         },
-        "description": "Semantic splitter target 5 sentences (no char limit, equal distribution)"
+        "description": "Semantic splitter dynamic drop-based (zscore) + hard cap 18 sentences; chunks >5 sentences"
     },
     {
-        "name": "semantic_grouping_no_limit",
-        "method_choice": "1",
+        "name": "semantic_splitter_dynamic_aggressive",
+        "method_choice": "2",
         "params": {
-            "initial_threshold": 0.9,
-            "decay_factor": 0.85,
-            "min_threshold": 0.3,
-            "min_sentences_per_chunk": 1,
+            "chunk_size": None,
+            "chunk_overlap": 0,
+            "min_sentences_per_chunk": 6,    # enforce >5 sentences
+            "semantic_focus": True,
+            "dynamic_semantic": True,
+            "dynamic_mode": "zscore",
+            "dynamic_k": 0.3,                # very sensitive
+            "dynamic_window": 4,
+            "dynamic_min_drop": 0.05,        # small relative drop
+            "max_sentences_per_chunk": 12,   # tighter hard cap
+            "dynamic_adaptive": True,
+            "dynamic_percentile": 0.40,      # more aggressive percentile cuts
+            "dynamic_log_cuts": True,
         },
-        "description": "Semantic grouping pure semantic coherence (no sentence target)"
+        "description": "AGGRESSIVE dynamic semantic splitter (sensitive) but each chunk >5 sentences"
     },
+
     {
-        "name": "semantic_grouping_sent_5",
+        "name": "semantic_grouping_anchor_greedy",
         "method_choice": "1",
         "params": {
-            "initial_threshold": 0.85,
-            "decay_factor": 0.75,
-            "min_threshold": 0.25,
-            "min_sentences_per_chunk": 5,
-            "target_sentences_per_chunk": 5,
-            "sentence_target_tolerance": 0.3,
-            "max_sentences_per_chunk": 7,  # NEW: hard upper cap
+            "min_sentences_per_chunk": 6,
+            "anchor_greedy_mode": True,
+            "anchor_target_sentences": 6,  # target group size (including anchor)
+            # Optional: "anchor_similarity_floor": 0.0  # uncomment to enforce minimum similarity for selection
         },
-        "description": "Semantic grouping target 5 sentences per chunk (±30%)"
-    },
-    {
-        "name": "semantic_grouping_sent_8",
-        "method_choice": "1",
-        "params": {
-            "initial_threshold": 0.8,
-            "decay_factor": 0.8,
-            "min_threshold": 0.2,
-            "min_sentences_per_chunk": 2,
-            "target_sentences_per_chunk": 8,
-            "sentence_target_tolerance": 0.25,
-        },
-        "description": "Semantic grouping target 8 sentences per chunk (±25%)"
-    },
-    {
-        "name": "semantic_grouping_sent_strict4",
-        "method_choice": "1",
-        "params": {
-            "initial_threshold": 0.8,
-            "decay_factor": 0.75,
-            "min_threshold": 0.25,
-            "min_sentences_per_chunk": 1,
-            "target_sentences_per_chunk": 4,
-            "sentence_target_tolerance": 0.2,
-        },
-        "description": "Semantic grouping target 4 sentences (±20%) stricter"
+        "description": "Anchor greedy non-contiguous grouping (ONLY grouping mode) – hub + top similar sentences; chunks ≥6 sentences"
     },
 ]
 
@@ -906,8 +940,8 @@ def interactive_ui():
             params_info.append(f"init_th={params['initial_threshold']}")
         if 'target_sentences_per_chunk' in params:
             params_info.append(f"target_sent={params['target_sentences_per_chunk']}")
-        if 'max_sentences_per_chunk' in params:
-            params_info.append(f"max_sent={params['max_sentences_per_chunk']}")
+        if params.get('semantic_focus'):
+            params_info.append('semantic_focus')
 
         param_str = f" ({', '.join(params_info)})" if params_info else ""
         print(f"  {i:2d}. {cfg['name']}{param_str}")
@@ -935,6 +969,8 @@ def interactive_ui():
 
     # ----- Workers per config (batch) -----
     cfg_workers = int(input("Workers per config (batch) [1]: ") or "1")
+    max_chunk_chars_input = input("Max chunk chars before truncation [50000, 0=disable]: ").strip()
+    max_chunk_chars = 50000 if max_chunk_chars_input == "" else int(max_chunk_chars_input)
 
     print("\n=== SUMMARY ===")
     print(f"Input        : {input_path}")
@@ -949,11 +985,11 @@ def interactive_ui():
         # include_oie deprecated
         if 'target_sentences_per_chunk' in params:
             params_summary.append(f"target_sent={params['target_sentences_per_chunk']}")
-        if 'max_sentences_per_chunk' in params:
-            params_summary.append(f"max_sent={params['max_sentences_per_chunk']}")
+        if params.get('semantic_focus'):
+            params_summary.append('semantic_focus')
     param_str = f" ({', '.join(params_summary)})" if params_summary else ""
     print(f"  - {cfg['name']}{param_str}")
-    print(f"Workers      : per-config={cfg_workers}\n")
+    print(f"Workers      : per-config={cfg_workers} max_chunk_chars={max_chunk_chars}\n")
 
     # spawn start-method
     mp.set_start_method("spawn", force=True)
@@ -962,14 +998,15 @@ def interactive_ui():
     for i, cfg in enumerate(selected_cfgs, 1):
         clog(f"interactive run config {i}/{len(selected_cfgs)} name={cfg['name']}", 'info')
         run_config(
-            config=cfg, 
-            input_path=input_path, 
-            output_dir=out_dir, 
+            config=cfg,
+            input_path=input_path,
+            output_dir=out_dir,
             config_workers=cfg_workers,
             batch_size=BATCH_SIZE,
             embedding_model=current_embedding_model,
             device_preference=COMMON_DEFAULTS["device_preference"],
-            enable_text_cleaning=COMMON_DEFAULTS["enable_text_cleaning"]
+            enable_text_cleaning=COMMON_DEFAULTS["enable_text_cleaning"],
+            max_chunk_chars=max_chunk_chars,
         )
 
     clog(f"interactive all configs completed count={len(selected_cfgs)} out={out_dir}", 'info')
@@ -989,8 +1026,8 @@ def main():
         features = []
         if 'target_sentences_per_chunk' in params:
             features.append(f"SENT_TARGET={params['target_sentences_per_chunk']}")
-        if 'max_sentences_per_chunk' in params:
-            features.append(f"MAX_SENT={params['max_sentences_per_chunk']}")
+        if params.get('semantic_focus'):
+            features.append('SEMANTIC_FOCUS')
         
         if params.get('min_sentences_per_chunk', 2) == 1:
             features.append("PRESERVES_ALL")
