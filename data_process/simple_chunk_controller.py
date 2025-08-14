@@ -113,24 +113,38 @@ from Method.Semantic_Splitter_Optimized import (
 
 
 """
-Usage Overview:
+Usage Overview (MINIMAL MODE):
 
-This controller now supports:
-    - semantic_splitter_* : Sequential semantic sentence splitter variants (dynamic heuristics)
-    - semantic_grouping_anchor_greedy : Non‑contiguous anchor greedy semantic grouping (ONLY grouping mode retained)
+Active algorithms only:
+    1. semantic_splitter_global  – Global adjacent sentence similarity valley detection.
+             * Pure semantic boundaries (no character limits / overlaps)
+             * Parameters (tune only if needed):
+                     - min_sentences_per_chunk (default 6)
+                     - global_z_k (default 0.50)
+                     - global_min_drop (default 0.12)
+                     - global_valley_prominence (default 0.04)
+                     - target_sentences_per_chunk (optional approximate guidance)
+                     - max_sentences_per_chunk (optional hard cap)
 
-Removed: all legacy threshold-based semantic_grouping variants (initial_threshold / decay / min_threshold logic).
+    2. semantic_grouping_anchor  – Non‑contiguous anchor greedy grouping.
+             * Each chunk = anchor sentence (highest centrality not yet used) + top similar sentences
+             * Parameters:
+                     - min_sentences_per_chunk (default 6)
+                     - anchor_target_sentences (default 6)
+                     - anchor_similarity_floor (optional minimum similarity for inclusion)
+
+Removed completely: dynamic splitter modes, z‑score streaming variants, size/character based splitting, overlap logic,
+expansion / clustering grouping, all OIE logic. Third element in returned tuples is always None.
 
 Examples:
-    python simple_chunk_controller.py -i input.tsv -o output \
-            --configs semantic_grouping_anchor_greedy
-    python simple_chunk_controller.py -i input.tsv -o output \
-            --configs semantic_splitter_dynamic_drop
+    python simple_chunk_controller.py -i input.tsv -o output --configs semantic_splitter_global
+    python simple_chunk_controller.py -i input.tsv -o output --configs semantic_grouping_anchor
+    python simple_chunk_controller.py -i input.tsv -o output   (runs both by default)
 
 Notes:
- - Character size limits removed; only sentence counts enforced.
- - Short documents (< min_sentences_per_chunk) are preserved whole.
- - Anchor greedy groups are non‑contiguous: each chunk = central "hub" sentence + top similar sentences.
+    - Sentence count is the ONLY control; short docs (< min_sentences_per_chunk) are preserved whole.
+    - Use anchor grouping when you want semantic “bags” of related sentences (non‑contiguous).
+    - Use splitter when you need contiguous segments respecting document order.
 """
 # ==== Default constants ====
 BATCH_SIZE = 600  # dòng/đợt đọc pandas
@@ -514,13 +528,8 @@ def _process_batch(
         else:
             extra = {}
 
-        # Decide silent flag: allow verbose logs for dynamic semantic configs when logging requested
+        # All semantic methods run in silent mode unless controller log level adjusted
         local_silent = True
-        try:
-            if params.get('dynamic_semantic') and params.get('dynamic_log_cuts'):
-                local_silent = False
-        except Exception:
-            pass
 
         tuples: List[Tuple[str, str, Optional[str]]] = chunk_func(
             doc_id=doc_id,
@@ -810,68 +819,29 @@ def run_config(
 
 RUN_CONFIGURATIONS: List[Dict[str, Any]] = [
     {
-        "name": "semantic_splitter_no_limit",
+        "name": "semantic_splitter_global",
         "method_choice": "2",
         "params": {
-            "chunk_size": None,  # No character limit
-            "chunk_overlap": 0,
-            "semantic_threshold": 0.35,
-            "min_sentences_per_chunk": 6,  # Enforce >5 sentences per chunk
-            "semantic_focus": True,        # Pure semantic boundaries only (no size/target enforcement)
-        },
-        "description": "Semantic splitter PURE semantic mode (no size limits) - each chunk >5 sentences"
-    },
-    {
-        "name": "semantic_splitter_dynamic_drop",
-        "method_choice": "2",
-        "params": {
-            "chunk_size": None,
-            "chunk_overlap": 0,
             "min_sentences_per_chunk": 6,
-            "semantic_focus": True,
-            "dynamic_semantic": True,
-            "dynamic_mode": "zscore",
-            "dynamic_k": 0.45,              # lowered for higher sensitivity
-            "dynamic_window": 5,
-            "dynamic_min_drop": 0.08,       # allow smaller relative drops
-            "max_sentences_per_chunk": 18,
-            "dynamic_adaptive": True,
-            "dynamic_percentile": 0.30,     # slightly higher percentile for fallback
-            "dynamic_log_cuts": True,       # enable verbose logging
+            "global_z_k": 0.50,
+            "global_min_drop": 0.12,
+            "global_valley_prominence": 0.04,
+            # Optional guidance parameters (uncomment to use):
+            # "target_sentences_per_chunk": 6,
+            # "max_sentences_per_chunk": 18,
+            "global_debug": False,
         },
-        "description": "Semantic splitter dynamic drop-based (zscore) + hard cap 18 sentences; chunks >5 sentences"
+        "description": "Contiguous semantic splitter using global adjacent similarity valleys (chunks ≥6 sentences)"
     },
     {
-        "name": "semantic_splitter_dynamic_aggressive",
-        "method_choice": "2",
-        "params": {
-            "chunk_size": None,
-            "chunk_overlap": 0,
-            "min_sentences_per_chunk": 6,    # enforce >5 sentences
-            "semantic_focus": True,
-            "dynamic_semantic": True,
-            "dynamic_mode": "zscore",
-            "dynamic_k": 0.3,                # very sensitive
-            "dynamic_window": 4,
-            "dynamic_min_drop": 0.05,        # small relative drop
-            "max_sentences_per_chunk": 12,   # tighter hard cap
-            "dynamic_adaptive": True,
-            "dynamic_percentile": 0.40,      # more aggressive percentile cuts
-            "dynamic_log_cuts": True,
-        },
-        "description": "AGGRESSIVE dynamic semantic splitter (sensitive) but each chunk >5 sentences"
-    },
-
-    {
-        "name": "semantic_grouping_anchor_greedy",
+        "name": "semantic_grouping_anchor",
         "method_choice": "1",
         "params": {
             "min_sentences_per_chunk": 6,
-            "anchor_greedy_mode": True,
-            "anchor_target_sentences": 6,  # target group size (including anchor)
-            # Optional: "anchor_similarity_floor": 0.0  # uncomment to enforce minimum similarity for selection
+            "anchor_target_sentences": 6,
+            # Optional: "anchor_similarity_floor": 0.0,
         },
-        "description": "Anchor greedy non-contiguous grouping (ONLY grouping mode) – hub + top similar sentences; chunks ≥6 sentences"
+        "description": "Non‑contiguous anchor greedy grouping (hub sentence + top similar) (chunks ≥6 sentences)"
     },
 ]
 
@@ -928,21 +898,13 @@ def interactive_ui():
     for i, cfg in enumerate(RUN_CONFIGURATIONS, 1):
         desc = cfg.get('description', 'No description')
         params_info = []
-
-        # Extract key parameters for display
         params = cfg.get('params', {})
         if 'min_sentences_per_chunk' in params:
             params_info.append(f"min_sentences={params['min_sentences_per_chunk']}")
-        # include_oie deprecated
-        if 'semantic_threshold' in params:
-            params_info.append(f"threshold={params['semantic_threshold']}")
-        if 'initial_threshold' in params and params['initial_threshold'] != 'auto':
-            params_info.append(f"init_th={params['initial_threshold']}")
         if 'target_sentences_per_chunk' in params:
             params_info.append(f"target_sent={params['target_sentences_per_chunk']}")
-        if params.get('semantic_focus'):
-            params_info.append('semantic_focus')
-
+        if 'anchor_target_sentences' in params:
+            params_info.append(f"anchor_target={params['anchor_target_sentences']}")
         param_str = f" ({', '.join(params_info)})" if params_info else ""
         print(f"  {i:2d}. {cfg['name']}{param_str}")
         print(f"      {desc}")
@@ -982,13 +944,12 @@ def interactive_ui():
         params = cfg.get('params', {})
         if 'min_sentences_per_chunk' in params:
             params_summary.append(f"min_sentences={params['min_sentences_per_chunk']}")
-        # include_oie deprecated
         if 'target_sentences_per_chunk' in params:
             params_summary.append(f"target_sent={params['target_sentences_per_chunk']}")
-        if params.get('semantic_focus'):
-            params_summary.append('semantic_focus')
-    param_str = f" ({', '.join(params_summary)})" if params_summary else ""
-    print(f"  - {cfg['name']}{param_str}")
+        if 'anchor_target_sentences' in params:
+            params_summary.append(f"anchor_target={params['anchor_target_sentences']}")
+        param_str = f" ({', '.join(params_summary)})" if params_summary else ""
+        print(f"  - {cfg['name']}{param_str}")
     print(f"Workers      : per-config={cfg_workers} max_chunk_chars={max_chunk_chars}\n")
 
     # spawn start-method
@@ -1021,17 +982,13 @@ def main():
         name = cfg['name']
         desc = cfg.get('description', 'No description')
         params = cfg.get('params', {})
-        
-        # Extract key features for display
         features = []
         if 'target_sentences_per_chunk' in params:
-            features.append(f"SENT_TARGET={params['target_sentences_per_chunk']}")
-        if params.get('semantic_focus'):
-            features.append('SEMANTIC_FOCUS')
-        
+            features.append(f"TARGET≈{params['target_sentences_per_chunk']}")
+        if 'anchor_target_sentences' in params:
+            features.append(f"ANCHOR_TARGET={params['anchor_target_sentences']}")
         if params.get('min_sentences_per_chunk', 2) == 1:
             features.append("PRESERVES_ALL")
-            
         feature_str = f" [{', '.join(features)}]" if features else ""
         config_list.append(f"    {i+1}. {name}{feature_str}")
         config_list.append(f"       {desc}")
@@ -1039,8 +996,8 @@ def main():
     config_display = "\n".join(config_list)
     
     ap = argparse.ArgumentParser(
-        description="Enhanced chunking controller with sentence-target semantic grouping",
-        epilog=f"Available configurations:\n{config_display}\n\nKey Features:\n  ✅ Sentence-count based semantic grouping\n  ✅ Preserves ALL content (no chunks discarded)\n  ✅ Optional sentence target window control\n  ✅ Advanced text cleaning for better sentence detection",
+        description="Minimal semantic chunking controller (global splitter + anchor grouping)",
+        epilog=f"Available configurations:\n{config_display}\n\nKey Points:\n  • Pure sentence-count control (no character limits)\n  • Contiguous or non‑contiguous semantic options\n  • Optional approximate sentence target & anchor size\n  • Advanced text cleaning for better sentence detection",
         formatter_class=argparse.RawDescriptionHelpFormatter
     )
     ap.add_argument("-i", "--input", required=True, help="Input TSV path")
