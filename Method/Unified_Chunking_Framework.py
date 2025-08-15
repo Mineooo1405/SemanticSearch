@@ -136,9 +136,9 @@ class UnifiedChunkingFramework:
                     result = future.result()
                     if result:
                         method_results.append(result)
-                        print(f"✅ Completed {method_name}: {len(result.chunks)} chunks")
+                        print(f"Completed {method_name}: {len(result.chunks)} chunks")
                 except Exception as e:
-                    print(f"❌ Failed {method_name}: {e}")
+                    print(f"Failed {method_name}: {e}")
         
         # Analyze and rank results
         performance_summary = self._analyze_results(method_results, target_metrics)

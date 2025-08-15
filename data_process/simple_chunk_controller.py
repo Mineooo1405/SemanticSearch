@@ -110,6 +110,7 @@ from Method.Semantic_Grouping_Optimized import (
 from Method.Semantic_Splitter_Optimized import (
     chunk_passage_text_splitter as semantic_splitter,
 )
+from Method.Text_Splitter_Char_Naive import chunk_passage_text_splitter as chunk_passage_text_splitter_char_naive
 
 
 """
@@ -472,7 +473,7 @@ def _process_batch(
     params = dict(config["params"])  # shallow copy
 
     # map
-    func_map = {"1": semantic_grouping, "2": semantic_splitter}
+    func_map = {"1": semantic_grouping, "2": semantic_splitter, "3": chunk_passage_text_splitter_char_naive}
     chunk_func = func_map[method_choice]
 
     import os
@@ -663,7 +664,7 @@ def run_config(
         w.writerow(main_header)
         w_eval = csv.writer(feval, delimiter="\t")
         w_eval.writerow(["query_id", "document_id", "sentences", "words", "tokens", "chars", "label"])  # per-chunk metrics
-        w_map = csv.writer(fmap, delimiter='\t') if collect_metadata else None
+        w_map = csv.writer(fmap, delimiter='\t') if collect_metadata and w_map else None
         if collect_metadata and w_map:
             w_map.writerow(["query_id", "document_id", "chunk_id", "sent_indices", "n_sent", "sim_mean", "sim_min", "sim_max", "sim_std", "anchor", "anchor_centrality"])  # some fields may be blank
         
@@ -881,6 +882,15 @@ RUN_CONFIGURATIONS: List[Dict[str, Any]] = [
             # Optional: "anchor_similarity_floor": 0.0,
         },
         "description": "Non‑contiguous anchor greedy grouping (hub sentence + top similar) (chunks ≥6 sentences)"
+    },
+    {
+        "name": "text_splitter_char_naive",
+        "method_choice": "3",
+        "params": {
+            "chunk_size": 600,
+            "overlap": 0,
+        },
+        "description": "Naive fixed-character splitter (no semantics)"
     },
 ]
 
@@ -1148,4 +1158,4 @@ if __name__ == "__main__":
         mp.set_start_method("spawn", force=True)
         main()
     else:
-        interactive_ui() 
+        interactive_ui()
