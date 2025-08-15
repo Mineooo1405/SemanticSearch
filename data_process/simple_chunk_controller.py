@@ -1,20 +1,28 @@
-# -*- coding: utf-8 -*-
+"""simple_chunk_controller
+=================================
+Controller để chạy 3 kiểu chunking hiện tại:
+ 1. semantic_splitter_global  (contiguous, valley detection trên similarity liền kề)
+ 2. semantic_grouping_anchor  (non‑contiguous, anchor greedy)
+ 3. text_splitter_char_naive  (cắt theo độ dài ký tự cố định)
+"""
 from __future__ import annotations
 
-# Add parent directory to path for Method imports
+## ==== PYTHONPATH ADJUSTMENT ==================================================
+# Thêm parent directory vào sys.path để import module Method/* khi chạy trực tiếp.
 import sys
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-# Suppress noisy FutureWarnings & verbose library logs
+## ==== GLOBAL ENV / LOG NOISE SUPPRESSION =====================================
+# Giảm cảnh báo & log không cần thiết để output sạch.
 import os, warnings, logging
 
-# Disable tokenizers parallelism globally (must be before SentenceTransformer import)
+# Tắt parallelism tokenizer (tránh cảnh báo + fork overhead) – phải trước import SentenceTransformer.
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
-# Tăng giới hạn lên 1 triệu (hoặc lớn hơn nếu cần)
+## NOTE: csv.field_size_limit điều chỉnh ngay bên dưới khi cần đọc trường rất dài.
 
-# For newer tokenizers versions explicitly disable parallelism API
+# Với phiên bản tokenizers mới: tắt parallelism qua API (an toàn nếu không hỗ trợ).
 try:
     import tokenizers
     tokenizers.set_parallelism(False)
@@ -28,7 +36,7 @@ warnings.filterwarnings(
     category=FutureWarning,
 )
 
-# Giảm mức log của sentence_transformers / transformers để không in INFO
+# Giảm mức log của sentence_transformers / transformers về ERROR.
 logging.getLogger("sentence_transformers").setLevel(logging.ERROR)
 logging.getLogger("transformers").setLevel(logging.ERROR)
 
@@ -158,14 +166,9 @@ COMMON_DEFAULTS = {
 # ==== Text Cleaning for SpaCy Sentence Segmentation ========================
 
 def preprocess_interview_format(text: str) -> str:
-    """
-    Tiền xử lý format interview/transcript để SpaCy có thể tách câu đúng.
-    
-    Args:
-        text: Raw text potentially in interview format
-        
-    Returns:
-        Preprocessed text with better sentence boundaries for SpaCy
+    """Chuẩn hoá transcript interview để sentencizer ít tách sai.
+
+    Chủ yếu chuyển pattern (Speaker) câu -> "Speaker said: \"câu\"" và bỏ các marker rỗng.
     """
     import re
     
@@ -210,17 +213,7 @@ def preprocess_interview_format(text: str) -> str:
     return text
 
 def clean_document_for_spacy(text: str) -> str:
-    """
-    Làm sạch document để tránh SpaCy tách câu sai.
-    Xử lý các vấn đề phổ biến: metadata, nested punctuation, quotes, dashes, lists.
-    Tối ưu cho Robust04 dataset với patterns cụ thể.
-    
-    Args:
-        text: Raw document text
-        
-    Returns:
-        Cleaned text ready for SpaCy sentence segmentation
-    """
+    """Làm sạch văn bản (đặc thù Robust04) để giảm boundary noise trước sentencizer."""
     import re
     
     if not isinstance(text, str):
@@ -350,17 +343,7 @@ def clean_document_for_spacy(text: str) -> str:
 
 
 def validate_cleaned_text(original: str, cleaned: str, max_length_diff: float = 0.3) -> bool:
-    """
-    Kiểm tra xem text cleaning có quá aggressive không.
-    
-    Args:
-        original: Original text
-        cleaned: Cleaned text  
-        max_length_diff: Maximum allowed length difference ratio
-        
-    Returns:
-        True if cleaning is reasonable, False if too aggressive
-    """
+    """Guardrail: nếu cleaning làm mất quá nhiều nội dung thì revert."""
     if not original or not cleaned:
         return False
     
@@ -384,7 +367,7 @@ def validate_cleaned_text(original: str, cleaned: str, max_length_diff: float = 
 # ==== Worker initializer =====================================================
 
 def _worker_init(model_name: str, device_pref: str):
-    """Nạp SentenceTransformer + spaCy 1 lần cho mỗi process."""
+    """Khởi tạo resource cho mỗi worker process (spaCy sentencizer + SentenceTransformer)."""
     import os
 
     os.environ["TOKENIZERS_PARALLELISM"] = "false"
@@ -465,8 +448,8 @@ def _process_batch(
             device_obj = "cuda" if torch.cuda.is_available() else "cpu"
         else:
             device_obj = device_preference.lower()
-        
-        print(f"[Single-threaded] Using device: {device_obj}")
+
+        clog(f"single-thread device={device_obj}", 'debug')
         model = SentenceTransformer(embedding_model, device=device_obj)
 
     method_choice = config["method_choice"]
