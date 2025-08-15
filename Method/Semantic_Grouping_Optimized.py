@@ -1,4 +1,5 @@
 from typing import List, Tuple, Optional
+import json
 import hashlib
 import gc
 import numpy as np
@@ -21,20 +22,39 @@ def semantic_grouping_main(
     embedding_batch_size: int = 64,
     device: Optional[str] = "cuda",
     silent: bool = False,
+    collect_metadata: bool = False,
     **_extra,
 ) -> List[Tuple[str, str, Optional[str]]]:
-    """Anchor greedy semantic grouping (non‑contiguous, MINIMAL PARAMETERS).
+    """Anchor Greedy Grouping – Tạo các cụm câu không liên tiếp (non‑contiguous) dựa trên 'hub' sentence.
 
-    Parameters:
-        min_sentences_per_chunk: Minimum sentences per final chunk; short docs kept whole.
-        anchor_target_sentences: Desired sentences per group (including anchor).
-        anchor_similarity_floor: Optional minimum similarity to include a sentence under an anchor.
-        embedding_batch_size: Embedding batch size passed to embedding helper.
-        device: Device spec ("cuda" | "cpu" | "dml").
-        silent: Suppress logging if True.
-    Returns:
-        List of (chunk_id, chunk_text, None)
-    """
+        LUỒNG 8 BƯỚC:
+            1. Tách câu → danh sách sentences.
+            2. Trường hợp ngắn: nếu tổng số câu < min_sentences_per_chunk ⇒ giữ nguyên thành 1 chunk.
+            3. Nếu số câu ≤ anchor_target_sentences ⇒ cũng trả về 1 chunk (không cần tách).
+            4. Tính ma trận similarity đầy đủ (n x n) giữa các câu (chuẩn hoá để cosine = dot).
+            5. Tính centrality cho từng câu: trung bình similarity tới các câu khác ⇒ đo “độ đại diện”.
+            6. Vòng lặp greedily:
+                     • Chọn anchor = câu có centrality lớn nhất trong tập còn lại.
+                     • Lọc những câu còn lại có similarity ≥ anchor_similarity_floor.
+                     • Sort giảm dần theo similarity tới anchor, lấy top (anchor_target_sentences - 1) ⇒ tạo nhóm.
+                     • Loại các câu vừa chọn khỏi tập remaining.
+            7. Xử lý nhóm nhỏ (undersized) bằng cách merge/attach để đảm bảo mọi chunk cuối ≥ min_sentences_per_chunk.
+            8. Kết hợp câu trong mỗi nhóm (theo thứ tự chỉ số tăng dần) → chunk_text.
+
+        GHI CHÚ QUAN TRỌNG:
+            • Các câu trong chunk có thể ở vị trí rời rạc — không giữ tính liên tục.
+            • Overlap similarity ranges giữa các chunk là bình thường vì mỗi chunk dùng anchor khác để tính thống kê.
+            • anchor_similarity_floor giúp bỏ các câu quá xa anchor, tránh nhiễu.
+            • collect_metadata=True: lưu JSON gồm chỉ số câu, thống kê similarity anchor→members và centrality anchor.
+
+        Parameters:
+                min_sentences_per_chunk: Số câu tối thiểu mỗi chunk sau cùng.
+                anchor_target_sentences: Kích thước mong muốn mỗi nhóm (anchor + các câu chọn thêm).
+                anchor_similarity_floor: Ngưỡng tối thiểu để một câu được gắn vào anchor.
+                embedding_batch_size: Batch size embedding.
+                device: Thiết bị.
+                silent: Ẩn log.
+        """
     if not silent:
         log_msg(False, f"[anchor_greedy] doc={doc_id} model={embedding_model}", 'info', 'group')
 
@@ -65,9 +85,11 @@ def semantic_grouping_main(
     n = len(sentences)
     centrality = ((sim_matrix.sum(axis=1) - 1.0) / (n - 1)).astype(float) if n > 1 else np.zeros(n, dtype=float)
 
+    # remaining: tập chỉ số câu chưa được gán vào chunk nào
     remaining = set(range(n))
     groups: List[List[int]] = []
     while remaining:
+        # Chọn anchor có centrality cao nhất (câu "đại diện" nhất trong phần còn lại)
         anchor = max(remaining, key=lambda idx: centrality[idx])
         remaining.remove(anchor)
         # Rank remaining by similarity to anchor
@@ -76,19 +98,21 @@ def semantic_grouping_main(
             for idx in remaining
             if float(sim_matrix[anchor, idx]) >= anchor_similarity_floor
         ]
+        # Sort giảm dần theo similarity đến anchor
         similars.sort(key=lambda x: x[1], reverse=True)
         need = max(0, target_k - 1)
         chosen = [idx for idx, _ in similars[:need]]
         for c in chosen:
             remaining.discard(c)
+        # Lưu nhóm: sort theo chỉ số câu để chunk_text giữ nguyên thứ tự xuất hiện trong tài liệu
         groups.append(sorted([anchor] + chosen))
 
-    # Merge trailing undersized group
+    # Merge trailing undersized group (nhóm cuối quá nhỏ nhập vào nhóm trước)
     if len(groups) >= 2 and len(groups[-1]) < min_sentences_per_chunk:
         groups[-2].extend(groups[-1])
         groups.pop()
 
-    # Forward attach any undersized groups
+    # Forward attach any undersized groups (gom buffer tích luỹ các nhóm nhỏ)
     merged: List[List[int]] = []
     buffer: List[int] = []
     for g in groups:
@@ -110,15 +134,53 @@ def semantic_grouping_main(
         merged.pop()
 
     final_chunks: List[Tuple[str, str, Optional[str]]] = []
-    for i, g in enumerate(merged):
-        chunk_sentences = [sentences[idx] for idx in sorted(set(g)) if 0 <= idx < n]
-        if not chunk_sentences:
-            continue
-        chunk_text = " ".join(chunk_sentences).strip()
-        if not chunk_text:
-            continue
-        chunk_hash = hashlib.sha1(chunk_text.encode('utf-8', 'ignore')).hexdigest()[:8]
-        final_chunks.append((f"{doc_id}_anchor{i}_hash{chunk_hash}", chunk_text, None))
+    if collect_metadata:
+        # Pre-compute anchor centrality ordering for potential inclusion in metadata
+        try:
+            centrality_vals = list(map(float, centrality))
+        except Exception:
+            centrality_vals = []
+        for i, g in enumerate(merged):
+            chunk_sentences = [sentences[idx] for idx in sorted(set(g)) if 0 <= idx < n]
+            if not chunk_sentences:
+                continue
+            chunk_text = " ".join(chunk_sentences).strip()
+            if not chunk_text:
+                continue
+            chunk_hash = hashlib.sha1(chunk_text.encode('utf-8', 'ignore')).hexdigest()[:8]
+            # Build similarity stats within group (pairwise to anchor = first element of g)
+            chunk_id_str = f"{doc_id}_anchor{i}_hash{chunk_hash}"
+            meta = {"chunk_id": chunk_id_str, "sent_indices": ",".join(str(x) for x in sorted(set(g))), "n": len(g)}
+            if sim_matrix is not None and len(g) > 1:
+                anchor = g[0]
+                sims_anchor = []
+                for idx2 in g[1:]:
+                    try:
+                        sims_anchor.append(float(sim_matrix[anchor, idx2]))
+                    except Exception:
+                        continue
+                if sims_anchor:
+                    import math
+                    m = sum(sims_anchor)/len(sims_anchor)
+                    mn = min(sims_anchor); mx = max(sims_anchor)
+                    var = sum((x-m)**2 for x in sims_anchor)/len(sims_anchor)
+                    meta.update({"anchor": anchor, "sim_mean": round(m,4), "sim_min": round(mn,4), "sim_max": round(mx,4), "sim_std": round(math.sqrt(var),4)})
+            if centrality_vals:
+                try:
+                    meta["anchor_centrality"] = round(centrality_vals[g[0]],4)
+                except Exception:
+                    pass
+            final_chunks.append((chunk_id_str, chunk_text, json.dumps(meta, ensure_ascii=False)))
+    else:
+        for i, g in enumerate(merged):
+            chunk_sentences = [sentences[idx] for idx in sorted(set(g)) if 0 <= idx < n]
+            if not chunk_sentences:
+                continue
+            chunk_text = " ".join(chunk_sentences).strip()
+            if not chunk_text:
+                continue
+            chunk_hash = hashlib.sha1(chunk_text.encode('utf-8', 'ignore')).hexdigest()[:8]
+            final_chunks.append((f"{doc_id}_anchor{i}_hash{chunk_hash}", chunk_text, None))
 
     del sim_matrix
     gc.collect()
@@ -143,6 +205,7 @@ def semantic_chunk_passage_from_grouping_logic(
     embedding_batch_size: int = 64,
     device: Optional[str] = "cuda",
     silent: bool = False,
+    collect_metadata: bool = False,
     **_extra,
 ) -> List[Tuple[str, str, Optional[str]]]:
     return semantic_grouping_main(
@@ -155,4 +218,5 @@ def semantic_chunk_passage_from_grouping_logic(
         embedding_batch_size=embedding_batch_size,
         device=device,
         silent=silent,
+        collect_metadata=collect_metadata,
     )

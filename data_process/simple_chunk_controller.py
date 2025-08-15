@@ -433,6 +433,7 @@ def _process_batch(
     device_preference: str,
     enable_text_cleaning: bool = True,
     max_chunk_chars: Optional[int] = 50000,
+    collect_metadata: bool = False,
 ) -> List[List[Any]]:
     """Chunk các dòng trong batch và trả về list row cho TSV output."""
     results: List[List[Any]] = []
@@ -538,6 +539,7 @@ def _process_batch(
             **extra,
             silent=local_silent,
             output_dir=None,
+            collect_metadata=collect_metadata,
         )
         
         # Enhanced logging for chunk processing results
@@ -561,28 +563,23 @@ def _process_batch(
                 
                 clog(f"doc_idx={local_idx} method={method_name} chunks={len(tuples)} size_avg={avg_size:.0f} min={min_size} max={max_size}{balanced_info}", 'info')
         
-        for chunk_id, chunk_text, _ in tuples:
-            # CRITICAL: Validate and sanitize chunk_text for TSV writing
+        # Append chunks for THIS document
+        for chunk_id, chunk_text, meta in tuples:
             if not isinstance(chunk_text, str):
                 chunk_text = str(chunk_text)
-            
-            # Remove problematic characters that can break TSV format
-            chunk_text = chunk_text.replace('\t', ' ')  # Replace tabs with spaces
-            chunk_text = chunk_text.replace('\n', ' ')  # Replace newlines with spaces  
-            chunk_text = chunk_text.replace('\r', ' ')  # Replace carriage returns
-            chunk_text = chunk_text.strip()
-            
-            # Skip empty chunks
+            chunk_text = (chunk_text.replace('\t', ' ')  # tabs -> space
+                                      .replace('\n', ' ')  # newlines -> space
+                                      .replace('\r', ' ')  # CR -> space
+                                      .strip())
             if not chunk_text:
                 continue
-                
-            # Optional truncation safeguard (disable with max_chunk_chars <= 0)
             if max_chunk_chars is not None and max_chunk_chars > 0 and len(chunk_text) > max_chunk_chars:
                 clog(f"truncate chunk chars={len(chunk_text)} -> {max_chunk_chars}", 'warning')
                 chunk_text = chunk_text[:max_chunk_chars] + "..."
-            
-            # Output: query_id  | document_id | chunk_text | label
-            results.append([query_id, doc_orig, chunk_text, label])
+            if collect_metadata and meta:
+                results.append([query_id, doc_orig, chunk_text, label, meta])
+            else:
+                results.append([query_id, doc_orig, chunk_text, label])
     clog(f"batch={batch_idx} done chunks={len(results)}", 'debug')
     return results
 
@@ -599,6 +596,7 @@ def run_config(
     device_preference: Optional[str] = None,
     enable_text_cleaning: Optional[bool] = None,
     max_chunk_chars: Optional[int] = 50000,
+    collect_metadata: bool = False,
 ):
     """Chạy chunking cho 1 cấu hình."""
     import time
@@ -610,6 +608,7 @@ def run_config(
 
     start = time.time()
     outfile = output_dir / f"{config['name']}_chunks.tsv"
+    map_file = output_dir / f"{config['name']}_chunk_map.tsv" if collect_metadata else None
 
     # đọc input theo chunk
     with pd.read_csv(
@@ -656,11 +655,17 @@ def run_config(
         arr = np.array(values)
         return {f"p{p}": float(np.percentile(arr, p)) for p in ps}
 
-    with open(outfile, "w", encoding="utf-8", newline="") as f, open(eval_file, "w", encoding="utf-8", newline="") as feval:
+    with open(outfile, "w", encoding="utf-8", newline="") as f, open(eval_file, "w", encoding="utf-8", newline="") as feval, (open(map_file, "w", encoding="utf-8", newline="") if map_file else open(os.devnull, 'w')) as fmap:
         w = csv.writer(f, delimiter="\t")
-        w.writerow(["query_id", "document_id", "chunk_text", "label"])
+        main_header = ["query_id", "document_id", "chunk_text", "label"]
+        if collect_metadata:
+            main_header.append("meta_json")
+        w.writerow(main_header)
         w_eval = csv.writer(feval, delimiter="\t")
         w_eval.writerow(["query_id", "document_id", "sentences", "words", "tokens", "chars", "label"])  # per-chunk metrics
+        w_map = csv.writer(fmap, delimiter='\t') if collect_metadata else None
+        if collect_metadata and w_map:
+            w_map.writerow(["query_id", "document_id", "chunk_id", "sent_indices", "n_sent", "sim_mean", "sim_min", "sim_max", "sim_std", "anchor", "anchor_centrality"])  # some fields may be blank
         
         # pool xử lý batch with streaming write
         if config_workers > 1:
@@ -670,7 +675,7 @@ def run_config(
                 initargs=(actual_embedding_model, actual_device_preference),
             ) as exe:
                 futures = {
-                    exe.submit(_process_batch, df, config, idx, actual_embedding_model, actual_device_preference, actual_enable_text_cleaning, max_chunk_chars): idx 
+                    exe.submit(_process_batch, df, config, idx, actual_embedding_model, actual_device_preference, actual_enable_text_cleaning, max_chunk_chars, collect_metadata): idx 
                     for idx, df in all_batches
                 }
                 
@@ -685,12 +690,9 @@ def run_config(
                             for row in batch_results:
                                 try:
                                     # Ensure all fields are strings and properly formatted
-                                    validated_row = [
-                                        str(row[0]) if row[0] is not None else "",  # query_id
-                                        str(row[1]) if row[1] is not None else "",  # document_id  
-                                        str(row[2]) if row[2] is not None else "",  # chunk_text
-                                        str(row[3]) if row[3] is not None else ""   # label
-                                    ]
+                                    validated_row = []
+                                    for i in range(len(row)):
+                                        validated_row.append(str(row[i]) if row[i] is not None else "")
                                     validated_results.append(validated_row)
                                 except Exception as row_error:
                                     print(f"[WARNING] Skipping invalid row: {row_error}")
@@ -701,7 +703,7 @@ def run_config(
                                 w.writerows(validated_results)
                                 # Evaluation per chunk
                                 for row in validated_results:
-                                    qid, doc_id_row, chunk_text_row, lbl = row
+                                    qid, doc_id_row, chunk_text_row, lbl = row[0:4]
                                     # Update doc chunk counter
                                     doc_chunk_counter[doc_id_row] = doc_chunk_counter.get(doc_id_row, 0) + 1
                                     sent_ct = len(extract_sentences_spacy(chunk_text_row))
@@ -713,7 +715,29 @@ def run_config(
                                     eval_token_counts.append(tok_ct)
                                     eval_char_counts.append(char_ct)
                                     w_eval.writerow([qid, doc_id_row, sent_ct, word_ct, tok_ct, char_ct, lbl])
+                                    if collect_metadata and w_map and len(row) >=5 and row[4]:
+                                        # parse metadata JSON
+                                        try:
+                                            import json
+                                            meta = json.loads(row[4])
+                                        except Exception:
+                                            meta = {}
+                                        w_map.writerow([
+                                            qid,
+                                            doc_id_row,
+                                            meta.get("chunk_id", ""),
+                                            meta.get("sent_indices", ""),
+                                            meta.get("n", ""),
+                                            meta.get("sim_mean", ""),
+                                            meta.get("sim_min", ""),
+                                            meta.get("sim_max", ""),
+                                            meta.get("sim_std", ""),
+                                            meta.get("anchor", ""),
+                                            meta.get("anchor_centrality", ""),
+                                        ])
                                 f.flush(); feval.flush()
+                                if collect_metadata and fmap:
+                                    fmap.flush()
                                 total_chunks += len(validated_results)
                         completed_batches += 1
                         
@@ -728,19 +752,13 @@ def run_config(
             # Single-threaded with streaming write
             for batch_num, (idx, df) in enumerate(all_batches, 1):
                 try:
-                    batch_results = _process_batch(df, config, idx, actual_embedding_model, actual_device_preference, actual_enable_text_cleaning, max_chunk_chars)
+                    batch_results = _process_batch(df, config, idx, actual_embedding_model, actual_device_preference, actual_enable_text_cleaning, max_chunk_chars, collect_metadata)
                     if batch_results:
                         # CRITICAL: Validate each row before writing to prevent TSV corruption
                         validated_results = []
                         for row in batch_results:
                             try:
-                                # Ensure all fields are strings and properly formatted
-                                validated_row = [
-                                    str(row[0]) if row[0] is not None else "",  # query_id
-                                    str(row[1]) if row[1] is not None else "",  # document_id  
-                                    str(row[2]) if row[2] is not None else "",  # chunk_text
-                                    str(row[3]) if row[3] is not None else ""   # label
-                                ]
+                                validated_row = [str(col) if col is not None else "" for col in row]
                                 validated_results.append(validated_row)
                             except Exception as row_error:
                                 print(f"[WARNING] Skipping invalid row: {row_error}")
@@ -749,7 +767,7 @@ def run_config(
                         if validated_results:
                             w.writerows(validated_results)
                             for row in validated_results:
-                                qid, doc_id_row, chunk_text_row, lbl = row
+                                qid, doc_id_row, chunk_text_row, lbl = row[0:4]
                                 doc_chunk_counter[doc_id_row] = doc_chunk_counter.get(doc_id_row, 0) + 1
                                 sent_ct = len(extract_sentences_spacy(chunk_text_row))
                                 word_ct = len(chunk_text_row.split())
@@ -760,7 +778,28 @@ def run_config(
                                 eval_token_counts.append(tok_ct)
                                 eval_char_counts.append(char_ct)
                                 w_eval.writerow([qid, doc_id_row, sent_ct, word_ct, tok_ct, char_ct, lbl])
+                                if collect_metadata and w_map and len(row) >=5 and row[4]:
+                                    try:
+                                        import json
+                                        meta = json.loads(row[4])
+                                    except Exception:
+                                        meta = {}
+                                    w_map.writerow([
+                                        qid,
+                                        doc_id_row,
+                                        meta.get("chunk_id", ""),
+                                        meta.get("sent_indices", ""),
+                                        meta.get("n", ""),
+                                        meta.get("sim_mean", ""),
+                                        meta.get("sim_min", ""),
+                                        meta.get("sim_max", ""),
+                                        meta.get("sim_std", ""),
+                                        meta.get("anchor", ""),
+                                        meta.get("anchor_centrality", ""),
+                                    ])
                             f.flush(); feval.flush()
+                            if collect_metadata and fmap:
+                                fmap.flush()
                             total_chunks += len(validated_results)
                         
                         # Progress update
@@ -810,7 +849,8 @@ def run_config(
     except Exception as e:
         clog(f"Failed to write evaluation summary: {e}", 'error')
 
-    clog(f"config={config['name']} done file={outfile} eval={eval_file} summary={summary_file}", 'info')
+    extra_map = f" map={map_file}" if collect_metadata else ""
+    clog(f"config={config['name']} done file={outfile} eval={eval_file} summary={summary_file}{extra_map}", 'info')
     clog(f"stats chunks={total_chunks} elapsed={elapsed:.1f}s rate={chunks_per_sec:.1f}/s avg_per_doc={avg_chunks_per_doc:.2f}{split_info}{preserve_info}", 'info')
 
 
@@ -823,12 +863,11 @@ RUN_CONFIGURATIONS: List[Dict[str, Any]] = [
         "method_choice": "2",
         "params": {
             "min_sentences_per_chunk": 6,
-            "global_z_k": 0.50,
-            "global_min_drop": 0.12,
+            "global_z_k": 0.40,
+            "global_min_drop": 0.08,
             "global_valley_prominence": 0.04,
-            # Optional guidance parameters (uncomment to use):
-            # "target_sentences_per_chunk": 6,
-            # "max_sentences_per_chunk": 18,
+            "target_sentences_per_chunk": 6,
+            "max_sentences_per_chunk": 18,
             "global_debug": False,
         },
         "description": "Contiguous semantic splitter using global adjacent similarity valleys (chunks ≥6 sentences)"
@@ -1012,6 +1051,7 @@ def main():
                     help="Enable text cleaning for better SpaCy sentence segmentation (default: True)")
     ap.add_argument("--disable-text-cleaning", action="store_true", 
                     help="Disable text cleaning, use raw documents (overrides --enable-text-cleaning)")
+    ap.add_argument("--export-chunk-map", action="store_true", help="Xuất thêm file *_chunk_map.tsv với chỉ số câu & thống kê similarity (nếu hỗ trợ)")
     ap.add_argument(
         "--configs",
         help="Comma separated config names or numbers to run (default all)",
@@ -1072,7 +1112,8 @@ def main():
                     batch_size=BATCH_SIZE,
                     embedding_model=user_embedding_model,
                     device_preference=user_device_preference,
-                    enable_text_cleaning=enable_text_cleaning
+                    enable_text_cleaning=enable_text_cleaning,
+                    collect_metadata=args.export_chunk_map,
                 ): cfg["name"]
                 for cfg in configs
             }
@@ -1092,7 +1133,8 @@ def main():
                 batch_size=BATCH_SIZE,
                 embedding_model=user_embedding_model,
                 device_preference=user_device_preference,
-                enable_text_cleaning=enable_text_cleaning
+                enable_text_cleaning=enable_text_cleaning,
+                collect_metadata=args.export_chunk_map,
             )
 
     clog("all configurations completed", 'info')
