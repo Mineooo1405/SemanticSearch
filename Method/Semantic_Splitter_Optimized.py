@@ -1,9 +1,9 @@
-"""Semantic Splitter (Phiên bản tối giản – Global Adjacent Similarity Valleys)
+"""Semantic Splitter
 
-Mục tiêu: Cắt văn bản thành các đoạn liên tiếp (contiguous) sao cho ranh giới rơi vào những “thung lũng” ngữ nghĩa –
+Mục tiêu: Cắt văn bản thành các đoạn liên tiếp (contiguous) sao cho ranh giới rơi vào những điểm cắt ngữ nghĩa –
 những chỗ độ tương đồng (cosine similarity) giữa hai câu liền kề giảm rõ rệt so với vùng xung quanh.
 
-QUY TRÌNH TỔNG QUÁT (10 BƯỚC):
+QUY TRÌNH 10 BƯỚC:
   1. Tách câu bằng spaCy (hoặc fallback) → danh sách sentences.
   2. Nhúng (embed) từng câu → vector đã chuẩn hoá L2.
   3. Tính similarity giữa MỌI cặp câu liền kề: sim(i,i+1) cho i=0..n-2.
@@ -27,13 +27,11 @@ QUY TRÌNH TỔNG QUÁT (10 BƯỚC):
 GHI CHÚ:
   • Thuật toán không điều chỉnh động thresholds – bạn điều khiển bằng 3 tham số: global_z_k, global_min_drop, global_valley_prominence.
   • target_sentences_per_chunk chỉ là “gợi ý mềm”: khi tín hiệu không đủ rõ sẽ chen đều.
-  • Không có overlap ký tự, không có giới hạn độ dài theo ký tự – chỉ đếm câu.
   • Khi collect_metadata=True: tạo JSON thống kê nội bộ (similarity liên tiếp trong chunk).
 """
 
 from typing import List, Optional, Tuple
 import json
-import hashlib
 import numpy as np
 from sklearn.metrics.pairwise import cosine_similarity
 from Tool.Sentence_Segmenter import extract_sentences_spacy
@@ -296,8 +294,8 @@ def semantic_splitter_main(
             ctext = " ".join(sentences[grp[0]: grp[-1]+1]) if sentences and grp else ""
             if not ctext:
                 continue
-            h = hashlib.sha1(ctext.encode('utf-8', errors='ignore')).hexdigest()[:8]
-            chunk_id_str = f"{doc_id}_chunk{idx}_hash{h}"
+            # Removed hash generation per user request
+            chunk_id_str = f"{doc_id}_chunk{idx}"
             meta = {"chunk_id": chunk_id_str, "sent_indices": ",".join(str(i) for i in grp), "n": len(grp)}
             if embs is not None and len(grp) > 1:
                 # adjacency similarities inside group (contiguous)
@@ -317,8 +315,7 @@ def semantic_splitter_main(
             out.append((chunk_id_str, ctext, json.dumps(meta, ensure_ascii=False)))
     else:
         for idx, ctext in enumerate(chunks):
-            h = hashlib.sha1(ctext.encode('utf-8', errors='ignore')).hexdigest()[:8]
-            out.append((f"{doc_id}_chunk{idx}_hash{h}", ctext, None))
+            out.append((f"{doc_id}_chunk{idx}", ctext, None))
     return out
 
 def chunk_passage_text_splitter(

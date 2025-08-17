@@ -1,10 +1,3 @@
-"""simple_chunk_controller
-=================================
-Controller để chạy 3 kiểu chunking hiện tại:
- 1. semantic_splitter_global  (contiguous, valley detection trên similarity liền kề)
- 2. semantic_grouping_anchor  (non‑contiguous, anchor greedy)
- 3. text_splitter_char_naive  (cắt theo độ dài ký tự cố định)
-"""
 from __future__ import annotations
 
 ## ==== PYTHONPATH ADJUSTMENT ==================================================
@@ -108,10 +101,6 @@ while True:
         break
     except OverflowError:
         max_limit = int(max_limit / 10)
-# ==== Import optimized chunking methods ====
-# NOTE: Inline OIE extraction removed from semantic methods. Third tuple element is always None.
-# Run external OIE pipeline separately if needed.
-# Semantic Splitter optimized – removed adaptive parameters (target_tokens, tolerance, enable_adaptive)
 from Method.Semantic_Grouping_Optimized import (
     semantic_chunk_passage_from_grouping_logic as semantic_grouping,
 )
@@ -120,41 +109,6 @@ from Method.Semantic_Splitter_Optimized import (
 )
 from Method.Text_Splitter_Char_Naive import chunk_passage_text_splitter as chunk_passage_text_splitter_char_naive
 
-
-"""
-Usage Overview (MINIMAL MODE):
-
-Active algorithms only:
-    1. semantic_splitter_global  – Global adjacent sentence similarity valley detection.
-             * Pure semantic boundaries (no character limits / overlaps)
-             * Parameters (tune only if needed):
-                     - min_sentences_per_chunk (default 6)
-                     - global_z_k (default 0.50)
-                     - global_min_drop (default 0.12)
-                     - global_valley_prominence (default 0.04)
-                     - target_sentences_per_chunk (optional approximate guidance)
-                     - max_sentences_per_chunk (optional hard cap)
-
-    2. semantic_grouping_anchor  – Non‑contiguous anchor greedy grouping.
-             * Each chunk = anchor sentence (highest centrality not yet used) + top similar sentences
-             * Parameters:
-                     - min_sentences_per_chunk (default 6)
-                     - anchor_target_sentences (default 6)
-                     - anchor_similarity_floor (optional minimum similarity for inclusion)
-
-Removed completely: dynamic splitter modes, z‑score streaming variants, size/character based splitting, overlap logic,
-expansion / clustering grouping, all OIE logic. Third element in returned tuples is always None.
-
-Examples:
-    python simple_chunk_controller.py -i input.tsv -o output --configs semantic_splitter_global
-    python simple_chunk_controller.py -i input.tsv -o output --configs semantic_grouping_anchor
-    python simple_chunk_controller.py -i input.tsv -o output   (runs both by default)
-
-Notes:
-    - Sentence count is the ONLY control; short docs (< min_sentences_per_chunk) are preserved whole.
-    - Use anchor grouping when you want semantic “bags” of related sentences (non‑contiguous).
-    - Use splitter when you need contiguous segments respecting document order.
-"""
 # ==== Default constants ====
 BATCH_SIZE = 600  # dòng/đợt đọc pandas
 COMMON_DEFAULTS = {
@@ -165,11 +119,8 @@ COMMON_DEFAULTS = {
 
 # ==== Text Cleaning for SpaCy Sentence Segmentation ========================
 
-def preprocess_interview_format(text: str) -> str:
-    """Chuẩn hoá transcript interview để sentencizer ít tách sai.
+def preprocess_format(text: str) -> str:
 
-    Chủ yếu chuyển pattern (Speaker) câu -> "Speaker said: \"câu\"" và bỏ các marker rỗng.
-    """
     import re
     
     if not isinstance(text, str):
@@ -484,7 +435,7 @@ def _process_batch(
             cleaned_passage = clean_document_for_spacy(passage)
             
             # Step 2: Preprocess interview/transcript format for better sentence segmentation
-            interview_processed = preprocess_interview_format(cleaned_passage)
+            interview_processed = preprocess_format(cleaned_passage)
             
             # Validate cleaning didn't remove too much content
             if not validate_cleaned_text(original_passage, interview_processed):
@@ -647,10 +598,11 @@ def run_config(
         w.writerow(main_header)
         w_eval = csv.writer(feval, delimiter="\t")
         w_eval.writerow(["query_id", "document_id", "sentences", "words", "tokens", "chars", "label"])  # per-chunk metrics
-        w_map = csv.writer(fmap, delimiter='\t') if collect_metadata and w_map else None
-        if collect_metadata and w_map:
+        # Create metadata writer if requested
+        w_map = csv.writer(fmap, delimiter='\t') if collect_metadata else None
+        if w_map:
             w_map.writerow(["query_id", "document_id", "chunk_id", "sent_indices", "n_sent", "sim_mean", "sim_min", "sim_max", "sim_std", "anchor", "anchor_centrality"])  # some fields may be blank
-        
+
         # pool xử lý batch with streaming write
         if config_workers > 1:
             with ProcessPoolExecutor(
@@ -662,7 +614,7 @@ def run_config(
                     exe.submit(_process_batch, df, config, idx, actual_embedding_model, actual_device_preference, actual_enable_text_cleaning, max_chunk_chars, collect_metadata): idx 
                     for idx, df in all_batches
                 }
-                
+
                 # Write results as they complete (streaming)
                 completed_batches = 0
                 for fut in as_completed(futures):
@@ -681,7 +633,7 @@ def run_config(
                                 except Exception as row_error:
                                     print(f"[WARNING] Skipping invalid row: {row_error}")
                                     continue
-                            
+
                             if validated_results:
                                 # Write main chunks
                                 w.writerows(validated_results)
@@ -724,7 +676,7 @@ def run_config(
                                     fmap.flush()
                                 total_chunks += len(validated_results)
                         completed_batches += 1
-                        
+
                         # Progress update
                         if completed_batches % max(1, len(all_batches) // 10) == 0:
                             progress = (completed_batches / len(all_batches)) * 100
@@ -747,7 +699,7 @@ def run_config(
                             except Exception as row_error:
                                 print(f"[WARNING] Skipping invalid row: {row_error}")
                                 continue
-                        
+
                         if validated_results:
                             w.writerows(validated_results)
                             for row in validated_results:
@@ -785,7 +737,7 @@ def run_config(
                             if collect_metadata and fmap:
                                 fmap.flush()
                             total_chunks += len(validated_results)
-                        
+
                         # Progress update
                         if batch_num % max(1, len(all_batches) // 10) == 0:
                             progress = (batch_num / len(all_batches)) * 100
@@ -863,6 +815,7 @@ RUN_CONFIGURATIONS: List[Dict[str, Any]] = [
             "min_sentences_per_chunk": 6,
             "anchor_target_sentences": 6,
             # Optional: "anchor_similarity_floor": 0.0,
+            "use_uniform_fallback": False,
         },
         "description": "Non‑contiguous anchor greedy grouping (hub sentence + top similar) (chunks ≥6 sentences)"
     },
@@ -966,6 +919,10 @@ def interactive_ui():
     max_chunk_chars_input = input("Max chunk chars before truncation [50000, 0=disable]: ").strip()
     max_chunk_chars = 50000 if max_chunk_chars_input == "" else int(max_chunk_chars_input)
 
+    # ----- Export chunk map (metadata) option -----
+    export_map_ans = input("Export chunk map with sentence indices & similarity stats? (y/N): ").strip().lower()
+    export_chunk_map = export_map_ans == 'y'
+
     print("\n=== SUMMARY ===")
     print(f"Input        : {input_path}")
     print(f"Output dir   : {out_dir}")
@@ -983,6 +940,7 @@ def interactive_ui():
         param_str = f" ({', '.join(params_summary)})" if params_summary else ""
         print(f"  - {cfg['name']}{param_str}")
     print(f"Workers      : per-config={cfg_workers} max_chunk_chars={max_chunk_chars}\n")
+    print(f"Export map   : {'YES' if export_chunk_map else 'no'}\n")
 
     # spawn start-method
     mp.set_start_method("spawn", force=True)
@@ -1000,6 +958,7 @@ def interactive_ui():
             device_preference=COMMON_DEFAULTS["device_preference"],
             enable_text_cleaning=COMMON_DEFAULTS["enable_text_cleaning"],
             max_chunk_chars=max_chunk_chars,
+            collect_metadata=export_chunk_map,
         )
 
     clog(f"interactive all configs completed count={len(selected_cfgs)} out={out_dir}", 'info')
@@ -1134,7 +1093,6 @@ def main():
 
 
 if __name__ == "__main__":
-    # Nếu được truyền tham số dòng lệnh thì dùng argparse, ngược lại mở interactive UI.
     import sys
 
     if len(sys.argv) > 1:

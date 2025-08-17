@@ -1,8 +1,6 @@
 """
 Naive character-length based splitter.
 
-Yêu cầu người dùng: "doc có 1000 chữ (ký tự) và chunk_size = 600 => 2 chunk: 600 ký tự đầu, phần còn lại".
-
 Đây là phiên bản đơn giản nhất:
 - Chỉ cắt theo số ký tự cố định (chunk_size).
 - Không semantics, không đếm token, không tách câu, không overlap (trừ khi bạn bật tuỳ chọn).
@@ -93,8 +91,3 @@ def chunk_passage_text_splitter(
         silent=silent,
     )
 
-if __name__ == "__main__":
-    demo = """Lorem ipsum dolor sit amet, consectetur adipiscing elit. Sed non risus. Suspendisse lectus tortor, dignissim sit amet, adipiscing nec, ultricies sed, dolor. Cras elementum ultrices diam. Maecenas ligula massa, varius a, semper congue, euismod non, mi."""
-    res = chunk_passage_char_splitter("demo", demo, chunk_size=60, collect_metadata=True)
-    for r in res:
-        print(r[0], len(r[1]), r[2])

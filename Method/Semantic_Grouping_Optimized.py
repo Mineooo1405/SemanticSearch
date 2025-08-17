@@ -1,6 +1,5 @@
 from typing import List, Tuple, Optional
 import json
-import hashlib
 import gc
 import numpy as np
 
@@ -25,13 +24,13 @@ def semantic_grouping_main(
     collect_metadata: bool = False,
     **_extra,
 ) -> List[Tuple[str, str, Optional[str]]]:
-    """Anchor Greedy Grouping – Tạo các cụm câu không liên tiếp (non‑contiguous) dựa trên 'hub' sentence.
+    """Anchor Greedy Grouping – Tạo các cụm câu không liên tiếp (non‑contiguous) dựa trên group sentence.
 
-        LUỒNG 8 BƯỚC:
-            1. Tách câu → danh sách sentences.
+        Quy trình 8 BƯỚC:
+            1. Tách câu bằng spaCy (hoặc fallback) → danh sách sentences.
             2. Trường hợp ngắn: nếu tổng số câu < min_sentences_per_chunk ⇒ giữ nguyên thành 1 chunk.
             3. Nếu số câu ≤ anchor_target_sentences ⇒ cũng trả về 1 chunk (không cần tách).
-            4. Tính ma trận similarity đầy đủ (n x n) giữa các câu (chuẩn hoá để cosine = dot).
+            4. Tính ma trận similarity đầy đủ (n x n) giữa các câu.
             5. Tính centrality cho từng câu: trung bình similarity tới các câu khác ⇒ đo “độ đại diện”.
             6. Vòng lặp greedily:
                      • Chọn anchor = câu có centrality lớn nhất trong tập còn lại.
@@ -63,13 +62,12 @@ def semantic_grouping_main(
         return []
 
     if len(sentences) < min_sentences_per_chunk:
-        chunk_hash = hashlib.sha1(passage_text.encode('utf-8', 'ignore')).hexdigest()[:8]
-        return [(f"{doc_id}_short_hash{chunk_hash}", passage_text, None)]
+        # No hash: simple deterministic ID
+        return [(f"{doc_id}_short", passage_text, None)]
 
     target_k = max(anchor_target_sentences, min_sentences_per_chunk)
     if len(sentences) <= target_k:
-        chunk_hash = hashlib.sha1(passage_text.encode('utf-8', 'ignore')).hexdigest()[:8]
-        return [(f"{doc_id}_single_hash{chunk_hash}", passage_text, None)]
+        return [(f"{doc_id}_single", passage_text, None)]
 
     sim_matrix = create_similarity_matrix(
         sentences=sentences,
@@ -79,8 +77,7 @@ def semantic_grouping_main(
         silent=silent,
     )
     if sim_matrix is None:
-        chunk_hash = hashlib.sha1(passage_text.encode('utf-8', 'ignore')).hexdigest()[:8]
-        return [(f"{doc_id}_matrix_fail_hash{chunk_hash}", passage_text, None)]
+        return [(f"{doc_id}_matrix_fail", passage_text, None)]
 
     n = len(sentences)
     centrality = ((sim_matrix.sum(axis=1) - 1.0) / (n - 1)).astype(float) if n > 1 else np.zeros(n, dtype=float)
@@ -147,9 +144,8 @@ def semantic_grouping_main(
             chunk_text = " ".join(chunk_sentences).strip()
             if not chunk_text:
                 continue
-            chunk_hash = hashlib.sha1(chunk_text.encode('utf-8', 'ignore')).hexdigest()[:8]
             # Build similarity stats within group (pairwise to anchor = first element of g)
-            chunk_id_str = f"{doc_id}_anchor{i}_hash{chunk_hash}"
+            chunk_id_str = f"{doc_id}_anchor{i}"
             meta = {"chunk_id": chunk_id_str, "sent_indices": ",".join(str(x) for x in sorted(set(g))), "n": len(g)}
             if sim_matrix is not None and len(g) > 1:
                 anchor = g[0]
@@ -179,15 +175,13 @@ def semantic_grouping_main(
             chunk_text = " ".join(chunk_sentences).strip()
             if not chunk_text:
                 continue
-            chunk_hash = hashlib.sha1(chunk_text.encode('utf-8', 'ignore')).hexdigest()[:8]
-            final_chunks.append((f"{doc_id}_anchor{i}_hash{chunk_hash}", chunk_text, None))
+            final_chunks.append((f"{doc_id}_anchor{i}", chunk_text, None))
 
     del sim_matrix
     gc.collect()
 
     if not final_chunks:
-        chunk_hash = hashlib.sha1(passage_text.encode('utf-8', 'ignore')).hexdigest()[:8]
-        return [(f"{doc_id}_fallback_hash{chunk_hash}", passage_text, None)]
+        return [(f"{doc_id}_fallback", passage_text, None)]
 
     if not silent:
         log_msg(False, f"Anchor greedy chunks={len(final_chunks)} target={target_k}", 'info', 'group')
