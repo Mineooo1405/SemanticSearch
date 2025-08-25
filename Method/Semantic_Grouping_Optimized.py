@@ -1,6 +1,7 @@
 from typing import List, Tuple, Optional
 import json
 import gc
+import re
 import numpy as np
 
 from Tool.Sentence_Segmenter import extract_sentences_spacy
@@ -15,58 +16,74 @@ def semantic_grouping_main(
     doc_id: str,
     embedding_model: str,
     *,
-    min_sentences_per_chunk: int = 6,
-    anchor_target_sentences: int = 6,
-    anchor_similarity_floor: float = 0.0,
+    # Graph clustering params
+    knn_k: Optional[int] = None,
+    edge_floor: float = 0.25,
+    spectral_kmax: Optional[int] = None,
+    # RMT + Modularity multiscale params
+    rmt_keep_eigs: int = 3,
+    mod_gamma_start: float = 0.7,
+    mod_gamma_end: float = 1.6,
+    mod_gamma_step: float = 0.15,
+    # Post-processing params
+    cap_soft: Optional[int] = None,
+    small_group_min: int = 2,
+    tau_merge: float = 0.38,
+    reassign_delta: float = 0.02,
+    # Graph clustering params
+    # (kept above)
     embedding_batch_size: int = 64,
     device: Optional[str] = "cuda",
     silent: bool = False,
     collect_metadata: bool = False,
+    sigmoid_tau_group: Optional[float] = None,
+    engine: Optional[str] = None,
     **_extra,
 ) -> List[Tuple[str, str, Optional[str]]]:
-    """Anchor Greedy Grouping – Tạo các cụm câu không liên tiếp (non‑contiguous) dựa trên group sentence.
+    """Graph‑based Semantic Grouping – global semantic clusters from a similarity matrix (RMT + multiscale modularity; fallback k‑NN + Spectral),
+        with split/merge post‑processing and a one‑pass boundary re‑assignment.
 
-        Quy trình 8 BƯỚC:
-            1. Tách câu bằng spaCy (hoặc fallback) → danh sách sentences.
-            2. Trường hợp ngắn: nếu tổng số câu < min_sentences_per_chunk ⇒ giữ nguyên thành 1 chunk.
-            3. Nếu số câu ≤ anchor_target_sentences ⇒ cũng trả về 1 chunk (không cần tách).
-            4. Tính ma trận similarity đầy đủ (n x n) giữa các câu.
-            5. Tính centrality cho từng câu: trung bình similarity tới các câu khác ⇒ đo “độ đại diện”.
-            6. Vòng lặp greedily:
-                     • Chọn anchor = câu có centrality lớn nhất trong tập còn lại.
-                     • Lọc những câu còn lại có similarity ≥ anchor_similarity_floor.
-                     • Sort giảm dần theo similarity tới anchor, lấy top (anchor_target_sentences - 1) ⇒ tạo nhóm.
-                     • Loại các câu vừa chọn khỏi tập remaining.
-            7. Xử lý nhóm nhỏ (undersized) bằng cách merge/attach để đảm bảo mọi chunk cuối ≥ min_sentences_per_chunk.
-            8. Kết hợp câu trong mỗi nhóm (theo thứ tự chỉ số tăng dần) → chunk_text.
+        Pipeline:
+            1) Split into sentences; build similarity matrix S and optionally sharpen via sigmoid on z‑scores.
+            2) Primary: Filter S with RMT (keep top eigen-components), then run multiscale modularity (python‑louvain) sweeping resolution γ.
+               Fallback: Build symmetric weighted k‑NN graph from S and run Spectral clustering with automatic K via eigengap (K ≤ spectral_kmax).
+            3) Post‑process: split over‑large clusters (internal k=2) when separable; merge undersized clusters if semantic gain is positive.
+            5) One pass of boundary re‑assignment if moving a boundary sentence increases its score by at least reassign_delta.
+            6) Emit clusters ordered by increasing sentence index.
 
-        GHI CHÚ QUAN TRỌNG:
-            • Các câu trong chunk có thể ở vị trí rời rạc — không giữ tính liên tục.
-            • Overlap similarity ranges giữa các chunk là bình thường vì mỗi chunk dùng anchor khác để tính thống kê.
-            • anchor_similarity_floor giúp bỏ các câu quá xa anchor, tránh nhiễu.
-            • collect_metadata=True: lưu JSON gồm chỉ số câu, thống kê similarity anchor→members và centrality anchor.
-
-        Parameters:
-                min_sentences_per_chunk: Số câu tối thiểu mỗi chunk sau cùng.
-                anchor_target_sentences: Kích thước mong muốn mỗi nhóm (anchor + các câu chọn thêm).
-                anchor_similarity_floor: Ngưỡng tối thiểu để một câu được gắn vào anchor.
-                embedding_batch_size: Batch size embedding.
-                device: Thiết bị.
-                silent: Ẩn log.
+        Key parameters:
+            rmt_keep_eigs – number of top eigenvalues to keep in RMT filter (rest averaged as noise).
+            mod_gamma_start/mod_gamma_end/mod_gamma_step – resolution sweep for multiscale modularity (larger γ → more clusters).
+            knn_k, edge_floor, spectral_kmax – graph and K limit for Spectral fallback and internal split.
+            cap_soft, small_group_min, tau_merge – disciplined split/merge controls.
+            reassign_delta – improvement threshold to move a boundary sentence to another cluster.
         """
-    if not silent:
-        log_msg(False, f"[anchor_greedy] doc={doc_id} model={embedding_model}", 'info', 'group')
+    # Start log (honor 'silent')
+    log_msg(silent, f"[grouping] doc={doc_id} model={embedding_model}", 'info', 'grouping')
 
+    # --- lightweight cleaning to remove residual metadata before sentence split ---
+    def _preclean_text(text: str) -> str:
+        if not isinstance(text, str):
+            return ""
+        s = text
+        # Remove lines/segments like: "Language: Spanish Article Type:BFN" (with or without quotes/spaces)
+        s = re.sub(
+            r"\s*[\"“”']{0,3}\s*Language:\s*\w+\s+Article\s*Type:\s*[A-Za-z0-9\-]+\.?\s*",
+            " ",
+            s,
+            flags=re.IGNORECASE,
+        )
+        # Normalize excess whitespace
+        s = re.sub(r"\s+", " ", s).strip()
+        return s
+
+    passage_text = _preclean_text(passage_text)
     sentences = extract_sentences_spacy(passage_text)
     if not sentences:
         return []
 
-    if len(sentences) < min_sentences_per_chunk:
-        # No hash: simple deterministic ID
-        return [(f"{doc_id}_short", passage_text, None)]
-
-    target_k = max(anchor_target_sentences, min_sentences_per_chunk)
-    if len(sentences) <= target_k:
+    if len(sentences) <= 1:
+        # Too short – keep as a single chunk
         return [(f"{doc_id}_single", passage_text, None)]
 
     sim_matrix = create_similarity_matrix(
@@ -80,59 +97,368 @@ def semantic_grouping_main(
         return [(f"{doc_id}_matrix_fail", passage_text, None)]
 
     n = len(sentences)
-    centrality = ((sim_matrix.sum(axis=1) - 1.0) / (n - 1)).astype(float) if n > 1 else np.zeros(n, dtype=float)
+    # Apply sigmoid to sharpen similarities around the global mean
+    try:
+        mu = float(np.mean(sim_matrix))
+        sigma = float(np.std(sim_matrix) + 1e-9)
+        tau = 0.15 if sigmoid_tau_group is None else float(sigmoid_tau_group)
+        z = (sim_matrix - mu) / sigma
+        sim_sharp = 1.0 / (1.0 + np.exp(-(z / tau)))
+    except Exception:
+        sim_sharp = sim_matrix
+    # Remove self‑similarity
+    try:
+        np.fill_diagonal(sim_sharp, 0.0)
+    except Exception:
+        pass
+    # Centrality for metadata/exemplar selection
+    centrality = (sim_sharp.sum(axis=1) / max(n - 1, 1)).astype(float) if n > 1 else np.zeros(n, dtype=float)
 
-    # remaining: tập chỉ số câu chưa được gán vào chunk nào
-    remaining = set(range(n))
-    groups: List[List[int]] = []
-    while remaining:
-        # Chọn anchor có centrality cao nhất (câu "đại diện" nhất trong phần còn lại)
-        anchor = max(remaining, key=lambda idx: centrality[idx])
-        remaining.remove(anchor)
-        # Rank remaining by similarity to anchor
-        similars = [
-            (idx, float(sim_matrix[anchor, idx]))
-            for idx in remaining
-            if float(sim_matrix[anchor, idx]) >= anchor_similarity_floor
-        ]
-        # Sort giảm dần theo similarity đến anchor
-        similars.sort(key=lambda x: x[1], reverse=True)
-        need = max(0, target_k - 1)
-        chosen = [idx for idx, _ in similars[:need]]
-        for c in chosen:
-            remaining.discard(c)
-        # Lưu nhóm: sort theo chỉ số câu để chunk_text giữ nguyên thứ tự xuất hiện trong tài liệu
-        groups.append(sorted([anchor] + chosen))
+    # ===== Helper functions =====
+    def _mean_between(A: List[int], B: List[int]) -> float:
+        if not A or not B:
+            return 0.0
+        return float(np.mean([float(sim_sharp[a, b]) for a in A for b in B]))
 
-    # Merge trailing undersized group (nhóm cuối quá nhỏ nhập vào nhóm trước)
-    if len(groups) >= 2 and len(groups[-1]) < min_sentences_per_chunk:
-        groups[-2].extend(groups[-1])
-        groups.pop()
+    def _mean_within(A: List[int]) -> float:
+        if len(A) <= 1:
+            return 1.0
+        vals = []
+        for i in range(len(A)):
+            for j in range(i + 1, len(A)):
+                vals.append(float(sim_sharp[A[i], A[j]]))
+        return float(np.mean(vals)) if vals else 1.0
 
-    # Forward attach any undersized groups (gom buffer tích luỹ các nhóm nhỏ)
-    merged: List[List[int]] = []
-    buffer: List[int] = []
+    # --- Random Matrix Theory (RMT) filtering to remove global/system noise ---
+    def _rmt_filter(S: np.ndarray, keep_eigs: int = 3) -> np.ndarray:
+        try:
+            # Ensure symmetry
+            S_sym = 0.5 * (S + S.T)
+            # Eigen decomposition
+            evals, evecs = np.linalg.eigh(S_sym)
+            # Sort descending
+            order = np.argsort(evals)[::-1]
+            evals = evals[order]
+            evecs = evecs[:, order]
+            k = int(max(1, min(keep_eigs, S.shape[0])))
+            # Keep top-k, average the rest (noise level)
+            if k < len(evals):
+                noise_mean = float(np.mean(evals[k:]))
+                evals_f = np.array([evals[i] if i < k else noise_mean for i in range(len(evals))], dtype=float)
+            else:
+                evals_f = evals.astype(float)
+            S_f = (evecs @ np.diag(evals_f) @ evecs.T).astype(float)
+            # Non-negativity and remove self-similarity
+            S_f = np.maximum(S_f, 0.0)
+            try:
+                np.fill_diagonal(S_f, 0.0)
+            except Exception:
+                pass
+            return S_f
+        except Exception:
+            # Fallback: return original (diagonal cleared)
+            Sf = S.astype(float)
+            try:
+                np.fill_diagonal(Sf, 0.0)
+            except Exception:
+                pass
+            return np.maximum(Sf, 0.0)
+
+    # --- Multiscale modularity clustering over filtered similarity ---
+    def _modularity_multiscale_labels(
+        S_filtered: np.ndarray,
+        gamma_start: float,
+        gamma_end: float,
+        gamma_step: float,
+        edge_floor_local: float,
+        kmax_cap: int,
+    ) -> Optional[np.ndarray]:
+        n_local = int(S_filtered.shape[0])
+        if n_local <= 2:
+            return None
+        # Build adjacency by threshold
+        A = np.where(S_filtered >= float(edge_floor_local), S_filtered, 0.0).astype(float)
+        try:
+            np.fill_diagonal(A, 0.0)
+        except Exception:
+            pass
+        if np.allclose(A, 0.0):
+            return None
+        # Try python-louvain (community) via networkx
+        best_labels = None
+        best_k = 0
+        best_score = float('inf')  # prefer fewer clusters; tie-break by cohesion
+        try:
+            import networkx as nx  # type: ignore
+            import community as community_louvain  # type: ignore
+
+            # Build graph from dense adjacency
+            G = nx.Graph()
+            G.add_nodes_from(range(n_local))
+            for i in range(n_local):
+                row = A[i]
+                for j in range(i + 1, n_local):
+                    w = float(row[j])
+                    if w > 0.0:
+                        G.add_edge(int(i), int(j), weight=w)
+
+            if G.number_of_edges() == 0:
+                return None
+
+            # Sweep gamma
+            cur = float(gamma_start)
+            gamma_end_eff = float(gamma_end)
+            gamma_step_eff = float(gamma_step if gamma_step > 0 else 0.2)
+            tried_any = False
+            while cur <= gamma_end_eff + 1e-9:
+                tried_any = True
+                try:
+                    part = community_louvain.best_partition(G, weight='weight', resolution=float(cur), random_state=0)
+                    labels_arr = np.array([int(part.get(i, 0)) for i in range(n_local)], dtype=int)
+                    k = int(np.max(labels_arr) + 1) if labels_arr.size else 0
+                    if 2 <= k <= int(max(2, min(kmax_cap, n_local - 1))):
+                        # Score = k minus separation (encourage smaller K and tighter groups)
+                        clusters = [[] for _ in range(k)]
+                        for i_node, labc in enumerate(labels_arr.tolist()):
+                            clusters[int(labc)].append(i_node)
+                        within_vals = []
+                        between_vals = []
+                        for a in range(k):
+                            ca = clusters[a]
+                            if len(ca) >= 2:
+                                for i2 in range(len(ca)):
+                                    for j2 in range(i2 + 1, len(ca)):
+                                        within_vals.append(float(A[ca[i2], ca[j2]]))
+                            for b in range(a + 1, k):
+                                cb = clusters[b]
+                                for ia in ca:
+                                    for ib in cb:
+                                        between_vals.append(float(A[ia, ib]))
+                        w_mean = float(np.mean(within_vals)) if within_vals else 0.0
+                        b_mean = float(np.mean(between_vals)) if between_vals else 0.0
+                        sep = max(0.0, w_mean - b_mean)
+                        score = float(k) - sep  # smaller is better
+                        if score < best_score - 1e-6 or (abs(score - best_score) <= 1e-6 and k < best_k):
+                            best_score = score
+                            best_k = k
+                            best_labels = labels_arr
+                except Exception:
+                    pass
+                cur += gamma_step_eff
+            if tried_any:
+                return best_labels
+        except Exception:
+            # networkx/community not available → no modularity
+            return None
+        return None
+
+    def _build_knn_graph(S: np.ndarray, kk: int, floor: float) -> np.ndarray:
+        nn = S.shape[0]
+        W = np.zeros((nn, nn), dtype=float)
+        k_eff = int(max(1, min(kk, nn - 1)))
+        for i in range(nn):
+            row = S[i]
+            idxs = np.argsort(-row)[: k_eff + 1]
+            idxs = [int(j) for j in idxs if int(j) != i]
+            for j in idxs:
+                val = float(S[i, j])
+                if val >= floor:
+                    W[i, j] = val
+        W = np.maximum(W, W.T)
+        return W
+
+    def _normalized_laplacian(W: np.ndarray) -> np.ndarray:
+        d = np.sum(W, axis=1)
+        with np.errstate(divide='ignore'):
+            d_inv_sqrt = np.where(d > 0, 1.0 / np.sqrt(d), 0.0)
+        D_inv_sqrt = np.diag(d_inv_sqrt)
+        I = np.eye(W.shape[0], dtype=float)
+        L = I - (D_inv_sqrt @ W @ D_inv_sqrt)
+        return L
+
+    def _kmeans(X: np.ndarray, k: int, n_init: int = 5, max_iter: int = 100, seed: int = 0) -> np.ndarray:
+        rng = np.random.RandomState(seed)
+        best_labels = None
+        best_inertia = float('inf')
+        for _ in range(n_init):
+            idx = rng.choice(X.shape[0], size=k, replace=False)
+            centers = X[idx].copy()
+            for _ in range(max_iter):
+                dists = ((X[:, None, :] - centers[None, :, :]) ** 2).sum(axis=2)
+                labels = np.argmin(dists, axis=1)
+                new_centers = np.vstack([
+                    X[labels == c].mean(axis=0) if np.any(labels == c) else centers[c]
+                    for c in range(k)
+                ])
+                shift = float(np.linalg.norm(new_centers - centers))
+                centers = new_centers
+                if shift < 1e-6:
+                    break
+            inertia = float(((X - centers[labels]) ** 2).sum())
+            if inertia < best_inertia:
+                best_inertia = inertia
+                best_labels = labels.copy()
+        return best_labels.astype(int)
+
+    def _auto_k_spectral_labels(W: np.ndarray, kmax: int) -> Optional[np.ndarray]:
+        nn = W.shape[0]
+        if nn <= 2 or np.allclose(W, 0.0):
+            return None
+        L = _normalized_laplacian(W)
+        try:
+            evals, evecs = np.linalg.eigh(L)
+        except Exception:
+            return None
+        order = np.argsort(evals)
+        evals = evals[order]
+        evecs = evecs[:, order]
+        kmax_eff = int(max(2, min(kmax, nn - 1)))
+        gaps = np.diff(evals[: kmax_eff + 1])
+        if gaps.size == 0:
+            k = 2
+        else:
+            k = int(np.argmax(gaps) + 1)
+            k = max(2, min(k, kmax_eff))
+        U = evecs[:, :k]
+        row_norm = np.linalg.norm(U, axis=1) + 1e-9
+        U_norm = U / row_norm[:, None]
+        labels = _kmeans(U_norm, k=k, n_init=5, max_iter=100, seed=0)
+        return labels
+
+    # Precompute a k‑NN graph once for spectral paths and internal split
+    k_eff_all = int(knn_k if knn_k is not None else max(5, min(20, n - 1)))
+    W_all = _build_knn_graph(sim_sharp, kk=k_eff_all, floor=float(edge_floor))
+
+    # ===== Engine selection: 'spectral' only vs 'rmt' with fallback =====
+    labels = None
+    eng = (engine or "rmt").lower().strip()
+    method_used = "RMT"
+    if eng == "spectral":
+        method_used = "SpectralOnly"
+        kmax_eff = int(spectral_kmax if spectral_kmax is not None else max(2, min(10, max(2, n // 5))))
+        labels = _auto_k_spectral_labels(W_all, kmax=kmax_eff)
+    else:
+        try:
+            S_f = _rmt_filter(sim_sharp, keep_eigs=int(max(1, rmt_keep_eigs)))
+            labels = _modularity_multiscale_labels(
+                S_filtered=S_f,
+                gamma_start=float(mod_gamma_start),
+                gamma_end=float(mod_gamma_end),
+                gamma_step=float(mod_gamma_step),
+                edge_floor_local=float(edge_floor),
+                kmax_cap=int(spectral_kmax if spectral_kmax is not None else max(2, min(10, max(2, n // 5))))
+            )
+        except Exception:
+            labels = None
+
+        if labels is None:
+            method_used = "SpectralFallback"
+            kmax_eff = int(spectral_kmax if spectral_kmax is not None else max(2, min(10, max(2, n // 5))))
+            labels = _auto_k_spectral_labels(W_all, kmax=kmax_eff)
+
+    if labels is None:
+        groups: List[List[int]] = [list(range(n))]
+    else:
+        num_clusters = int(np.max(labels) + 1)
+        groups = [[] for _ in range(num_clusters)]
+        for i, lab in enumerate(labels.tolist()):
+            groups[int(lab)].append(i)
+
+    # ===== Post‑processing: split over‑large clusters with internal 2‑way spectral when separable =====
+    # If cap_soft is not provided: use an absolute threshold derived from n
+    eff_cap_soft = int(cap_soft if cap_soft is not None else max(20, n // 3))
+
+    def _spectral_split_k2(members: List[int]) -> Optional[Tuple[List[int], List[int]]]:
+        if len(members) < 4:
+            return None
+        subW = W_all[np.ix_(members, members)]
+        L = _normalized_laplacian(subW)
+        try:
+            _, evecs = np.linalg.eigh(L)
+        except Exception:
+            return None
+        U = evecs[:, :2]
+        row_norm = np.linalg.norm(U, axis=1) + 1e-9
+        U_norm = U / row_norm[:, None]
+        lab2 = _kmeans(U_norm, k=2, n_init=5, max_iter=100, seed=1)
+        left = [members[i] for i in range(len(members)) if lab2[i] == 0]
+        right = [members[i] for i in range(len(members)) if lab2[i] == 1]
+        if not left or not right:
+            return None
+        sep = _mean_between(left, right) - 0.5 * (_mean_within(left) + _mean_within(right))
+        if sep < 0.0:
+            return (sorted(left), sorted(right))
+        return None
+
+    new_groups: List[List[int]] = []
     for g in groups:
-        if len(g) >= min_sentences_per_chunk:
-            if buffer:
-                g = sorted(buffer + g)
-                buffer = []
-            merged.append(g)
+        if len(g) > eff_cap_soft:
+            split = _spectral_split_k2(g)
+            if split is not None and all(len(x) >= max(2, small_group_min) for x in split):
+                new_groups.extend(list(split))
+            else:
+                new_groups.append(sorted(g))
         else:
-            buffer.extend(g)
-    if buffer:
-        if merged:
-            merged[-1].extend(buffer)
-        else:
-            merged.append(buffer)
+            new_groups.append(sorted(g))
+    groups = new_groups
 
-    if len(merged) >= 2 and len(merged[-1]) < min_sentences_per_chunk:
-        merged[-2].extend(merged[-1])
-        merged.pop()
+    # ===== Conditionally merge undersized clusters =====
+    merged: List[List[int]] = []
+    consumed = set()
+    for i, g in enumerate(groups):
+        if i in consumed:
+            continue
+        if len(g) >= max(2, int(small_group_min)):
+            merged.append(g)
+            continue
+        best_j = None
+        best_gain = 0.0
+        for j, h in enumerate(groups):
+            if j == i or j in consumed:
+                continue
+            inter = _mean_between(g, h)
+            if inter < float(tau_merge):
+                continue
+            base = 0.5 * (_mean_within(g) + _mean_within(h))
+            after = _mean_within(sorted(g + h))
+            gain = after - base
+            if gain > best_gain:
+                best_gain = gain
+                best_j = j
+        if best_j is not None and best_gain > 0.0:
+            consumed.add(best_j)
+            merged.append(sorted(groups[best_j] + g))
+        else:
+            merged.append(g)
+
+    # ===== One‑pass boundary sentence re‑assignment =====
+    if len(merged) >= 2:
+        for x in range(n):
+            cur = None
+            for cid, g in enumerate(merged):
+                if x in g:
+                    cur = cid
+                    break
+            if cur is None:
+                continue
+            cur_members = [y for y in merged[cur] if y != x]
+            cur_mean = float(np.mean([float(sim_sharp[x, y]) for y in cur_members])) if cur_members else 0.0
+            best_c = cur
+            best_score = cur_mean
+            for c2, h in enumerate(merged):
+                if c2 == cur:
+                    continue
+                mean_other = float(np.mean([float(sim_sharp[x, y]) for y in h])) if h else 0.0
+                # require a noticeable improvement
+                if mean_other > best_score + float(reassign_delta):
+                    best_score = mean_other
+                    best_c = c2
+            if best_c != cur:
+                merged[cur] = [y for y in merged[cur] if y != x]
+                merged[best_c] = sorted(merged[best_c] + [x])
 
     final_chunks: List[Tuple[str, str, Optional[str]]] = []
     if collect_metadata:
-        # Pre-compute anchor centrality ordering for potential inclusion in metadata
         try:
             centrality_vals = list(map(float, centrality))
         except Exception:
@@ -144,26 +470,33 @@ def semantic_grouping_main(
             chunk_text = " ".join(chunk_sentences).strip()
             if not chunk_text:
                 continue
-            # Build similarity stats within group (pairwise to anchor = first element of g)
-            chunk_id_str = f"{doc_id}_anchor{i}"
-            meta = {"chunk_id": chunk_id_str, "sent_indices": ",".join(str(x) for x in sorted(set(g))), "n": len(g)}
-            if sim_matrix is not None and len(g) > 1:
-                anchor = g[0]
-                sims_anchor = []
-                for idx2 in g[1:]:
-                    try:
-                        sims_anchor.append(float(sim_matrix[anchor, idx2]))
-                    except Exception:
-                        continue
-                if sims_anchor:
-                    import math
-                    m = sum(sims_anchor)/len(sims_anchor)
-                    mn = min(sims_anchor); mx = max(sims_anchor)
-                    var = sum((x-m)**2 for x in sims_anchor)/len(sims_anchor)
-                    meta.update({"anchor": anchor, "sim_mean": round(m,4), "sim_min": round(mn,4), "sim_max": round(mx,4), "sim_std": round(math.sqrt(var),4)})
-            if centrality_vals:
+            # Exemplar = the member with the highest centrality within the cluster
+            chunk_id_str = f"{doc_id}_cluster{i}"
+            meta = {"chunk_id": chunk_id_str, "sent_indices": ",".join(str(x) for x in sorted(set(g))), "n": len(g), "method_used": method_used}
+            if centrality_vals and g:
                 try:
-                    meta["anchor_centrality"] = round(centrality_vals[g[0]],4)
+                    exemplar = max(g, key=lambda t: centrality_vals[t])
+                    sims_ex = []
+                    for idx2 in g:
+                        if idx2 == exemplar:
+                            continue
+                        try:
+                            sims_ex.append(float(sim_matrix[exemplar, idx2]))
+                        except Exception:
+                            continue
+                    if sims_ex:
+                        import math
+                        m = sum(sims_ex) / len(sims_ex)
+                        mn = min(sims_ex); mx = max(sims_ex)
+                        var = sum((x - m) ** 2 for x in sims_ex) / len(sims_ex)
+                        meta.update({
+                            "exemplar": exemplar,
+                            "sim_mean": round(m, 4),
+                            "sim_min": round(mn, 4),
+                            "sim_max": round(mx, 4),
+                            "sim_std": round(math.sqrt(var), 4),
+                            "exemplar_centrality": round(centrality_vals[exemplar], 4)
+                        })
                 except Exception:
                     pass
             final_chunks.append((chunk_id_str, chunk_text, json.dumps(meta, ensure_ascii=False)))
@@ -175,7 +508,7 @@ def semantic_grouping_main(
             chunk_text = " ".join(chunk_sentences).strip()
             if not chunk_text:
                 continue
-            final_chunks.append((f"{doc_id}_anchor{i}", chunk_text, None))
+            final_chunks.append((f"{doc_id}_cluster{i}", chunk_text, None))
 
     del sim_matrix
     gc.collect()
@@ -183,8 +516,11 @@ def semantic_grouping_main(
     if not final_chunks:
         return [(f"{doc_id}_fallback", passage_text, None)]
 
-    if not silent:
-        log_msg(False, f"Anchor greedy chunks={len(final_chunks)} target={target_k}", 'info', 'group')
+    # Completion log (honor 'silent')
+    try:
+        log_msg(silent, f"[grouping] doc={doc_id} method={method_used} clusters={len(final_chunks)}", 'info', 'grouping')
+    except Exception:
+        pass
     return final_chunks
 
 
@@ -193,24 +529,47 @@ def semantic_chunk_passage_from_grouping_logic(
     passage_text: str,
     embedding_model: str = "thenlper/gte-base",
     *,
-    min_sentences_per_chunk: int = 6,
-    anchor_target_sentences: int = 6,
-    anchor_similarity_floor: float = 0.0,
+    # Graph clustering params
+    knn_k: Optional[int] = None,
+    edge_floor: float = 0.25,
+    spectral_kmax: Optional[int] = None,
+    # RMT + Modularity params
+    rmt_keep_eigs: int = 3,
+    mod_gamma_start: float = 0.7,
+    mod_gamma_end: float = 1.6,
+    mod_gamma_step: float = 0.15,
+    # Post-processing params
+    cap_soft: Optional[int] = None,
+    small_group_min: int = 2,
+    tau_merge: float = 0.38,
+    reassign_delta: float = 0.02,
     embedding_batch_size: int = 64,
     device: Optional[str] = "cuda",
     silent: bool = False,
     collect_metadata: bool = False,
+    sigmoid_tau_group: Optional[float] = None,
+    engine: Optional[str] = None,
     **_extra,
 ) -> List[Tuple[str, str, Optional[str]]]:
     return semantic_grouping_main(
         passage_text=passage_text,
         doc_id=doc_id,
         embedding_model=embedding_model,
-        min_sentences_per_chunk=min_sentences_per_chunk,
-        anchor_target_sentences=anchor_target_sentences,
-        anchor_similarity_floor=anchor_similarity_floor,
+        cap_soft=cap_soft,
+        small_group_min=small_group_min,
+        tau_merge=tau_merge,
+        knn_k=knn_k,
+        edge_floor=edge_floor,
+        spectral_kmax=spectral_kmax,
+        rmt_keep_eigs=rmt_keep_eigs,
+        mod_gamma_start=mod_gamma_start,
+        mod_gamma_end=mod_gamma_end,
+        mod_gamma_step=mod_gamma_step,
+        reassign_delta=reassign_delta,
         embedding_batch_size=embedding_batch_size,
         device=device,
         silent=silent,
         collect_metadata=collect_metadata,
+        sigmoid_tau_group=sigmoid_tau_group,
+        engine=engine,
     )
