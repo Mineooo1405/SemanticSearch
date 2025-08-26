@@ -108,6 +108,7 @@ from Method.Semantic_Splitter_Optimized import (
     chunk_passage_text_splitter as semantic_splitter,
 )
 from Method.Text_Splitter_Char_Naive import chunk_passage_text_splitter as chunk_passage_text_splitter_char_naive
+from Tool.rank_chunks_optimized import rank_and_filter_chunks_optimized
 
 # ==== Default constants ====
 BATCH_SIZE = 600  # dòng/đợt đọc pandas
@@ -115,6 +116,136 @@ COMMON_DEFAULTS = {
     "embedding_model": "sentence-transformers/all-MiniLM-L6-v2",
     "device_preference": "dml",  # "cuda", "dml", hoặc "cpu"
     "enable_text_cleaning": True,  # Enable text cleaning by default
+}
+
+# ==== Mapping helpers (integrated from data_process/file_mapping.py) ====
+def _mapping_parse_topics(topics_file_path: str) -> Dict[str, str]:
+    """Parse TREC topics file into {query_id: query_text} using desc + narr."""
+    import re
+    topics_data: Dict[str, str] = {}
+    with open(topics_file_path, 'r', encoding='utf-8', errors='ignore') as f:
+        content = f.read()
+    topic_entries = re.findall(r"<top>(.*?)</top>", content, re.DOTALL)
+    for entry in topic_entries:
+        num_match = re.search(r"<num>\s*Number:\s*(\d+)", entry)
+        desc_match = re.search(r"<desc>\s*Description:(.*?)(?=<narr>|\Z)", entry, re.DOTALL)
+        narr_match = re.search(r"<narr>\s*Narrative:(.*?)\Z", entry, re.DOTALL)
+        if num_match:
+            qid = num_match.group(1).strip()
+            desc = desc_match.group(1).strip() if desc_match else ""
+            narr = narr_match.group(1).strip() if narr_match else ""
+            query_text = (desc + ". " + narr).replace('\n', ' ').replace('\r', '').replace('\t', ' ').strip()
+            query_text = re.sub(r'\s+', ' ', query_text)
+            topics_data[qid] = query_text
+    return topics_data
+
+def _mapping_add_query_text_to_tsv(file_final_path: str, file_topics_path: str, output_path: str) -> bool:
+    """Add query_text to a TSV with columns: query_id, chunk_text, label."""
+    topics = _mapping_parse_topics(file_topics_path)
+    if not topics:
+        clog("mapping: no queries parsed from topics", 'warning')
+        return False
+    processed_lines = 0
+    skipped_lines = 0
+    with open(file_final_path, 'r', encoding='utf-8') as src, open(output_path, 'w', encoding='utf-8') as out:
+        # Read and ignore original header
+        header = src.readline()
+        out.write("query_text\tchunk_text\tlabel\n")
+        line_num = 1
+        for line in src:
+            line_num += 1
+            items = line.rstrip('\n').split('\t')
+            if len(items) != 3:
+                skipped_lines += 1
+                continue
+            query_id, chunk_text, label = items
+            query_text = topics.get(query_id, "")
+            if not query_text:
+                skipped_lines += 1
+                continue
+            out.write(f"{query_text}\t{chunk_text}\t{label}\n")
+            processed_lines += 1
+    clog(f"mapping: processed={processed_lines} skipped={skipped_lines} out={output_path}", 'info')
+    return True
+
+"""
+    
+_MODEL_PRESETS = {
+    # Retrieval-oriented (cao chất lượng, có thể mượt cục bộ):
+    "1": ("thenlper/gte-large", "High Quality retrieval (≥4.5GB VRAM)"),
+    "2": ("thenlper/gte-base", "Balanced retrieval (≈2GB VRAM)"),
+    "6": ("BAAI/bge-large-en-v1.5", "High Quality retrieval (≈5GB VRAM)"),
+    "7": ("BAAI/bge-small-en-v1.5", "Lightweight retrieval (≈0.3GB VRAM)"),
+    "8": ("intfloat/e5-large-v2", "Retrieval (≈3.5GB VRAM)"),
+
+    # Splitter-friendly / general-purpose SBERT:
+    "3": ("sentence-transformers/all-MiniLM-L12-v2", "Fast general (≈0.7GB VRAM)"),
+    "4": ("sentence-transformers/all-MiniLM-L6-v2", "Ultra-Fast general (≈0.5GB VRAM)"),
+    "9": ("sentence-transformers/all-mpnet-base-v2", "Strong general-purpose (≈1.0GB VRAM)"),
+
+    # Multilingual options:
+    "10": ("paraphrase-multilingual-mpnet-base-v2", "Multilingual strong (≈1.0GB VRAM)"),
+    "11": ("distiluse-base-multilingual-cased-v2", "Multilingual fast (≈0.6GB VRAM)"),
+
+    # Auto suggestion:
+    "5": ("auto", "Auto-select based on sys RAM/GPU"),
+}
+
+"""
+
+# ==== Ranking defaults and hardcoded parameters (user-editable) ====
+RANKING_DEFAULTS = {
+    "model": "thenlper/gte-base",
+    "workers": 4,
+    "chunk_size": 50000,
+    "upper_percentile": 80,
+    "lower_percentile": 20,
+    "filter_mode": "percentile",  # "percentile" or "fixed"
+    "pos_sim_thr": 0.6,
+    "neg_sim_thr": 0.4,
+}
+
+# When --hardcode flag is used, these parameters will be applied
+HARDCODE_RANKING = {
+    "model": "thenlper/gte-base",
+    "device_preference": "dml",
+    "workers": 4,
+    "chunk_size": 50000,
+    "upper_percentile": 80,
+    "lower_percentile": 20,
+    "filter_mode": "percentile",
+    "pos_sim_thr": 0.6,
+    "neg_sim_thr": 0.4,
+}
+
+# ==== Controller hardcoded run parameters (input/output, heatmap etc.) ====
+HARD_CODED_CONTROLLER = {
+    # Path to input TSV (query_id\tquery_text\tdocument_id\tdocument\tlabel)
+    "input_path": str("F:/SematicSearch/test.tsv"),
+    # Output directory for chunk and rank artifacts
+    "output_dir": str(Path("training_datasets")),
+    # Controller execution knobs
+    "workers": 1,             # parallel configs
+    "config_workers": 1,      # workers per config (batch processing)
+    "embedding_model": HARDCODE_RANKING["model"],
+    "device": HARDCODE_RANKING["device_preference"],
+    "enable_text_cleaning": True,
+    # Allow running ranking step from controller (global gate)
+    "allow_ranking": True,
+    # Allow mapping step (add query_text from topics to filtered 3-col TSV)
+    "allow_mapping": True,
+    # Topics file path for mapping
+    "topics_file": str(Path("F:/SematicSearch/robustirdata/topics.robust04.txt")),
+    # Metadata & heatmap exports
+    "export_chunk_map": True,     # write *_chunk_map.tsv
+    "export_correlation": True,   # write heatmaps per document
+    # Where to save heatmaps; default below if None
+    "correlation_dir": str(Path("training_datasets") / "correlations"),
+    # Overlay ideal boundaries in heatmaps, if available
+    "ideal_bounds_dir": str("F:/SematicSearch/tideal_bounds"),  # e.g., str(Path("training_datasets") / "ideal_bounds")
+    # Optional subset of configurations to run; None means ALL
+    # Example: ["semantic_splitter_global", "semantic_grouping_cluster"]
+    "configs": "semantic_splitter_global",
 }
 
 # ==== Text Cleaning for SpaCy Sentence Segmentation ========================
@@ -429,14 +560,14 @@ def _process_batch(
     clog(f"[controller] pid={pid} batch={batch_idx} rows={len(batch_df)} start", 'debug')
 
     # ---- Diameter enforcement helpers (optional) ----
-    def _l2_normalize_rows(arr: "np.ndarray") -> "np.ndarray":
+    def _l2_normalize_rows(arr):
         if np is None:
             return arr
         norms = np.linalg.norm(arr, axis=1, keepdims=True)
         norms[norms == 0] = 1e-9
         return arr / norms
 
-    def _split_indices_by_diameter(sim_matrix: "np.ndarray", start: int, end: int, threshold: float) -> List[Tuple[int, int]]:
+    def _split_indices_by_diameter(sim_matrix, start: int, end: int, threshold: float) -> List[Tuple[int, int]]:
         # Segment is [start, end) indices
         length = end - start
         if length <= 1 or np is None:
@@ -554,10 +685,14 @@ def _process_batch(
                         ax.set_xlabel("Sentence index")
                         ax.set_ylabel("Sentence index")
                         plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
-                        out_png = Path(correlation_dir) / f"{doc_orig}.png"
-                        fig.tight_layout()
-                        fig.savefig(out_png, dpi=120)
-                        plt.close(fig)
+                        out_png_dir = Path(correlation_dir)
+                        out_png_dir.mkdir(parents=True, exist_ok=True)
+                        out_png = out_png_dir / f"{doc_orig}.png"
+                        try:
+                            fig.tight_layout()
+                            fig.savefig(out_png, dpi=120)
+                        finally:
+                            plt.close(fig)
         except Exception as e:
             try:
                 clog(f"signals export failed doc={doc_orig} err={e}", 'warning')
@@ -620,10 +755,14 @@ def _process_batch(
                             ax.axvline(pos-0.5, color='red', linewidth=1.2)
                             ax.axhline(pos-0.5, color='red', linewidth=1.2)
                         plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
-                        out_png = Path(correlation_dir) / f"{doc_orig}.png"
-                        fig.tight_layout()
-                        fig.savefig(out_png, dpi=120)
-                        plt.close(fig)
+                        out_png_dir = Path(correlation_dir)
+                        out_png_dir.mkdir(parents=True, exist_ok=True)
+                        out_png = out_png_dir / f"{doc_orig}.png"
+                        try:
+                            fig.tight_layout()
+                            fig.savefig(out_png, dpi=120)
+                        finally:
+                            plt.close(fig)
 
                         # ==== Signals 1D plots with boundary markers ====
                         # Compute adjacent similarities and window gaps consistent with splitter
@@ -982,6 +1121,8 @@ def run_config(
     export_correlation: bool = False,
     correlation_dir: Optional[Path] = None,
     ideal_bounds_dir: Optional[Path] = None,
+    rank_after: bool = False,
+    ranking_params: Optional[Dict[str, Any]] = None,
 ):
     """Chạy chunking cho 1 cấu hình."""
     import time
@@ -1237,6 +1378,46 @@ def run_config(
 
     extra_map = f" map={map_file}" if collect_metadata else ""
     clog(f"config={config['name']} done file={outfile} eval={eval_file} summary={summary_file}{extra_map}", 'info')
+
+    # Optional: run ranking after chunking
+    if rank_after:
+        try:
+            rp = dict(RANKING_DEFAULTS)
+            if ranking_params:
+                rp.update(ranking_params)
+            clog(f"ranking after chunking using model={rp['model']} mode={rp['filter_mode']} up={rp['upper_percentile']} low={rp['lower_percentile']} workers={rp['workers']}", 'info')
+            ranked_path = rank_and_filter_chunks_optimized(
+                chunks_tsv=str(outfile),
+                output_dir=output_dir,
+                original_tsv=str(input_path),
+                upper_percentile=int(rp.get('upper_percentile', 80)),
+                lower_percentile=int(rp.get('lower_percentile', 20)),
+                model_name=str(rp.get('model', RANKING_DEFAULTS['model'])),
+                max_workers=int(rp.get('workers', 1)),
+                chunk_size=int(rp.get('chunk_size', 50000)),
+                pos_sim_thr=float(rp.get('pos_sim_thr', 0.6)),
+                neg_sim_thr=float(rp.get('neg_sim_thr', 0.4)),
+                filter_mode=str(rp.get('filter_mode', 'percentile')),
+            )
+            clog(f"ranking completed. file={ranked_path}", 'info')
+        except Exception as e:
+            clog(f"ranking failed: {e}", 'error')
+
+        # Optional mapping step: convert query_id to query_text using topics file
+        try:
+            hc = HARD_CODED_CONTROLLER
+            allow_map = bool(hc.get("allow_mapping", False))
+            topics_file = hc.get("topics_file")
+            if allow_map and topics_file and ranked_path:
+                ranked_path_str = str(ranked_path)
+                # Prefer the 3-col file output (same name) already saved by ranker
+                # If needed, map on ranked_path to produce *_with_querytext.tsv
+                mapped_out = str(Path(ranked_path_str).with_name(Path(ranked_path_str).stem + "_with_querytext.tsv"))
+                ok = _mapping_add_query_text_to_tsv(ranked_path_str, str(topics_file), mapped_out)
+                if ok:
+                    clog(f"mapping completed. file={mapped_out}", 'info')
+        except Exception as e:
+            clog(f"mapping failed: {e}", 'error')
     clog(f"stats chunks={total_chunks} elapsed={elapsed:.1f}s rate={chunks_per_sec:.1f}/s avg_per_doc={avg_chunks_per_doc:.2f}{split_info}{preserve_info}", 'info')
 
 
@@ -1265,7 +1446,19 @@ RUN_CONFIGURATIONS: List[Dict[str, Any]] = [
             "c99_stopping": "gain",
             "c99_knee_c": 1.3,
             "c99_smooth_window": 5,
-            "refine_max_shift": 2
+            "refine_max_shift": 2,
+            # New robustness knobs
+            "smooth_adj_window": 5,
+            "reassign_k": 2,
+            "reassign_margin": 0.03,
+            "dp_local_adjust": True,
+            "dp_window": 6,
+            "dp_improve_eps": 0.001,
+            # Multi-pass (disabled by default here)
+            "multi_pass_dp": True,
+            "dp_global_penalty": 0.6,
+            "dp_min_first_boundary_index": 8,
+            "multi_pass_short_len": 3,
         },
         "description": "Contiguous semantic splitter using C99 over embedding sim matrix (+ optional length post-process)"
     },
@@ -1412,14 +1605,18 @@ def interactive_ui():
     export_chunk_map = export_map_ans == 'y'
     export_corr_ans = input("Export per-document correlation (cosine heatmap) images? (y/N): ").strip().lower()
     export_corr = export_corr_ans == 'y'
-    corr_dir = out_dir / "correlations"
+    corr_default = Path(HARD_CODED_CONTROLLER["correlation_dir"]) if HARD_CODED_CONTROLLER.get("correlation_dir") else (out_dir / "correlations")
+    corr_dir = corr_default
     if export_corr:
+        user_corr = input(f"Correlation output dir [{corr_default}]: ").strip()
+        corr_dir = Path(user_corr) if user_corr else corr_default
         corr_dir.mkdir(exist_ok=True)
         # Optional: ideal boundaries overlay
         ideal_ans = input("Overlay ideal boundaries on signals plots from files *.bounds? (y/N): ").strip().lower()
         if ideal_ans == 'y':
-            ideal_dir_input = input("Enter directory containing {document_id}.bounds files [training_datasets/ideal_bounds]: ").strip()
-            ideal_dir = Path(ideal_dir_input or (out_dir / "ideal_bounds"))
+            ideal_default = Path(HARD_CODED_CONTROLLER["ideal_bounds_dir"]) if HARD_CODED_CONTROLLER.get("ideal_bounds_dir") else (out_dir / "ideal_bounds")
+            ideal_dir_input = input(f"Enter directory containing {{document_id}}.bounds files [{ideal_default}]: ").strip()
+            ideal_dir = Path(ideal_dir_input or ideal_default)
             ideal_dir.mkdir(exist_ok=True)
         else:
             ideal_dir = None
@@ -1441,6 +1638,54 @@ def interactive_ui():
     print(f"Workers      : per-config={cfg_workers} max_chunk_chars={max_chunk_chars}\n")
     print(f"Export map   : {'YES' if export_chunk_map else 'no'}\n")
 
+    # ----- Optional ranking after chunking -----
+    allow_rank_default = bool(HARD_CODED_CONTROLLER.get("allow_ranking", True))
+    if not allow_rank_default:
+        print("Ranking is disabled by HARD_CODED_CONTROLLER.allow_ranking=False")
+        do_rank = False
+    else:
+        do_rank = input("Run ranking after chunking? (y/N): ").strip().lower() == 'y'
+    rank_params = None
+    if do_rank:
+        use_hard = input("Use HARDCODE ranking params? (y/N): ").strip().lower() == 'y'
+        if use_hard:
+            rank_params = dict(HARDCODE_RANKING)
+            print(f"Using HARDCODE params: {rank_params}")
+        else:
+            # Collect minimal interactive ranking params
+            model = input(f"Ranking model [{RANKING_DEFAULTS['model']}]: ").strip() or RANKING_DEFAULTS['model']
+            workers = int(input(f"Ranking workers [{RANKING_DEFAULTS['workers']}]: ") or str(RANKING_DEFAULTS['workers']))
+            chunk_sz = int(input(f"Ranking chunk size [{RANKING_DEFAULTS['chunk_size']}]: ") or str(RANKING_DEFAULTS['chunk_size']))
+            mode = input("Filter mode [percentile|fixed] (default percentile): ").strip() or RANKING_DEFAULTS['filter_mode']
+            up = int(input(f"Upper percentile POS [{RANKING_DEFAULTS['upper_percentile']}]: ") or str(RANKING_DEFAULTS['upper_percentile']))
+            low = int(input(f"Lower percentile NEG [{RANKING_DEFAULTS['lower_percentile']}]: ") or str(RANKING_DEFAULTS['lower_percentile']))
+            pos_thr = float(input(f"Positive cosine threshold [{RANKING_DEFAULTS['pos_sim_thr']}]: ") or str(RANKING_DEFAULTS['pos_sim_thr']))
+            neg_thr = float(input(f"Negative cosine threshold [{RANKING_DEFAULTS['neg_sim_thr']}]: ") or str(RANKING_DEFAULTS['neg_sim_thr']))
+            rank_params = {
+                "model": model,
+                "workers": workers,
+                "chunk_size": chunk_sz,
+                "filter_mode": mode,
+                "upper_percentile": up,
+                "lower_percentile": low,
+                "pos_sim_thr": pos_thr,
+                "neg_sim_thr": neg_thr,
+            }
+
+    # ----- Optional mapping after ranking -----
+    do_map = False
+    map_topics = None
+    if do_rank:
+        allow_map_default = bool(HARD_CODED_CONTROLLER.get("allow_mapping", False))
+        do_map = input(f"Run mapping (add query_text) after ranking? (y/N) [default {'Y' if allow_map_default else 'N'}]: ").strip().lower() == 'y' if allow_map_default else (input("Run mapping (add query_text) after ranking? (y/N): ").strip().lower() == 'y')
+        if do_map:
+            map_topics_default = HARD_CODED_CONTROLLER.get("topics_file") or (Path("robustirdata") / "topics.robust04.txt")
+            map_topics_in = input(f"Path to topics file [{map_topics_default}]: ").strip()
+            map_topics = Path(map_topics_in) if map_topics_in else Path(map_topics_default)
+            # Update hardcoded so run_config sees it
+            HARD_CODED_CONTROLLER["allow_mapping"] = True
+            HARD_CODED_CONTROLLER["topics_file"] = str(map_topics)
+
     # spawn start-method
     mp.set_start_method("spawn", force=True)
 
@@ -1461,6 +1706,8 @@ def interactive_ui():
             export_correlation=export_corr,
             correlation_dir=corr_dir,
             ideal_bounds_dir=ideal_dir,
+            rank_after=do_rank,
+            ranking_params=rank_params,
         )
 
     clog(f"interactive all configs completed count={len(selected_cfgs)} out={out_dir}", 'info')
@@ -1491,7 +1738,7 @@ def main():
         epilog=f"Available configurations:\n{config_display}\n\nKey Points:\n  • Pure sentence-count control (no character limits)\n  • Contiguous or non‑contiguous semantic options\n  • Optional approximate sentence target & anchor size\n  • Advanced text cleaning for better sentence detection",
         formatter_class=argparse.RawDescriptionHelpFormatter
     )
-    ap.add_argument("-i", "--input", required=True, help="Input TSV path")
+    ap.add_argument("-i", "--input", required=False, help="Input TSV path (required unless --use-hardcoded)")
     ap.add_argument("-o", "--output-dir", default="training_datasets", help="Output directory")
     ap.add_argument("-w", "--workers", type=int, default=1, help="Parallel configs workers")
     ap.add_argument("-c", "--config-workers", type=int, default=1, help="Workers per config (process batches)")
@@ -1506,11 +1753,28 @@ def main():
     ap.add_argument("--export-chunk-map", action="store_true", help="Xuất thêm file *_chunk_map.tsv với chỉ số câu & thống kê similarity (nếu hỗ trợ)")
     ap.add_argument("--export-correlation", action="store_true", help="Xuất ảnh heatmap cosine similarity per-document")
     ap.add_argument("--ideal-bounds-dir", help="Thư mục chứa các file {document_id}.bounds (danh sách edge theo dòng hoặc dấu phẩy) để overlay lên signals")
+    # Ranking options
+    ap.add_argument("--rank-after", action="store_true", help="Run ranking after chunking and write filtered outputs")
+    ap.add_argument("--hardcode", action="store_true", help="Use HARDCODE_RANKING parameters for ranking")
+    ap.add_argument("--rank-model", help="Ranking model name (overrides defaults unless --hardcode)")
+    ap.add_argument("--rank-workers", type=int, help="Ranking workers (overrides defaults unless --hardcode)")
+    ap.add_argument("--rank-chunk-size", type=int, help="Ranking chunk size (overrides defaults unless --hardcode)")
+    ap.add_argument("--rank-filter-mode", choices=["percentile", "fixed"], help="Ranking filter mode")
+    ap.add_argument("--rank-up", type=int, help="Upper percentile for positives")
+    ap.add_argument("--rank-low", type=int, help="Lower percentile for negatives")
+    ap.add_argument("--rank-pos-thr", type=float, help="Positive cosine threshold (fixed mode)")
+    ap.add_argument("--rank-neg-thr", type=float, help="Negative cosine threshold (fixed mode)")
+    # Mapping options
+    ap.add_argument("--map-after", action="store_true", help="Run mapping (add query_text) after ranking")
+    ap.add_argument("--topics-file", help="Path to topics file for mapping")
     ap.add_argument("--grouping-engine", choices=["rmt", "spectral"], help="Engine cho semantic_grouping: rmt (mặc định, có fallback) hoặc spectral (chỉ spectral)")
     ap.add_argument(
         "--configs",
         help="Comma separated config names or numbers to run (default all)",
     )
+    # Controller hardcoded toggle (with alias for convenience)
+    ap.add_argument("--use-hardcoded", action="store_true", dest="use_hardcoded", help="Use HARD_CODED_CONTROLLER for input/output and heatmap options")
+    ap.add_argument("--use-hardcode", action="store_true", dest="use_hardcoded", help=argparse.SUPPRESS)
     args = ap.parse_args()
 
     # USER PARAMETERS TAKE PRIORITY - only update defaults if user explicitly provided values
@@ -1525,9 +1789,69 @@ def main():
     set_controller_log_level(args.log_level)
     clog(f"startup embedding_model={user_embedding_model} device={user_device_preference} text_cleaning={enable_text_cleaning}", 'info')
 
+    # Validate required input unless using hardcoded
+    if not args.use_hardcoded and not args.input:
+        ap.error("-i/--input is required unless --use-hardcoded is provided")
+
+    # If --use-hardcoded is set, override input/output and export options
+    if args.use_hardcoded:
+        hc = HARD_CODED_CONTROLLER
+        # Apply paths
+        args.input = hc.get("input_path", args.input)
+        args.output_dir = hc.get("output_dir", args.output_dir)
+        # Apply controller execution knobs
+        args.workers = hc.get("workers", args.workers)
+        args.config_workers = hc.get("config_workers", args.config_workers)
+        args.embedding_model = hc.get("embedding_model", args.embedding_model)
+        args.device = hc.get("device", args.device)
+        # Apply text cleaning
+        if hc.get("enable_text_cleaning", True):
+            args.enable_text_cleaning = True
+            args.disable_text_cleaning = False
+        else:
+            args.enable_text_cleaning = False
+            args.disable_text_cleaning = True
+        # Export options
+        if hc.get("export_chunk_map", False):
+            args.export_chunk_map = True
+        if hc.get("export_correlation", False):
+            args.export_correlation = True
+        # Ideal bounds dir
+        if hc.get("ideal_bounds_dir"):
+            args.ideal_bounds_dir = hc.get("ideal_bounds_dir")
+        # Prepare correlation dir
+        correlation_dir_override = hc.get("correlation_dir")
+        # Apply hardcoded configs selection if provided
+        if hc.get("configs"):
+            args.configs = hc.get("configs")
+        # Honor mapping default from hardcoded
+        if not hc.get("allow_mapping", False):
+            args.map_after = False
+        else:
+            # Provide default topics file if not given
+            if not getattr(args, 'topics_file', None):
+                args.topics_file = hc.get("topics_file")
+        # Honor allow_ranking gate for CLI
+        if not hc.get("allow_ranking", True):
+            # Disable rank-after even if user passed it
+            try:
+                args.rank_after = False
+            except Exception:
+                pass
+    else:
+        correlation_dir_override = None
+
     input_path = Path(args.input)
     out_dir = Path(args.output_dir)
     out_dir.mkdir(exist_ok=True)
+
+    # Ensure correlation directory exists if exporting correlations
+    if args.export_correlation:
+        try:
+            corr_path = Path(correlation_dir_override) if correlation_dir_override else (out_dir / "correlations")
+            corr_path.mkdir(parents=True, exist_ok=True)
+        except Exception as e:
+            clog(f"failed to create correlation dir: {e}", 'warning')
 
     # filter configs - support both names and numbers
     if args.configs:
@@ -1560,6 +1884,24 @@ def main():
             except Exception:
                 pass
 
+    # Build ranking params if requested
+    do_rank_after = bool(args.rank_after)
+    rank_params_cli = None
+    if do_rank_after:
+        if args.hardcode:
+            rank_params_cli = dict(HARDCODE_RANKING)
+        else:
+            rp = dict(RANKING_DEFAULTS)
+            if args.rank_model: rp['model'] = args.rank_model
+            if args.rank_workers is not None: rp['workers'] = args.rank_workers
+            if args.rank_chunk_size is not None: rp['chunk_size'] = args.rank_chunk_size
+            if args.rank_filter_mode: rp['filter_mode'] = args.rank_filter_mode
+            if args.rank_up is not None: rp['upper_percentile'] = args.rank_up
+            if args.rank_low is not None: rp['lower_percentile'] = args.rank_low
+            if args.rank_pos_thr is not None: rp['pos_sim_thr'] = args.rank_pos_thr
+            if args.rank_neg_thr is not None: rp['neg_sim_thr'] = args.rank_neg_thr
+            rank_params_cli = rp
+
     # pool cho configs - pass user parameters directly, don't modify COMMON_DEFAULTS
     if args.workers > 1:
         with ProcessPoolExecutor(
@@ -1580,8 +1922,10 @@ def main():
                     enable_text_cleaning=enable_text_cleaning,
                     collect_metadata=args.export_chunk_map,
                     export_correlation=args.export_correlation,
-                    correlation_dir=out_dir / "correlations",
+                    correlation_dir=Path(correlation_dir_override) if correlation_dir_override else out_dir / "correlations",
                     ideal_bounds_dir=Path(args.ideal_bounds_dir) if args.ideal_bounds_dir else None,
+                    rank_after=do_rank_after,
+                    ranking_params=rank_params_cli,
                 ): cfg["name"]
                 for cfg in configs
             }
@@ -1604,8 +1948,10 @@ def main():
                 enable_text_cleaning=enable_text_cleaning,
                 collect_metadata=args.export_chunk_map,
                 export_correlation=args.export_correlation,
-                correlation_dir=out_dir / "correlations",
+                correlation_dir=Path(correlation_dir_override) if correlation_dir_override else out_dir / "correlations",
                 ideal_bounds_dir=Path(args.ideal_bounds_dir) if args.ideal_bounds_dir else None,
+                rank_after=do_rank_after,
+                ranking_params=rank_params_cli,
             )
 
     clog("all configurations completed", 'info')
