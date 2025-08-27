@@ -7,6 +7,26 @@ import argparse
 from typing import cast
 from sklearn.model_selection import KFold
 
+# ===== Hardcoded defaults (optional one-shot mode) =====
+# Adjust these paths to your environment, then run:
+#   python create_matchzoo_datapacks.py --use-hardcode
+HARD_CODED_CONFIG = {
+    # Input should be a 3-column TSV: query_text (or query), chunk_text (or passage), label
+    # Recommended: the mapping output produced by controller ranking: *_with_querytext.tsv
+    "input_file": "training_datasets/semantic_splitter_global_chunks_rrf_filtered_with_querytext.tsv",
+    # Where to write cv_folds/*.dam files
+    "output_dir": "datapacks/semantic_splitter_global",
+    # Data properties
+    "has_header": True,
+    # CV controls
+    "create_cv_folds": True,
+    "n_folds": 5,
+    # Unused when create_cv_folds is True (kept for completeness)
+    "train_ratio": 0.8,
+    # Verbose logging
+    "verbose": True,
+}
+
 def parse_arguments():
     """Parse command line arguments"""
     parser = argparse.ArgumentParser(
@@ -19,6 +39,9 @@ def parse_arguments():
         python create_matchzoo_datapacks.py input.tsv --n-folds 10
         python create_matchzoo_datapacks.py input.tsv --output-dir ./datapacks
         python create_matchzoo_datapacks.py input.tsv --train-ratio 0.7 --no-cv
+        
+    Chạy với cấu hình hardcode (không cần đối số):
+    python create_matchzoo_datapacks.py --use-hardcode
         """
     )
     
@@ -140,6 +163,38 @@ def main():
         interactive_mode()
         return
     
+    # One-shot hardcoded mode: allow running with just --use-hardcode
+    if len(sys.argv) == 2 and sys.argv[1] in ("--use-hardcode", "--use-hardcoded"):
+        cfg = HARD_CODED_CONFIG
+        input_file = cfg["input_file"]
+        output_dir = cfg["output_dir"] or os.path.dirname(input_file)
+        os.makedirs(output_dir, exist_ok=True)
+
+        print("=== CONFIGURATION (HARDCODE) ===")
+        print(f"Input file    : {input_file}")
+        print(f"Output dir    : {output_dir}")
+        print(f"Has header    : {cfg['has_header']}")
+        print(f"Create CV     : {cfg['create_cv_folds']}")
+        if cfg['create_cv_folds']:
+            print(f"Number of folds: {cfg['n_folds']}")
+        print(f"Verbose       : {cfg['verbose']}")
+        print("=" * 22)
+
+        try:
+            create_and_split_datapack(
+                input_file=input_file,
+                train_ratio=cfg.get('train_ratio', 0.8),
+                has_header=cfg.get('has_header', True),
+                create_cv_folds=cfg.get('create_cv_folds', True),
+                n_folds=cfg.get('n_folds', 5),
+                output_dir=output_dir,
+            )
+            print(f"\nHoàn thành! {cfg.get('n_folds', 5)}-fold cross-validation đã được tạo trong {os.path.join(output_dir, 'cv_folds')}/")
+        except Exception as e:
+            print(f"Lỗi (hardcode): {e}")
+            sys.exit(1)
+        return
+    
     # Parse CLI arguments
     args = parse_arguments()
     
@@ -188,7 +243,8 @@ def main():
             train_ratio=args.train_ratio,
             has_header=not args.no_header,
             create_cv_folds=not args.no_cv,
-            n_folds=args.n_folds if not args.no_cv else 5
+            n_folds=args.n_folds if not args.no_cv else 5,
+            output_dir=output_dir,
         )
         
         if args.no_cv:
@@ -201,7 +257,7 @@ def main():
         print(f"Lỗi: {e}")
         sys.exit(1)
 
-def create_and_split_datapack(input_file: str, train_ratio: float, has_header: bool, create_cv_folds: bool = True, n_folds: int = 5):
+def create_and_split_datapack(input_file: str, train_ratio: float, has_header: bool, create_cv_folds: bool = True, n_folds: int = 5, output_dir: str | None = None):
     """
     Đọc file TSV, chuyển đổi thành các DataPack của MatchZoo cho Cross-Validation.
     
@@ -215,7 +271,8 @@ def create_and_split_datapack(input_file: str, train_ratio: float, has_header: b
           không tạo train_pack.dam và test_pack.dam riêng biệt.
     """
     print(f"Đang xử lý file: {input_file}")
-    output_dir = os.path.dirname(input_file)
+    # Determine output directory
+    output_dir = output_dir or os.path.dirname(input_file)
     
     # Check file size first to determine processing strategy
     file_size_mb = os.path.getsize(input_file) / (1024 * 1024)

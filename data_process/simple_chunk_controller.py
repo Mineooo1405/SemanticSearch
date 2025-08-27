@@ -207,7 +207,8 @@ RANKING_DEFAULTS = {
 
 # When --hardcode flag is used, these parameters will be applied
 HARDCODE_RANKING = {
-    "model": "thenlper/gte-base",
+    #"model": "thenlper/gte-base",
+    "model" : "sentence-transformers/all-mpnet-base-v2",
     "device_preference": "dml",
     "workers": 4,
     "chunk_size": 50000,
@@ -221,7 +222,7 @@ HARDCODE_RANKING = {
 # ==== Controller hardcoded run parameters (input/output, heatmap etc.) ====
 HARD_CODED_CONTROLLER = {
     # Path to input TSV (query_id\tquery_text\tdocument_id\tdocument\tlabel)
-    "input_path": str("F:/SematicSearch/test.tsv"),
+    "input_path": str("F:/SematicSearch/integrated_robust04_modified_v2_subset_100rows.tsv"),
     # Output directory for chunk and rank artifacts
     "output_dir": str(Path("training_datasets")),
     # Controller execution knobs
@@ -238,11 +239,11 @@ HARD_CODED_CONTROLLER = {
     "topics_file": str(Path("F:/SematicSearch/robustirdata/topics.robust04.txt")),
     # Metadata & heatmap exports
     "export_chunk_map": True,     # write *_chunk_map.tsv
-    "export_correlation": True,   # write heatmaps per document
+    "export_correlation": False,   # write heatmaps per document
     # Where to save heatmaps; default below if None
     "correlation_dir": str(Path("training_datasets") / "correlations"),
     # Overlay ideal boundaries in heatmaps, if available
-    "ideal_bounds_dir": str("F:/SematicSearch/tideal_bounds"),  # e.g., str(Path("training_datasets") / "ideal_bounds")
+    #"ideal_bounds_dir": str("F:/SematicSearch/tideal_bounds"),  # e.g., str(Path("training_datasets") / "ideal_bounds")
     # Optional subset of configurations to run; None means ALL
     # Example: ["semantic_splitter_global", "semantic_grouping_cluster"]
     "configs": "semantic_splitter_global",
@@ -1136,6 +1137,12 @@ def run_config(
     outfile = output_dir / f"{config['name']}_chunks.tsv"
     map_file = output_dir / f"{config['name']}_chunk_map.tsv" if collect_metadata else None
 
+    # Announce effective settings for this config
+    clog(
+        f"config={config['name']} begin model={actual_embedding_model} device={actual_device_preference} clean={'on' if actual_enable_text_cleaning else 'off'} rank_after={rank_after}",
+        'info'
+    )
+
     # đọc input theo chunk
     with pd.read_csv(
         input_path,
@@ -1385,7 +1392,10 @@ def run_config(
             rp = dict(RANKING_DEFAULTS)
             if ranking_params:
                 rp.update(ranking_params)
-            clog(f"ranking after chunking using model={rp['model']} mode={rp['filter_mode']} up={rp['upper_percentile']} low={rp['lower_percentile']} workers={rp['workers']}", 'info')
+            clog(
+                f"ranking start model={rp['model']} mode={rp['filter_mode']} up={rp['upper_percentile']} low={rp['lower_percentile']} workers={rp['workers']} chunks_in={outfile}",
+                'info'
+            )
             ranked_path = rank_and_filter_chunks_optimized(
                 chunks_tsv=str(outfile),
                 output_dir=output_dir,
@@ -1399,7 +1409,7 @@ def run_config(
                 neg_sim_thr=float(rp.get('neg_sim_thr', 0.4)),
                 filter_mode=str(rp.get('filter_mode', 'percentile')),
             )
-            clog(f"ranking completed. file={ranked_path}", 'info')
+            clog(f"ranking completed file={ranked_path}", 'info')
         except Exception as e:
             clog(f"ranking failed: {e}", 'error')
 
@@ -1415,7 +1425,9 @@ def run_config(
                 mapped_out = str(Path(ranked_path_str).with_name(Path(ranked_path_str).stem + "_with_querytext.tsv"))
                 ok = _mapping_add_query_text_to_tsv(ranked_path_str, str(topics_file), mapped_out)
                 if ok:
-                    clog(f"mapping completed. file={mapped_out}", 'info')
+                    clog(f"mapping completed file={mapped_out}", 'info')
+                else:
+                    clog("mapping skipped (no queries parsed or no matches)", 'warning')
         except Exception as e:
             clog(f"mapping failed: {e}", 'error')
     clog(f"stats chunks={total_chunks} elapsed={elapsed:.1f}s rate={chunks_per_sec:.1f}/s avg_per_doc={avg_chunks_per_doc:.2f}{split_info}{preserve_info}", 'info')
@@ -1787,7 +1799,6 @@ def main():
     global CONTROLLER_SILENT
     CONTROLLER_SILENT = args.quiet
     set_controller_log_level(args.log_level)
-    clog(f"startup embedding_model={user_embedding_model} device={user_device_preference} text_cleaning={enable_text_cleaning}", 'info')
 
     # Validate required input unless using hardcoded
     if not args.use_hardcoded and not args.input:
@@ -1804,6 +1815,9 @@ def main():
         args.config_workers = hc.get("config_workers", args.config_workers)
         args.embedding_model = hc.get("embedding_model", args.embedding_model)
         args.device = hc.get("device", args.device)
+        # Reflect hardcoded overrides into effective variables
+        user_embedding_model = args.embedding_model
+        user_device_preference = args.device.lower()
         # Apply text cleaning
         if hc.get("enable_text_cleaning", True):
             args.enable_text_cleaning = True
@@ -1811,6 +1825,7 @@ def main():
         else:
             args.enable_text_cleaning = False
             args.disable_text_cleaning = True
+        enable_text_cleaning = args.enable_text_cleaning and not args.disable_text_cleaning
         # Export options
         if hc.get("export_chunk_map", False):
             args.export_chunk_map = True
@@ -1831,6 +1846,9 @@ def main():
             # Provide default topics file if not given
             if not getattr(args, 'topics_file', None):
                 args.topics_file = hc.get("topics_file")
+            # Auto-enable mapping when allowed in hardcoded mode
+            if hc.get("topics_file"):
+                args.map_after = True
         # Honor allow_ranking gate for CLI
         if not hc.get("allow_ranking", True):
             # Disable rank-after even if user passed it
@@ -1838,8 +1856,19 @@ def main():
                 args.rank_after = False
             except Exception:
                 pass
+        else:
+            # Auto-enable ranking with HARDCODE_RANKING if not specified
+            if not getattr(args, 'rank_after', False):
+                args.rank_after = True
+                args.hardcode = True
+                clog("hardcoded: auto-enable ranking with HARDCODE_RANKING", 'info')
     else:
         correlation_dir_override = None
+    # Log effective startup settings AFTER applying overrides
+    clog(
+        f"startup embedding_model={user_embedding_model} device={user_device_preference} text_cleaning={enable_text_cleaning} use_hardcoded={args.use_hardcoded} rank_after={bool(args.rank_after)} map_after={bool(args.map_after)}",
+        'info'
+    )
 
     input_path = Path(args.input)
     out_dir = Path(args.output_dir)

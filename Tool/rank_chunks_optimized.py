@@ -56,6 +56,7 @@ def estimate_memory_usage(file_path: str) -> Dict[str, float]:
 _QUERY_TEXT_KEYS = {"query_text", "query", "question"}
 _CHUNK_TEXT_KEYS = {"chunk_text", "passage", "text"}
 _QUERY_ID_KEYS   = {"query_id", "qid"}
+_DOC_ID_KEYS     = {"document_id", "doc_id", "did", "doc"}
 _CHUNK_ID_KEYS   = {"chunk_id", "cid", "pid"}
 _LABEL_KEYS      = {"label", "score", "target"}
 
@@ -91,6 +92,10 @@ def _standardize_columns(df: pd.DataFrame, *, require_query_text: bool = True) -
     qid = _find_col(existing, _QUERY_ID_KEYS)
     if qid:
         mapping[qid] = "query_id"
+
+    did = _find_col(existing, _DOC_ID_KEYS)
+    if did:
+        mapping[did] = "document_id"
 
     cid = _find_col(existing, _CHUNK_ID_KEYS)
     if cid:
@@ -522,10 +527,16 @@ def _process_queries_sequential(
     ranker = OptimizedRanker(model_name=model_name)
     kept_rows = []
     processed_queries = 0
-    total_queries = df['query_id'].nunique()
+    # Count unique (query, document) pairs
+    if 'document_id' in df.columns:
+        total_queries = df[['query_id','document_id']].drop_duplicates().shape[0]
+        group_iter = df.groupby(['query_id','document_id'])
+    else:
+        total_queries = df['query_id'].nunique()
+        group_iter = df.groupby('query_id')
     
     # Process each query group
-    for query_id, group_df in df.groupby('query_id'):
+    for keys, group_df in group_iter:
         try:
             processed_queries += 1
             if processed_queries % 10 == 0:
@@ -533,8 +544,12 @@ def _process_queries_sequential(
                 gc.collect()  # Periodic garbage collection
             
             query_text = str(group_df['query_text'].iloc[0])
+            if isinstance(keys, tuple):
+                query_id, document_id = keys
+            else:
+                query_id, document_id = keys, group_df.get('document_id', pd.Series([''])).iloc[0]
             
-            # Skip very small groups
+            # Skip very small groups (per document)
             if len(group_df) < 2:
                 continue
             
@@ -573,7 +588,10 @@ def _process_queries_sequential(
                 kept_rows.append(selected)
             
         except Exception as e:
-            print(f"Error processing query {query_id}: {e}")
+            try:
+                print(f"Error processing query {query_id} doc {document_id}: {e}")
+            except Exception:
+                print(f"Error processing group: {e}")
             continue
     
     # Clean up
@@ -597,15 +615,26 @@ def _process_queries_parallel(
     from concurrent.futures import ProcessPoolExecutor, as_completed
     import multiprocessing
     
+    # Determine total groups: per (query_id, document_id) if available
+    if 'document_id' in df.columns:
+        group_iter = df.groupby(['query_id','document_id'])
+        group_count = df[['query_id','document_id']].drop_duplicates().shape[0]
+    else:
+        group_iter = df.groupby('query_id')
+        group_count = df['query_id'].nunique()
     # Limit workers to available resources
-    effective_workers = min(max_workers, multiprocessing.cpu_count(), df['query_id'].nunique())
+    effective_workers = min(max_workers, multiprocessing.cpu_count(), group_count)
     print(f"Using {effective_workers} effective workers for ranking")
     
     # Group queries for batch processing
     query_groups = []
-    for query_id, group_df in df.groupby('query_id'):
-        if len(group_df) >= 2:  # Skip very small groups
-            query_groups.append((query_id, group_df))
+    for keys, group_df in group_iter:
+        if len(group_df) >= 2:  # Skip very small groups per document
+            if isinstance(keys, tuple):
+                qid, did = keys
+            else:
+                qid, did = keys, group_df.get('document_id', pd.Series([''])).iloc[0]
+            query_groups.append((qid, did, group_df))
     
     if not query_groups:
         return []
@@ -620,11 +649,12 @@ def _process_queries_parallel(
         future_to_query = {}
         worker_counter = 0
         
-        for query_id, group_df in query_groups:
+        for query_id, document_id, group_df in query_groups:
             worker_id = worker_counter % effective_workers + 1
             future = executor.submit(
                 _rank_single_query_worker,
                 query_id,
+                document_id,
                 group_df,
                 model_name,
                 upper_percentile,
@@ -634,13 +664,13 @@ def _process_queries_parallel(
                 neg_sim_thr,
                 filter_mode,
             )
-            future_to_query[future] = query_id
+            future_to_query[future] = (query_id, document_id)
             worker_counter += 1
         
         # Collect results
         completed_count = 0
         for future in as_completed(future_to_query):
-            query_id = future_to_query[future]
+            query_id, document_id = future_to_query[future]
             completed_count += 1
             
             try:
@@ -649,10 +679,10 @@ def _process_queries_parallel(
                     kept_rows.append(result)
                 
                 if completed_count % 10 == 0:
-                    print(f"Parallel: Completed {completed_count}/{len(query_groups)} queries...")
+                    print(f"Parallel: Completed {completed_count}/{len(query_groups)} query-doc groups...")
                     
             except Exception as e:
-                print(f"Error processing query {query_id} in parallel: {e}")
+                print(f"Error processing query {query_id} doc {document_id} in parallel: {e}")
                 continue
     
     print(f"Parallel processing completed. {len(kept_rows)} successful query rankings.")
@@ -661,6 +691,7 @@ def _process_queries_parallel(
 
 def _rank_single_query_worker(
     query_id: str,
+    document_id: str,
     group_df: pd.DataFrame,
     model_name: str,
     upper_percentile: int,
@@ -718,7 +749,7 @@ def _rank_single_query_worker(
         return selected if not selected.empty else None
             
     except Exception as e:
-        print(f"Worker W{worker_id} error processing query {query_id}: {e}")
+        print(f"Worker W{worker_id} error processing query {query_id} doc {document_id}: {e}")
         return None
     finally:
         # Cleanup worker resources
