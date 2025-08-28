@@ -452,6 +452,130 @@ def _global_dp_boundaries(adj_signal: List[float], *, penalty: float = 0.5, min_
     # enforce minimal first boundary if requested
     return [b for b in boundaries if b >= int(min_first_boundary_index)]
 
+
+def _build_unified_boundary_signal(
+    embs: np.ndarray,
+    adj_base: List[float],
+    *,
+    window: int = 4,
+    w_drop: float = 0.6,
+    w_drift: float = 0.3,
+    w_valley: float = 0.1,
+    tau: float = 1.0,
+) -> List[float]:
+    """Hợp nhất ba tín hiệu ranh giới (điểm cắt) về một thang điểm đơn:
+    - drop: 1 - sim(i, i+1) từ adjacencies đã làm mượt
+    - drift: 1 - cos(centroid trái, centroid phải) trong cửa sổ nhỏ quanh biên
+    - valley: (s_{i-1}-s_i)_+ + (s_{i+1}-s_i)_+ biểu diễn độ lõm cục bộ
+
+    Trả về điểm [0,1] sau khi z-score và sigmoid; càng cao càng là biên.
+    """
+    n = int(embs.shape[0])
+    m = max(0, n - 1)
+    if m == 0:
+        return []
+    s = np.array(adj_base, dtype=float)
+    # 1) drop component
+    drop_raw = 1.0 - s
+    mu = float(drop_raw.mean()); sd = float(drop_raw.std() + 1e-9)
+    drop_z = (drop_raw - mu) / sd
+    # 2) drift component via rolling centroids
+    w = max(1, int(window))
+    drift_vals: List[float] = []
+    for i in range(m):
+        a0 = max(0, i - (w - 1))
+        a1 = i + 1
+        b0 = i + 1
+        b1 = min(n, i + 1 + w)
+        if (a1 - a0) < 1 or (b1 - b0) < 1:
+            drift_vals.append(0.0)
+            continue
+        cl = embs[a0:a1].mean(axis=0)
+        cr = embs[b0:b1].mean(axis=0)
+        nl = float(np.linalg.norm(cl) + 1e-9)
+        nr = float(np.linalg.norm(cr) + 1e-9)
+        cl = cl / nl; cr = cr / nr
+        cs = float(cl @ cr)
+        cs = max(-1.0, min(1.0, cs))
+        drift_vals.append(1.0 - cs)
+    dv = np.array(drift_vals, dtype=float)
+    mu = float(dv.mean()); sd = float(dv.std() + 1e-9)
+    drift_z = (dv - mu) / sd
+    # 3) valley concavity
+    valley_raw = np.zeros(m, dtype=float)
+    for i in range(m):
+        left_drop = max(0.0, float(s[i - 1] - s[i])) if i - 1 >= 0 else 0.0
+        right_rise = max(0.0, float(s[i + 1] - s[i])) if i + 1 < m else 0.0
+        valley_raw[i] = left_drop + right_rise
+    mu = float(valley_raw.mean()); sd = float(valley_raw.std() + 1e-9)
+    valley_z = (valley_raw - mu) / sd
+    # Hợp nhất và squash về [0,1]
+    comb = float(w_drop) * drop_z + float(w_drift) * drift_z + float(w_valley) * valley_z
+    t = max(1e-9, float(tau))
+    unified = 1.0 / (1.0 + np.exp(-(comb / t)))
+    return unified.tolist()
+
+
+def _dp_select_boundaries(
+    scores: List[float],
+    *,
+    penalty: float = 0.6,
+    min_spacing: int = 2,
+    min_first_boundary_index: int = 1,
+) -> List[int]:
+    """Chọn tập biên tối đa hóa tổng điểm - penalty*#cuts với ràng buộc khoảng cách tối thiểu.
+
+    - scores có độ dài m = n-1 (điểm cho mỗi cạnh giữa câu i và i+1, i=0..m-1)
+    - Trả về chỉ số câu (1..n-1) theo quy ước của file.
+    """
+    m = len(scores)
+    if m <= 0:
+        return []
+    s = np.array(scores, dtype=float)
+    # Vị trí không hợp lệ cho biên đầu tiên
+    start_edge = int(min_first_boundary_index) - 1
+    neg_inf = -1e18
+    valid = np.ones(m, dtype=bool)
+    if start_edge > 0:
+        valid[:max(0, start_edge)] = False
+    # DP: best value đến vị trí i
+    dp = np.full(m, neg_inf, dtype=float)
+    take = np.zeros(m, dtype=bool)
+    prev_idx = np.full(m, -1, dtype=int)
+    for i in range(m):
+        # Không chọn i
+        if i > 0:
+            dp0 = dp[i - 1]
+        else:
+            dp0 = 0.0
+        best_val = dp0
+        best_take = False
+        best_prev = i - 1
+        # Chọn i nếu hợp lệ
+        if valid[i]:
+            j = i - int(min_spacing)
+            base = dp[j] if j >= 0 else 0.0
+            v = float(s[i]) - float(penalty) + base
+            if v > best_val:
+                best_val = v
+                best_take = True
+                best_prev = j
+        dp[i] = best_val
+        take[i] = best_take
+        prev_idx[i] = best_prev
+    # Truy hồi
+    res_edges: List[int] = []
+    i = m - 1
+    while i >= 0:
+        if take[i]:
+            res_edges.append(i)
+            i = prev_idx[i]
+        else:
+            i = i - 1
+    res_edges.sort()
+    # đổi từ edge index (0..m-1) sang boundary (1..n-1)
+    return [e + 1 for e in res_edges]
+
 def _merge_short_segments(boundaries: List[int], embs: np.ndarray, *, short_len: int = 3) -> List[int]:
     """Merge segments shorter than short_len into the more similar neighbor based on centroid cosine.
     Iterate until no short segment remains or only one segment left.
@@ -564,61 +688,77 @@ def process_sentence_splitting_with_semantics(
             adj_for_valley = (1.0 / (1.0 + np.exp(-(z / tau_f)))).tolist()
     except Exception:
         adj_for_valley = adj_base
-    # 4. Hybrid C99 + Valley
-    c99_min_chunk = max(3, int(min_boundary_spacing))
-    c99_bounds: List[int] = _c99_boundaries(
-        embeddings,
-        min_chunk_size=c99_min_chunk,
-        max_cuts=None,
-        use_local_rank=bool(_legacy_kwargs.get('c99_use_local_rank', False)),
-        mask_size=int(_legacy_kwargs.get('c99_mask_size', 11) or 11),
-        stopping=str(_legacy_kwargs.get('c99_stopping', 'gain')), # gain or profile
-        knee_c=float(_legacy_kwargs.get('c99_knee_c', 1.2) or 1.2),
-        smooth_window=int(_legacy_kwargs.get('c99_smooth_window', 3) or 3),
-    )
-    # Valley from adjacent similarities
-    valley_tau = float(_legacy_kwargs.get('valley_tau', 0.12))
-    hybrid_mode = str(_legacy_kwargs.get('hybrid_mode', 'intersection')).lower()
-    valley_bounds: List[int] = _valley_boundaries(
-        adj_for_valley,
-        triplet_tau=valley_tau,
-        min_boundary_spacing=min_boundary_spacing,
-        min_first_boundary_index=min_first_boundary_index,
-    )
-    vote_thr = float(_legacy_kwargs.get('vote_thr', 0.8) or 0.8)
-    if hybrid_mode == 'union_weighted':
-        all_bs = sorted(set(c99_bounds) | set(valley_bounds))
-        scores = {}
-        for b in all_bs:
-            sc = 0.0
-            if b in valley_bounds:
-                sc += 0.5
-            if b in c99_bounds:
-                sc += 0.5
-            scores[b] = sc
-        boundaries = [b for b in all_bs if scores.get(b, 0.0) >= vote_thr]
-    elif hybrid_mode == 'union':
-        boundaries = sorted(set(c99_bounds) | set(valley_bounds))
+    # 4. Chọn thuật toán phân đoạn
+    algorithm = str(_legacy_kwargs.get('algorithm', 'hybrid')).lower()
+    if algorithm in ('robust_dp', 'robust'):
+        # Xây unified score và chọn biên bằng DP với ràng buộc min_spacing
+        r_window = int(_legacy_kwargs.get('r_window', 4) or 4)
+        r_w_drop = float(_legacy_kwargs.get('r_w_drop', 0.6) or 0.6)
+        r_w_drift = float(_legacy_kwargs.get('r_w_drift', 0.3) or 0.3)
+        r_w_valley = float(_legacy_kwargs.get('r_w_valley', 0.1) or 0.1)
+        r_tau = float(_legacy_kwargs.get('r_tau', 1.0) or 1.0)
+        r_penalty = float(_legacy_kwargs.get('rdp_penalty', 0.6) or 0.6)
+        unified_scores = _build_unified_boundary_signal(
+            embeddings,
+            adj_for_valley,
+            window=r_window,
+            w_drop=r_w_drop,
+            w_drift=r_w_drift,
+            w_valley=r_w_valley,
+            tau=r_tau,
+        )
+        boundaries = _dp_select_boundaries(
+            unified_scores,
+            penalty=r_penalty,
+            min_spacing=min_boundary_spacing,
+            min_first_boundary_index=min_first_boundary_index,
+        )
     else:
-        boundaries = sorted(set(c99_bounds) & set(valley_bounds))
-    # Score map for NMS: prefer consensus
-    if hybrid_mode == 'union_weighted':
-        score_map = scores
-    else:
-        score_map = {}
-        both = set(c99_bounds) & set(valley_bounds)
-        for b in set(boundaries):
-            if b in both:
-                score_map[b] = 1.0
-            elif b in set(valley_bounds):
-                score_map[b] = 0.8
-            else:
-                score_map[b] = 0.7
-    # Score-based NMS (soft preference)
-    boundaries = _score_based_nms(boundaries, score_map, min_boundary_spacing)
-    # Fallback: when intersection is empty use C99 (avoid over-cutting from naive union)
-    if hybrid_mode == 'intersection' and len(boundaries) == 0:
-        boundaries = c99_bounds
+        # Hybrid C99 + Valley (mặc định cũ)
+        c99_min_chunk = max(3, int(min_boundary_spacing))
+        c99_bounds: List[int] = _c99_boundaries(
+            embeddings,
+            min_chunk_size=c99_min_chunk,
+            max_cuts=None,
+            use_local_rank=bool(_legacy_kwargs.get('c99_use_local_rank', False)),
+            mask_size=int(_legacy_kwargs.get('c99_mask_size', 11) or 11),
+            stopping=str(_legacy_kwargs.get('c99_stopping', 'gain')), # gain or profile
+            knee_c=float(_legacy_kwargs.get('c99_knee_c', 1.2) or 1.2),
+            smooth_window=int(_legacy_kwargs.get('c99_smooth_window', 3) or 3),
+        )
+        valley_tau = float(_legacy_kwargs.get('valley_tau', 0.12))
+        hybrid_mode = str(_legacy_kwargs.get('hybrid_mode', 'intersection')).lower()
+        valley_bounds: List[int] = _valley_boundaries(
+            adj_for_valley,
+            triplet_tau=valley_tau,
+            min_boundary_spacing=min_boundary_spacing,
+            min_first_boundary_index=min_first_boundary_index,
+        )
+        vote_thr = float(_legacy_kwargs.get('vote_thr', 0.8) or 0.8)
+        if hybrid_mode == 'union_weighted':
+            all_bs = sorted(set(c99_bounds) | set(valley_bounds))
+            scores = {}
+            for b in all_bs:
+                sc = 0.0
+                if b in valley_bounds:
+                    sc += 0.5
+                if b in c99_bounds:
+                    sc += 0.5
+                scores[b] = sc
+            boundaries = [b for b in all_bs if scores.get(b, 0.0) >= vote_thr]
+            score_map = scores
+        elif hybrid_mode == 'union':
+            boundaries = sorted(set(c99_bounds) | set(valley_bounds))
+            # tạo score nhẹ để NMS
+            score_map = {b: (1.0 if (b in c99_bounds and b in valley_bounds) else 0.8 if b in valley_bounds else 0.7) for b in boundaries}
+        else:
+            boundaries = sorted(set(c99_bounds) & set(valley_bounds))
+            score_map = {b: 1.0 for b in boundaries}
+        # Score-based NMS (soft preference)
+        boundaries = _score_based_nms(boundaries, score_map, min_boundary_spacing)
+        # Fallback: when intersection is empty use C99 (avoid over-cutting from naive union)
+        if hybrid_mode == 'intersection' and len(boundaries) == 0:
+            boundaries = c99_bounds
     n = len(sentences)
     all_bounds = boundaries + [n]
     chunks: List[str] = []
@@ -632,34 +772,69 @@ def process_sentence_splitting_with_semantics(
             groups.append(grp)
         cursor = b
     # 6. Fine-tune boundaries: local shift near boundary to minimize cross-similarity
+    # Các hệ số cho tinh chỉnh biên: tối đa hóa kết dính trong-segment, tối thiểu hóa tương tự liên-segment
+    try:
+        refine_alpha = float(_legacy_kwargs.get('refine_alpha', 1.0) or 1.0)
+        refine_beta = float(_legacy_kwargs.get('refine_beta', 0.5) or 0.5)
+        refine_balance = float(_legacy_kwargs.get('refine_balance', 0.0) or 0.0)  # phạt mất cân bằng độ dài hai bên
+    except Exception:
+        refine_alpha, refine_beta, refine_balance = 1.0, 0.5, 0.0
+
     def _refine_boundaries(bounds: List[int], embs: np.ndarray, max_shift: int = 0, min_first_boundary_index: int = 3) -> List[int]:
+        """Dịch chuyển biên trong cửa sổ [-max_shift, +max_shift] để tối ưu:
+        score = alpha*(coh_left + coh_right) - beta*(sim(mean_left, mean_right)) - balance_penalty
+        Trong đó: coh(seg) ~= ||sum(vec)||^2 / len(seg), tính nhanh bằng tiền tố tích lũy embedding.
+        """
         if not bounds:
             return bounds
         n = embs.shape[0]
+        d = embs.shape[1] if embs.ndim == 2 else 0
+        # Tiền tố tích lũy embedding để tính nhanh tổng và kết dính
+        try:
+            pref = np.concatenate([np.zeros((1, d), dtype=embs.dtype), np.cumsum(embs, axis=0)], axis=0)
+        except Exception:
+            pref = None
+
+        def seg_sum(a: int, b: int) -> Optional[np.ndarray]:
+            if pref is None or b <= a:
+                return None
+            return pref[b] - pref[a]
+
         refined: List[int] = []
         prev = 0
         sorted_bounds = sorted(bounds)
         for idx, b in enumerate(sorted_bounds):
             next_b = sorted_bounds[idx + 1] if (idx + 1) < len(sorted_bounds) else n
             best_b = b
-            best_score = -1e9
+            best_score = -1e18
             for delta in range(-max_shift, max_shift + 1):
                 nb = b + delta
-                # Ensure at least 1 sentence on each side after shifting
+                # đảm bảo tối thiểu 1 câu mỗi bên và ràng buộc biên đầu tiên
                 min_nb_allowed = prev + 2
                 if idx == 0:
                     min_nb_allowed = max(min_nb_allowed, int(min_first_boundary_index))
                 if nb < min_nb_allowed or nb >= next_b - 1:
                     continue
-                left = embs[prev:nb]
-                right = embs[nb:next_b]
-                if left.shape[0] < 1 or right.shape[0] < 1:
+                left_sum = seg_sum(prev, nb)
+                right_sum = seg_sum(nb, next_b)
+                if left_sum is None or right_sum is None:
                     continue
-                a = embs[nb - 1]
-                c = embs[nb]
-                cross = float(a @ c)
-                # lower cross-similarity is better
-                score = -cross
+                left_len = nb - prev
+                right_len = next_b - nb
+                # mean vector hai phía
+                ml = left_sum / float(max(1, left_len))
+                mr = right_sum / float(max(1, right_len))
+                # kết dính trong đoạn: ||sum||^2 / len
+                coh_l = float(left_sum @ left_sum) / float(max(1, left_len))
+                coh_r = float(right_sum @ right_sum) / float(max(1, right_len))
+                # tương tự giữa hai phía (càng thấp càng tốt)
+                cross = float(ml @ mr)
+                score = refine_alpha * (coh_l + coh_r) - refine_beta * cross
+                # phạt mất cân bằng độ dài (tùy chọn)
+                if refine_balance > 0.0:
+                    total_len = left_len + right_len
+                    bal = abs(left_len - right_len) / float(max(1, total_len))
+                    score -= refine_balance * bal
                 if score > best_score:
                     best_score = score
                     best_b = nb

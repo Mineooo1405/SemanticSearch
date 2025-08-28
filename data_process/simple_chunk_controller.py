@@ -107,6 +107,9 @@ from Method.Semantic_Grouping_Optimized import (
 from Method.Semantic_Splitter_Optimized import (
     chunk_passage_text_splitter as semantic_splitter,
 )
+from Method.Coling2025_RobustDP_Splitter import (
+    chunk_passage_text_splitter_coling2025 as semantic_splitter_coling2025,
+)
 from Method.Text_Splitter_Char_Naive import chunk_passage_text_splitter as chunk_passage_text_splitter_char_naive
 from Tool.rank_chunks_optimized import rank_and_filter_chunks_optimized
 
@@ -139,12 +142,38 @@ def _mapping_parse_topics(topics_file_path: str) -> Dict[str, str]:
             topics_data[qid] = query_text
     return topics_data
 
-def _mapping_add_query_text_to_tsv(file_final_path: str, file_topics_path: str, output_path: str) -> bool:
-    """Add query_text to a TSV with columns: query_id, chunk_text, label."""
-    topics = _mapping_parse_topics(file_topics_path)
-    if not topics:
-        clog("mapping: no queries parsed from topics", 'warning')
+def _mapping_parse_original(original_tsv_path: str) -> Dict[str, str]:
+    """Parse original 5-col TSV (query_id, query_text, document_id, document, label) -> {query_id: query_text}."""
+    try:
+        import pandas as _pd
+        try:
+            df = _pd.read_csv(original_tsv_path, sep='\t', usecols=['query_id', 'query_text'], engine='python', on_bad_lines='warn')
+        except TypeError:
+            df = _pd.read_csv(original_tsv_path, sep='\t', usecols=['query_id', 'query_text'], engine='python', error_bad_lines=False, warn_bad_lines=True)
+        df['query_id'] = df['query_id'].astype(str).str.strip()
+        df['query_text'] = df['query_text'].astype(str)
+        return {k: v for k, v in df.groupby('query_id')['query_text'].first().items()}
+    except Exception:
+        return {}
+
+
+def _mapping_add_query_text_to_tsv(file_final_path: str, file_topics_path: str, output_path: str, original_tsv_path: Optional[str] = None) -> bool:
+    """Add query_text to a TSV with columns: query_id, chunk_text, label.
+
+    Ưu tiên map từ topics; nếu không có thì fallback sang map từ original TSV.
+    """
+    # Build merged mapping: topics first, then fill missing from original
+    topics = _mapping_parse_topics(file_topics_path) if file_topics_path else {}
+    orig_map = _mapping_parse_original(original_tsv_path) if original_tsv_path else {}
+    mapping: Dict[str, str] = dict(topics)
+    for k, v in orig_map.items():
+        if k not in mapping or not mapping[k]:
+            mapping[k] = v
+
+    if not mapping:
+        clog("mapping: no query mapping available (topics and original missing)", 'warning')
         return False
+
     processed_lines = 0
     skipped_lines = 0
     with open(file_final_path, 'r', encoding='utf-8') as src, open(output_path, 'w', encoding='utf-8') as out:
@@ -159,14 +188,15 @@ def _mapping_add_query_text_to_tsv(file_final_path: str, file_topics_path: str, 
                 skipped_lines += 1
                 continue
             query_id, chunk_text, label = items
-            query_text = topics.get(query_id, "")
+            qid = str(query_id).strip()
+            query_text = mapping.get(qid, "")
             if not query_text:
                 skipped_lines += 1
                 continue
             out.write(f"{query_text}\t{chunk_text}\t{label}\n")
             processed_lines += 1
     clog(f"mapping: processed={processed_lines} skipped={skipped_lines} out={output_path}", 'info')
-    return True
+    return processed_lines > 0
 
 """
     
@@ -222,7 +252,7 @@ HARDCODE_RANKING = {
 # ==== Controller hardcoded run parameters (input/output, heatmap etc.) ====
 HARD_CODED_CONTROLLER = {
     # Path to input TSV (query_id\tquery_text\tdocument_id\tdocument\tlabel)
-    "input_path": str("F:/SematicSearch/integrated_robust04_modified_v2_subset_100rows.tsv"),
+    "input_path": str("F:/SematicSearch/test.tsv"),
     # Output directory for chunk and rank artifacts
     "output_dir": str(Path("training_datasets")),
     # Controller execution knobs
@@ -239,11 +269,11 @@ HARD_CODED_CONTROLLER = {
     "topics_file": str(Path("F:/SematicSearch/robustirdata/topics.robust04.txt")),
     # Metadata & heatmap exports
     "export_chunk_map": True,     # write *_chunk_map.tsv
-    "export_correlation": False,   # write heatmaps per document
+    "export_correlation": True,   # write heatmaps per document
     # Where to save heatmaps; default below if None
     "correlation_dir": str(Path("training_datasets") / "correlations"),
     # Overlay ideal boundaries in heatmaps, if available
-    #"ideal_bounds_dir": str("F:/SematicSearch/tideal_bounds"),  # e.g., str(Path("training_datasets") / "ideal_bounds")
+    "ideal_bounds_dir": str("F:/SematicSearch/tideal_bounds"),  # e.g., str(Path("training_datasets") / "ideal_bounds")
     # Optional subset of configurations to run; None means ALL
     # Example: ["semantic_splitter_global", "semantic_grouping_cluster"]
     "configs": "semantic_splitter_global",
@@ -552,7 +582,7 @@ def _process_batch(
     params = dict(config["params"])  # shallow copy
 
     # map
-    func_map = {"1": semantic_grouping, "2": semantic_splitter, "3": chunk_passage_text_splitter_char_naive}
+    func_map = {"1": semantic_grouping, "2": semantic_splitter, "3": chunk_passage_text_splitter_char_naive, "4": semantic_splitter_coling2025}
     chunk_func = func_map[method_choice]
 
     import os
@@ -1423,7 +1453,12 @@ def run_config(
                 # Prefer the 3-col file output (same name) already saved by ranker
                 # If needed, map on ranked_path to produce *_with_querytext.tsv
                 mapped_out = str(Path(ranked_path_str).with_name(Path(ranked_path_str).stem + "_with_querytext.tsv"))
-                ok = _mapping_add_query_text_to_tsv(ranked_path_str, str(topics_file), mapped_out)
+                ok = _mapping_add_query_text_to_tsv(
+                    ranked_path_str,
+                    str(topics_file),
+                    mapped_out,
+                    original_tsv_path=str(input_path),
+                )
                 if ok:
                     clog(f"mapping completed file={mapped_out}", 'info')
                 else:
@@ -1473,6 +1508,30 @@ RUN_CONFIGURATIONS: List[Dict[str, Any]] = [
             "multi_pass_short_len": 3,
         },
         "description": "Contiguous semantic splitter using C99 over embedding sim matrix (+ optional length post-process)"
+    },
+    {
+        "name": "coling2025_robust_dp_splitter",
+        "method_choice": "4",
+        "params": {
+            # robust DP defaults (tuneable)
+            "min_boundary_spacing": 10,
+            "min_first_boundary_index": 6,
+            "r_window": 4,
+            "r_w_drop": 0.6,
+            "r_w_drift": 0.35,
+            "r_w_valley": 0.05,
+            "r_tau": 1.0,
+            "rdp_penalty": 0.65,
+            # refinement and length control
+            "refine_max_shift": 2,
+            "refine_alpha": 1.0,
+            "refine_beta": 0.5,
+            "refine_balance": 0.05,
+            "min_chunk_len": 8,
+            "max_chunk_len": 24,
+            # metadata export compatible with controller
+        },
+        "description": "COLING 2025 robust DP splitter (unified signal + DP + local refine)",
     },
     {
         "name": "semantic_grouping_cluster",
