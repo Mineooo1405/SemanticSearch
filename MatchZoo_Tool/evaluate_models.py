@@ -60,11 +60,33 @@ class ModelEvaluator:
     def _load_test_data(self):
         """Tải dữ liệu test từ test_pack.dam"""
         test_pack_path = os.path.join(self.data_pack_dir, 'test_pack.dam')
-        if not os.path.exists(test_pack_path):
-            raise FileNotFoundError(f"Không tìm thấy test_pack.dam trong {self.data_pack_dir}")
-        
-        self.test_pack_raw = mz.load_data_pack(test_pack_path)
-        print(f"Đã tải test data: {len(self.test_pack_raw)} samples")
+        if os.path.exists(test_pack_path):
+            self.test_pack_raw = mz.load_data_pack(test_pack_path)
+            print(f"Đã tải test data: {len(self.test_pack_raw)} samples")
+            return
+        # Fallback: nếu người dùng trỏ thẳng vào thư mục 'cv_folds', chọn fold nhỏ nhất làm test mặc định
+        cv_dir = self.data_pack_dir
+        try:
+            entries = os.listdir(cv_dir)
+        except Exception:
+            entries = []
+        fold_dirs = []
+        for name in entries:
+            if name.startswith('fold_') and name.endswith('_test.dam'):
+                try:
+                    fnum = int(name.split('_')[1])
+                except Exception:
+                    continue
+                fold_dirs.append((fnum, name))
+        if fold_dirs:
+            fold_dirs.sort(key=lambda x: x[0])
+            chosen_num, chosen = fold_dirs[0]
+            fold_path = os.path.join(cv_dir, chosen)
+            print(f"[Fallback] Không có test_pack.dam. Dùng {chosen} làm test (Fold {chosen_num}).")
+            self.test_pack_raw = mz.load_data_pack(fold_path)
+            print(f"Đã tải test data từ {chosen}: {len(self.test_pack_raw)} samples")
+            return
+        raise FileNotFoundError(f"Không tìm thấy test_pack.dam trong {self.data_pack_dir}")
     
     def _load_cv_folds(self):
         """Tải dữ liệu từ CV folds"""
@@ -137,11 +159,31 @@ class ModelEvaluator:
             
             # Đọc thông tin embedding dimension từ saved model
             model_path = os.path.join(model_dir, 'model.pt')
-            state_dict = torch.load(model_path, map_location=self.device)
-            
-            # Lấy embedding dimension từ state_dict
-            embedding_dim = state_dict['embedding.weight'].shape[1]
-            vocab_size = state_dict['embedding.weight'].shape[0]
+            raw_obj = torch.load(model_path, map_location=self.device)
+            # Chuẩn hóa state_dict từ nhiều định dạng lưu khác nhau
+            if isinstance(raw_obj, dict) and 'state_dict' in raw_obj:
+                state_dict = raw_obj['state_dict']
+            elif isinstance(raw_obj, dict) and any(isinstance(v, torch.Tensor) for v in raw_obj.values()):
+                state_dict = raw_obj
+            elif hasattr(raw_obj, 'state_dict'):
+                state_dict = raw_obj.state_dict()
+            else:
+                print(f"Không nhận diện được định dạng checkpoint trong {model_path}")
+                return None
+            # Tìm khóa embedding để suy ra shape
+            embed_key = None
+            for k in state_dict.keys():
+                if k.endswith('embedding.weight') or 'embedding.weight' in k:
+                    embed_key = k
+                    break
+            if embed_key is None:
+                # thử thêm một số tên thường gặp
+                candidates = [k for k in state_dict.keys() if 'embed' in k and k.endswith('weight')]
+                embed_key = candidates[0] if candidates else None
+            if embed_key is None:
+                print("Không tìm thấy embedding.weight trong checkpoint, bỏ qua mô hình này.")
+                return None
+            vocab_size, embedding_dim = state_dict[embed_key].shape
             
             # Tiền xử lý dữ liệu test
             test_pack_processed = preprocessor.transform(test_pack_raw)
@@ -222,35 +264,62 @@ class ModelEvaluator:
                 
                 model.params['task'] = ranking_task
                 
-                # Tạo và set embedding
+                # Khởi tạo embedding dummy đúng shape; trọng số thật sẽ được load từ checkpoint
                 try:
-                    if embedding_dim == 100:
-                        glove_embedding = mz.datasets.embeddings.load_glove_embedding(dimension=100)
-                    elif embedding_dim == 200:
-                        glove_embedding = mz.datasets.embeddings.load_glove_embedding(dimension=200)
-                    elif embedding_dim == 300:
-                        glove_embedding = mz.datasets.embeddings.load_glove_embedding(dimension=300)
-                    else:
-                        glove_embedding = mz.datasets.embeddings.load_glove_embedding(dimension=100)
-                        
-                    term_index = preprocessor.context['vocab_unit'].state['term_index']
-                    embedding_matrix = glove_embedding.build_matrix(term_index)
-                    
-                    if embedding_matrix.shape[1] != embedding_dim:
-                        if embedding_matrix.shape[1] < embedding_dim:
-                            padding = np.zeros((embedding_matrix.shape[0], embedding_dim - embedding_matrix.shape[1]))
-                            embedding_matrix = np.concatenate([embedding_matrix, padding], axis=1)
-                        else:
-                            embedding_matrix = embedding_matrix[:, :embedding_dim]
-                    
-                    l2_norm = np.sqrt((embedding_matrix * embedding_matrix).sum(axis=1))
-                    l2_norm[l2_norm == 0] = 1e-8
-                    embedding_matrix = embedding_matrix / l2_norm[:, np.newaxis]
-                    
-                    model.params['embedding'] = embedding_matrix
-                    
-                except Exception as e:
-                    return None
+                    term_index = preprocessor.context['vocab_unit'].state.get('term_index', {})
+                    vocab_size_in_data = len(term_index) + 1 if term_index else vocab_size
+                except Exception:
+                    vocab_size_in_data = vocab_size
+                # đảm bảo khớp số hàng với checkpoint để tránh mismatch
+                embedding_matrix = np.zeros((vocab_size, embedding_dim), dtype=np.float32)
+                model.params['embedding'] = embedding_matrix
+
+                # Nếu là Conv-KNRM, suy luận tham số từ checkpoint để khớp kiến trúc
+                if 'convknrm' in model_name_lower:
+                    # Suy luận filters và max_ngram từ các kernel conv
+                    filters = None
+                    max_ngram = None
+                    for k, w in state_dict.items():
+                        if isinstance(w, torch.Tensor) and w.dim() == 3 and '.1.weight' in k:
+                            # dạng [filters, embedding_dim, kernel_size]
+                            filters = int(w.shape[0])
+                            ksize = int(w.shape[2])
+                            max_ngram = max(max_ngram or 0, ksize)
+                    # Suy luận kernel_num và use_crossmatch từ lớp out
+                    phi = None
+                    for k, w in state_dict.items():
+                        if k.endswith('out.weight') and isinstance(w, torch.Tensor) and w.dim() == 2:
+                            phi = int(w.shape[1])
+                            break
+                    # fallback tìm key có 'out' và 'weight'
+                    if phi is None:
+                        for k, w in state_dict.items():
+                            if 'out' in k and k.endswith('weight') and isinstance(w, torch.Tensor) and w.dim() == 2:
+                                phi = int(w.shape[1])
+                                break
+                    # Áp dụng suy luận
+                    if max_ngram is None:
+                        max_ngram = 3
+                    use_crossmatch = True
+                    kernel_num = 11
+                    if phi is not None:
+                        if phi % (max_ngram * max_ngram) == 0:
+                            kernel_num = phi // (max_ngram * max_ngram)
+                            use_crossmatch = True
+                        elif phi % max_ngram == 0:
+                            kernel_num = phi // max_ngram
+                            use_crossmatch = False
+                    if filters is None:
+                        filters = 64
+                    # Set params để khớp checkpoint
+                    if 'filters' in model.params:
+                        model.params['filters'] = filters
+                    if 'max_ngram' in model.params:
+                        model.params['max_ngram'] = max_ngram
+                    if 'use_crossmatch' in model.params:
+                        model.params['use_crossmatch'] = use_crossmatch
+                    if 'kernel_num' in model.params:
+                        model.params['kernel_num'] = kernel_num
                 
                 self._set_model_specific_params(model, model_name_lower, embedding_dim)
                 
@@ -258,6 +327,7 @@ class ModelEvaluator:
                 model.load_state_dict(state_dict, strict=False)
                 
             except Exception as e:
+                print(f"Lỗi khi khởi tạo/tải mô hình {model_name}: {e}")
                 return None
             
             model.to(self.device)
@@ -329,11 +399,12 @@ class ModelEvaluator:
             safe_set_param('lstm_layer', 1)
             
         elif 'convknrm' in model_name_lower:
-            safe_set_param('filters', 128)
+            # Defaults aligned with a lighter configuration; will be overridden by checkpoint inference if available
+            safe_set_param('filters', 64)
             safe_set_param('conv_activation_func', 'tanh')
             safe_set_param('max_ngram', 3)
             safe_set_param('use_crossmatch', True)
-            safe_set_param('kernel_num', 11)
+            safe_set_param('kernel_num', 7)
             safe_set_param('sigma', 0.1)
             safe_set_param('exact_sigma', 0.001)
             
@@ -418,7 +489,7 @@ class ModelEvaluator:
                 continue
             
             print(f"\n{'='*50}")
-            print(f"Đánh giá mô hình {name} trên {len(self.cv_folds_data)} folds")
+            print(f"Đánh giá mô hình {name} trên {len(self.cv_folds_data)} folds (yêu cầu model theo fold)")
             print(f"{'='*50}")
             
             model_fold_results = []
@@ -426,9 +497,28 @@ class ModelEvaluator:
             # Đánh giá trên từng fold
             for fold_num in sorted(self.cv_folds_data.keys()):
                 fold_test_data = self.cv_folds_data[fold_num]
-                
+                # Try per-fold model directory patterns
+                fold_dir_candidates = [
+                    os.path.join(path, f"fold_{fold_num}"),
+                    os.path.join(path, f"fold{fold_num}"),
+                    os.path.join(path, f"fold-{fold_num}"),
+                    os.path.join(path, f"{fold_num}"),
+                ]
+                fold_model_dir = next((d for d in fold_dir_candidates if os.path.isdir(d)), None)
+
+                # Decide how to proceed based on CLI flag
+                allow_shared = getattr(self, "allow_shared_model", False)
+
+                if not fold_model_dir:
+                    if allow_shared:
+                        print(f"[CẢNH BÁO] Không tìm thấy model cho Fold {fold_num} trong {path}; dùng model chung (không phải CV chuẩn)")
+                        fold_model_dir = path
+                    else:
+                        print(f"[BỎ QUA FOLD] Thiếu model fold-specific cho Fold {fold_num} trong {path}.\n  Kỳ vọng thư mục: {', '.join(os.path.basename(d) for d in fold_dir_candidates)}\n  Hint: Lưu mỗi model đã train từ K-1 folds vào {path}/fold_<k>/ (model.pt, preprocessor/)")
+                        continue
+
                 print(f"\n--- Fold {fold_num} ---")
-                result = self.evaluate_model(path, name, test_data=fold_test_data, fold_num=fold_num)
+                result = self.evaluate_model(fold_model_dir, name, test_data=fold_test_data, fold_num=fold_num)
                 
                 if result:
                     # Thêm fold number vào kết quả
@@ -443,7 +533,7 @@ class ModelEvaluator:
                 # Tính trung bình và std cho mô hình này
                 print(f"\nKết quả tổng hợp cho {name}:")
                 self._print_cv_summary(model_fold_results, name)
-        
+
         if not all_fold_results:
             print("Không có mô hình nào được đánh giá thành công!")
             return pd.DataFrame()
@@ -730,6 +820,11 @@ def parse_arguments():
         action='store_true',
         help='Sử dụng Cross-Validation folds thay vì test_pack.dam'
     )
+    parser.add_argument(
+        '--allow-shared-model',
+        action='store_true',
+        help='Cho phép dùng cùng một model cho tất cả folds (KHÔNG phải CV chuẩn, chỉ để tham khảo nhanh)'
+    )
     
     parser.add_argument(
         '--output', '-o',
@@ -807,6 +902,8 @@ def main():
     
     # Tạo evaluator với device từ CLI args
     evaluator = ModelEvaluator(data_pack_dir, batch_size=args.batch_size, device=args.device, use_cv_folds=args.use_cv_folds)
+    # Truyền cờ cho phép dùng model chung nếu người dùng yêu cầu
+    setattr(evaluator, 'allow_shared_model', bool(getattr(args, 'allow_shared_model', False)))
     
     # Cấu hình các mô hình cần đánh giá
     model_configs = []
@@ -816,7 +913,7 @@ def main():
         'Arc-II': 'F:\\SematicSearch\\my_model\\my_model',
         'MatchLSTM': 'F:\\SematicSearch\\matchlstm_model',
         'ESIM': 'F:\\SematicSearch\\esim_model',
-        'Conv-KNRM': 'F:\\SematicSearch\\conv_knrm_model',
+        'Conv-KNRM': '/workspace/Trained_model/conv_knrm_model',
         'KNRM': 'F:\\SematicSearch\\knrm_model',
         'Match-Pyramid': 'F:\\SematicSearch\\match_pyramid_model',
         'MVLSTM': 'F:\\SematicSearch\\mvlstm_model'
@@ -858,6 +955,11 @@ def main():
             print(f"   {config['name']}: {config['path']}")
     else:
         print("\n💡 Tip: Sử dụng --verbose để xem chi tiết đường dẫn model, hoặc --model-paths để chỉ định đường dẫn tùy chỉnh")
+
+    if args.use_cv_folds and not getattr(args, 'allow_shared_model', False):
+        print("\nYÊU CẦU: Với --use-cv-folds, mỗi mô hình nên có thư mục con theo fold, ví dụ:")
+        print("  <model_base>/fold_1, fold_2, ..., fold_K (mỗi thư mục chứa model.pt và preprocessor/)")
+        print("  Có thể bật --allow-shared-model để tạm thời dùng một model cho mọi fold (không chuẩn CV).")
     
     # Thực hiện đánh giá
     results_df = evaluator.evaluate_all_models(model_configs)

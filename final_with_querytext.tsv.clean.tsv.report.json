@@ -1,0 +1,17 @@
+{
+  "input": "F:\\SematicSearch\\final_with_querytext.tsv",
+  "output": "F:\\SematicSearch\\final_with_querytext.tsv.clean.tsv",
+  "drop_unpairable": false,
+  "stats": {
+    "total_rows": 2102385,
+    "kept_rows": 0,
+    "dropped_bad_format": 0,
+    "dropped_bad_label": 2102385,
+    "dropped_empty_text": 0,
+    "dropped_unpairable": 0,
+    "unique_queries": 0,
+    "pairable_queries": 0,
+    "only_pos_queries": 0,
+    "only_neg_queries": 0
+  }
+}

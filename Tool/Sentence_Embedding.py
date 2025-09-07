@@ -5,6 +5,15 @@ import logging
 import importlib # ADDED
 from typing import Optional
 
+# Optional TPU (PyTorch/XLA)
+try:
+    import importlib as _importlib
+    torch_xla = _importlib.import_module('torch_xla')
+    xm = _importlib.import_module('torch_xla.core.xla_model')
+except Exception:
+    torch_xla = None
+    xm = None
+
 try:
     torch_directml = importlib.import_module("torch_directml")
     if not (hasattr(torch_directml, 'is_available') and callable(torch_directml.is_available) and
@@ -35,6 +44,11 @@ def get_device(preferred_device_str: Optional[str] = None):
                     pass
         elif preferred_device_str == 'cuda' and torch.cuda.is_available():
             return torch.device("cuda")
+        elif preferred_device_str in ('tpu','xla') and xm is not None:
+            try:
+                return xm.xla_device()
+            except Exception:
+                pass
         elif preferred_device_str == 'cpu':
             return torch.device("cpu")
 
@@ -43,6 +57,13 @@ def get_device(preferred_device_str: Optional[str] = None):
         try:
             dml_device = torch_directml.device()
             return dml_device
+        except Exception:
+            pass
+    
+    # TPU/XLA
+    if xm is not None:
+        try:
+            return xm.xla_device()
         except Exception:
             pass
     
@@ -75,6 +96,27 @@ def sentence_embedding(text_list: list, model_name: str, batch_size: int = 32, d
             if model_name in loaded_models:
                 del loaded_models[model_name]  # Remove the failed DirectML model
     
+    # Special handling for TPU/XLA: try XLA first, fallback to CPU
+    if xm is not None:
+        try:
+            dev_str = str(effective_device)
+            if 'xla' in dev_str or 'TPU' in dev_str:
+                if model_name not in loaded_models:
+                    loaded_models[model_name] = SentenceTransformer(model_name, device=dev_str)
+                model = loaded_models[model_name]
+                embeddings = model.encode(text_list, batch_size=batch_size, show_progress_bar=False)
+                try:
+                    xm.mark_step()
+                except Exception:
+                    pass
+                return embeddings
+        except Exception as xla_error:
+            logging.warning(f"XLA/TPU failed for model {model_name}: {xla_error}")
+            logging.info("Falling back to CPU for embeddings...")
+            effective_device = torch.device('cpu')
+            if model_name in loaded_models:
+                del loaded_models[model_name]
+
     # Standard loading for CPU/CUDA
     if model_name not in loaded_models:
         try:

@@ -26,6 +26,14 @@ except Exception:  # pragma: no cover
     torch = None  # fallback
 
 from Tool.Sentence_Embedding import sentence_embedding as embed_text_list
+
+# Optional TPU (PyTorch/XLA)
+try:  # pragma: no cover
+    import os as _os
+    import importlib as _importlib
+    _torch_xla = _importlib.import_module('torch_xla.core.xla_model')
+except Exception:
+    _torch_xla = None
 from Tool.OIE import extract_relations_from_paragraph
 
 # ---------------- Device & Batch Utilities ---------------- #
@@ -39,10 +47,17 @@ def normalize_device(device: Optional[object]) -> str:
     except Exception:
         cuda_available = False
     device_str = str(device).lower() if device is not None else None
+    # Auto-detect preference: CUDA > TPU(XLA) > CPU
     if device_str in (None, "auto"):
-        return "cuda" if cuda_available else "cpu"
+        if cuda_available:
+            return "cuda"
+        if _torch_xla is not None:
+            return "tpu"
+        return "cpu"
     if device_str.startswith("cuda"):
         return "cuda" if cuda_available else "cpu"
+    if device_str in ("tpu", "xla"):
+        return "tpu" if _torch_xla is not None else ("cuda" if cuda_available else "cpu")
     return "cpu"
 
 def estimate_optimal_batch_size(sentences: List[str], base_batch_size: int, device: str) -> int:
@@ -152,6 +167,23 @@ def create_similarity_matrix(
                 try: torch.cuda.empty_cache()
                 except Exception: pass
             return sim
+        elif device_str == "tpu" and _torch_xla is not None and torch is not None:
+            try:
+                xdev = _torch_xla.xla_device()
+                t = torch.tensor(embs, dtype=torch.float32, device=xdev)
+                sim_x = torch.mm(t, t.t())
+                # XLA needs mark_step to ensure computation materializes
+                try:
+                    import torch_xla.core.xla_model as xm  # type: ignore
+                    xm.mark_step()
+                except Exception:
+                    pass
+                sim = sim_x.cpu().numpy()
+                del t, sim_x
+                return sim
+            except Exception:
+                # Fallback to CPU if XLA path fails
+                return embs @ embs.T
         else:
             # CPU fallback (manual cosine using dot since normalized)
             return embs @ embs.T

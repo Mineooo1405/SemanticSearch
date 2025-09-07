@@ -325,9 +325,24 @@ def semantic_grouping_main(
         labels = _kmeans(U_norm, k=k, n_init=5, max_iter=100, seed=0)
         return labels
 
-    # Precompute a k‑NN graph once for spectral paths and internal split
-    k_eff_all = int(knn_k if knn_k is not None else max(5, min(20, n - 1)))
-    W_all = _build_knn_graph(sim_sharp, kk=k_eff_all, floor=float(edge_floor))
+    # Auto-parameterization (no hard-coded values when possible)
+    auto_params = bool(_extra.get('auto_params', True))
+    # Effective K for kNN
+    if auto_params:
+        k_eff_all = int(max(5, min(32, round(n * 0.06))))
+    else:
+        k_eff_all = int(knn_k if knn_k is not None else max(5, min(20, n - 1)))
+    # Effective edge floor by robust quantile on positive sims
+    if auto_params:
+        try:
+            arr = np.asarray(sim_sharp, dtype=float)
+            vals = arr[arr > 0.0]
+            eff_edge_floor = float(np.quantile(vals, 0.80)) if vals.size else 0.4
+        except Exception:
+            eff_edge_floor = float(edge_floor)
+    else:
+        eff_edge_floor = float(edge_floor)
+    W_all = _build_knn_graph(sim_sharp, kk=k_eff_all, floor=eff_edge_floor)
 
     # ===== Engine selection: 'spectral' only vs 'rmt' with fallback =====
     labels = None
@@ -335,7 +350,10 @@ def semantic_grouping_main(
     method_used = "RMT"
     if eng == "spectral":
         method_used = "SpectralOnly"
-        kmax_eff = int(spectral_kmax if spectral_kmax is not None else max(2, min(10, max(2, n // 5))))
+        if auto_params:
+            kmax_eff = int(max(2, min(16, max(2, n // 6))))
+        else:
+            kmax_eff = int(spectral_kmax if spectral_kmax is not None else max(2, min(10, max(2, n // 5))))
         labels = _auto_k_spectral_labels(W_all, kmax=kmax_eff)
     else:
         try:
@@ -345,15 +363,18 @@ def semantic_grouping_main(
                 gamma_start=float(mod_gamma_start),
                 gamma_end=float(mod_gamma_end),
                 gamma_step=float(mod_gamma_step),
-                edge_floor_local=float(edge_floor),
-                kmax_cap=int(spectral_kmax if spectral_kmax is not None else max(2, min(10, max(2, n // 5))))
+                edge_floor_local=eff_edge_floor,
+                kmax_cap=int((max(2, min(16, max(2, n // 6)))) if auto_params else (spectral_kmax if spectral_kmax is not None else max(2, min(10, max(2, n // 5)))))
             )
         except Exception:
             labels = None
 
         if labels is None:
             method_used = "SpectralFallback"
-            kmax_eff = int(spectral_kmax if spectral_kmax is not None else max(2, min(10, max(2, n // 5))))
+            if auto_params:
+                kmax_eff = int(max(2, min(16, max(2, n // 6))))
+            else:
+                kmax_eff = int(spectral_kmax if spectral_kmax is not None else max(2, min(10, max(2, n // 5))))
             labels = _auto_k_spectral_labels(W_all, kmax=kmax_eff)
 
     if labels is None:
@@ -365,8 +386,11 @@ def semantic_grouping_main(
             groups[int(lab)].append(i)
 
     # ===== Post‑processing: split over‑large clusters with internal 2‑way spectral when separable =====
-    # If cap_soft is not provided: use an absolute threshold derived from n
-    eff_cap_soft = int(cap_soft if cap_soft is not None else max(20, n // 3))
+    # If cap_soft is not provided: derive from n
+    if auto_params and cap_soft is None:
+        eff_cap_soft = int(max(20, n // 4))
+    else:
+        eff_cap_soft = int(cap_soft if cap_soft is not None else max(20, n // 3))
 
     def _spectral_split_k2(members: List[int]) -> Optional[Tuple[List[int], List[int]]]:
         if len(members) < 4:
@@ -405,10 +429,30 @@ def semantic_grouping_main(
     # ===== Conditionally merge undersized clusters =====
     merged: List[List[int]] = []
     consumed = set()
+    # Auto small_group_min based on distribution of current group sizes
+    if auto_params:
+        try:
+            sizes = [len(g) for g in groups]
+            auto_min = int(max(2, np.percentile(sizes, 10))) if len(sizes) >= 5 else 2
+        except Exception:
+            auto_min = 2
+        min_group_len_eff = auto_min
+    else:
+        min_group_len_eff = int(max(2, small_group_min))
+    # Auto tau_merge: encourage merging only when inter > robust mid of sims
+    if auto_params:
+        try:
+            arr = np.asarray(sim_sharp, dtype=float)
+            vals = arr[arr > 0.0]
+            eff_tau_merge = float(np.quantile(vals, 0.65)) if vals.size else float(tau_merge)
+        except Exception:
+            eff_tau_merge = float(tau_merge)
+    else:
+        eff_tau_merge = float(tau_merge)
     for i, g in enumerate(groups):
         if i in consumed:
             continue
-        if len(g) >= max(2, int(small_group_min)):
+        if len(g) >= max(2, int(min_group_len_eff)):
             merged.append(g)
             continue
         best_j = None
@@ -417,7 +461,7 @@ def semantic_grouping_main(
             if j == i or j in consumed:
                 continue
             inter = _mean_between(g, h)
-            if inter < float(tau_merge):
+            if inter < float(eff_tau_merge):
                 continue
             base = 0.5 * (_mean_within(g) + _mean_within(h))
             after = _mean_within(sorted(g + h))
@@ -433,6 +477,16 @@ def semantic_grouping_main(
 
     # ===== One‑pass boundary sentence re‑assignment =====
     if len(merged) >= 2:
+        # Auto reassignment improvement threshold
+        if auto_params:
+            try:
+                arr = np.asarray(sim_sharp, dtype=float)
+                vals = arr[arr > 0.0]
+                eff_reassign_delta = float(np.std(vals)) * 0.1 if vals.size else float(reassign_delta)
+            except Exception:
+                eff_reassign_delta = float(reassign_delta)
+        else:
+            eff_reassign_delta = float(reassign_delta)
         for x in range(n):
             cur = None
             for cid, g in enumerate(merged):
@@ -450,7 +504,7 @@ def semantic_grouping_main(
                     continue
                 mean_other = float(np.mean([float(sim_sharp[x, y]) for y in h])) if h else 0.0
                 # require a noticeable improvement
-                if mean_other > best_score + float(reassign_delta):
+                if mean_other > best_score + float(eff_reassign_delta):
                     best_score = mean_other
                     best_c = c2
             if best_c != cur:

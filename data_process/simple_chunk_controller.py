@@ -107,17 +107,16 @@ from Method.Semantic_Grouping_Optimized import (
 from Method.Semantic_Splitter_Optimized import (
     chunk_passage_text_splitter as semantic_splitter,
 )
-from Method.Coling2025_RobustDP_Splitter import (
-    chunk_passage_text_splitter_coling2025 as semantic_splitter_coling2025,
-)
 from Method.Text_Splitter_Char_Naive import chunk_passage_text_splitter as chunk_passage_text_splitter_char_naive
+from Method.WeSWin_Paper_Splitter import weswin_paper_splitter
+from Method.TextTiling_LLM_Splitter import texttiling_llm_splitter
 from Tool.rank_chunks_optimized import rank_and_filter_chunks_optimized
 
 # ==== Default constants ====
 BATCH_SIZE = 600  # dòng/đợt đọc pandas
 COMMON_DEFAULTS = {
     "embedding_model": "sentence-transformers/all-MiniLM-L6-v2",
-    "device_preference": "dml",  # "cuda", "dml", hoặc "cpu"
+    "device_preference": "dml",  # "cuda", "dml", "tpu", hoặc "cpu"
     "enable_text_cleaning": True,  # Enable text cleaning by default
 }
 
@@ -142,38 +141,12 @@ def _mapping_parse_topics(topics_file_path: str) -> Dict[str, str]:
             topics_data[qid] = query_text
     return topics_data
 
-def _mapping_parse_original(original_tsv_path: str) -> Dict[str, str]:
-    """Parse original 5-col TSV (query_id, query_text, document_id, document, label) -> {query_id: query_text}."""
-    try:
-        import pandas as _pd
-        try:
-            df = _pd.read_csv(original_tsv_path, sep='\t', usecols=['query_id', 'query_text'], engine='python', on_bad_lines='warn')
-        except TypeError:
-            df = _pd.read_csv(original_tsv_path, sep='\t', usecols=['query_id', 'query_text'], engine='python', error_bad_lines=False, warn_bad_lines=True)
-        df['query_id'] = df['query_id'].astype(str).str.strip()
-        df['query_text'] = df['query_text'].astype(str)
-        return {k: v for k, v in df.groupby('query_id')['query_text'].first().items()}
-    except Exception:
-        return {}
-
-
-def _mapping_add_query_text_to_tsv(file_final_path: str, file_topics_path: str, output_path: str, original_tsv_path: Optional[str] = None) -> bool:
-    """Add query_text to a TSV with columns: query_id, chunk_text, label.
-
-    Ưu tiên map từ topics; nếu không có thì fallback sang map từ original TSV.
-    """
-    # Build merged mapping: topics first, then fill missing from original
-    topics = _mapping_parse_topics(file_topics_path) if file_topics_path else {}
-    orig_map = _mapping_parse_original(original_tsv_path) if original_tsv_path else {}
-    mapping: Dict[str, str] = dict(topics)
-    for k, v in orig_map.items():
-        if k not in mapping or not mapping[k]:
-            mapping[k] = v
-
-    if not mapping:
-        clog("mapping: no query mapping available (topics and original missing)", 'warning')
+def _mapping_add_query_text_to_tsv(file_final_path: str, file_topics_path: str, output_path: str) -> bool:
+    """Add query_text to a TSV with columns: query_id, chunk_text, label."""
+    topics = _mapping_parse_topics(file_topics_path)
+    if not topics:
+        clog("mapping: no queries parsed from topics", 'warning')
         return False
-
     processed_lines = 0
     skipped_lines = 0
     with open(file_final_path, 'r', encoding='utf-8') as src, open(output_path, 'w', encoding='utf-8') as out:
@@ -188,35 +161,29 @@ def _mapping_add_query_text_to_tsv(file_final_path: str, file_topics_path: str, 
                 skipped_lines += 1
                 continue
             query_id, chunk_text, label = items
-            qid = str(query_id).strip()
-            query_text = mapping.get(qid, "")
+            query_text = topics.get(query_id, "")
             if not query_text:
                 skipped_lines += 1
                 continue
             out.write(f"{query_text}\t{chunk_text}\t{label}\n")
             processed_lines += 1
     clog(f"mapping: processed={processed_lines} skipped={skipped_lines} out={output_path}", 'info')
-    return processed_lines > 0
+    return True
 
 """
     
 _MODEL_PRESETS = {
-    # Retrieval-oriented (cao chất lượng, có thể mượt cục bộ):
-    "1": ("thenlper/gte-large", "High Quality retrieval (≥4.5GB VRAM)"),
+    # Retrieval-oriented (high quality):
+    "1": ("thenlper/gte-large", "High quality retrieval (≥4.5GB VRAM)"),
     "2": ("thenlper/gte-base", "Balanced retrieval (≈2GB VRAM)"),
-    "6": ("BAAI/bge-large-en-v1.5", "High Quality retrieval (≈5GB VRAM)"),
-    "7": ("BAAI/bge-small-en-v1.5", "Lightweight retrieval (≈0.3GB VRAM)"),
-    "8": ("intfloat/e5-large-v2", "Retrieval (≈3.5GB VRAM)"),
+    "6": ("BAAI/bge-large-en-v1.5", "High quality retrieval (≈5GB VRAM)"),
+    "8": ("intfloat/e5-large-v2", "Strong retrieval (≈3.5GB VRAM)"),
+    "10": ("Alibaba-NLP/gte-Qwen2-7B-instruct", "Very strong 7B (CPU/TPU ok, large RAM)"),
 
     # Splitter-friendly / general-purpose SBERT:
     "3": ("sentence-transformers/all-MiniLM-L12-v2", "Fast general (≈0.7GB VRAM)"),
-    "4": ("sentence-transformers/all-MiniLM-L6-v2", "Ultra-Fast general (≈0.5GB VRAM)"),
+    "4": ("sentence-transformers/all-MiniLM-L6-v2", "Ultra-fast general (≈0.5GB VRAM)"),
     "9": ("sentence-transformers/all-mpnet-base-v2", "Strong general-purpose (≈1.0GB VRAM)"),
-
-    # Multilingual options:
-    "10": ("paraphrase-multilingual-mpnet-base-v2", "Multilingual strong (≈1.0GB VRAM)"),
-    "11": ("distiluse-base-multilingual-cased-v2", "Multilingual fast (≈0.6GB VRAM)"),
-
     # Auto suggestion:
     "5": ("auto", "Auto-select based on sys RAM/GPU"),
 }
@@ -252,31 +219,32 @@ HARDCODE_RANKING = {
 # ==== Controller hardcoded run parameters (input/output, heatmap etc.) ====
 HARD_CODED_CONTROLLER = {
     # Path to input TSV (query_id\tquery_text\tdocument_id\tdocument\tlabel)
-    "input_path": str("F:/SematicSearch/test.tsv"),
+    #"input_path": str("F:/SematicSearch/test.tsv"),
+    "input_path": str("F:/SematicSearch/integrated_robust04_modified_v2_subset_100rows.tsv"),
     # Output directory for chunk and rank artifacts
-    "output_dir": str(Path("training_datasets")),
+    "output_dir": str(Path("training_datasets2")),
     # Controller execution knobs
     "workers": 1,             # parallel configs
     "config_workers": 1,      # workers per config (batch processing)
     "embedding_model": HARDCODE_RANKING["model"],
-    "device": HARDCODE_RANKING["device_preference"],
+    "device": HARDCODE_RANKING["device_preference"],  # accepts: cpu|cuda|dml|tpu
     "enable_text_cleaning": True,
     # Allow running ranking step from controller (global gate)
-    "allow_ranking": True,
+    "allow_ranking": False,
     # Allow mapping step (add query_text from topics to filtered 3-col TSV)
     "allow_mapping": True,
     # Topics file path for mapping
     "topics_file": str(Path("F:/SematicSearch/robustirdata/topics.robust04.txt")),
     # Metadata & heatmap exports
     "export_chunk_map": True,     # write *_chunk_map.tsv
-    "export_correlation": True,   # write heatmaps per document
+    "export_correlation": False,   # write heatmaps per document
     # Where to save heatmaps; default below if None
     "correlation_dir": str(Path("training_datasets") / "correlations"),
     # Overlay ideal boundaries in heatmaps, if available
-    "ideal_bounds_dir": str("F:/SematicSearch/tideal_bounds"),  # e.g., str(Path("training_datasets") / "ideal_bounds")
+    #"ideal_bounds_dir": str("F:/SematicSearch/tideal_bounds"),  # e.g., str(Path("training_datasets") / "ideal_bounds")
     # Optional subset of configurations to run; None means ALL
-    # Example: ["semantic_splitter_global", "semantic_grouping_cluster"]
-    "configs": "semantic_splitter_global",
+    # Example: ["semantic_splitter_auto", "semantic_grouping_auto"]
+    "configs": "semantic_splitter_auto",
 }
 
 # ==== Text Cleaning for SpaCy Sentence Segmentation ========================
@@ -582,7 +550,7 @@ def _process_batch(
     params = dict(config["params"])  # shallow copy
 
     # map
-    func_map = {"1": semantic_grouping, "2": semantic_splitter, "3": chunk_passage_text_splitter_char_naive, "4": semantic_splitter_coling2025}
+    func_map = {"1": semantic_grouping, "2": semantic_splitter, "3": chunk_passage_text_splitter_char_naive, "4": weswin_paper_splitter, "5": texttiling_llm_splitter}
     chunk_func = func_map[method_choice]
 
     import os
@@ -759,7 +727,7 @@ def _process_batch(
 
         # Optional: overwrite correlation heatmap with red boundary lines (Splitter only)
         try:
-            if export_correlation and correlation_dir and method_choice == "2":
+            if export_correlation and correlation_dir and method_choice in {"2", "4", "5"}:
                 sents_full = extract_sentences_spacy(passage)
                 if isinstance(sents_full, list) and len(sents_full) > 1:
                     import matplotlib
@@ -1442,7 +1410,7 @@ def run_config(
             clog(f"ranking completed file={ranked_path}", 'info')
         except Exception as e:
             clog(f"ranking failed: {e}", 'error')
-
+        
         # Optional mapping step: convert query_id to query_text using topics file
         try:
             hc = HARD_CODED_CONTROLLER
@@ -1453,18 +1421,16 @@ def run_config(
                 # Prefer the 3-col file output (same name) already saved by ranker
                 # If needed, map on ranked_path to produce *_with_querytext.tsv
                 mapped_out = str(Path(ranked_path_str).with_name(Path(ranked_path_str).stem + "_with_querytext.tsv"))
-                ok = _mapping_add_query_text_to_tsv(
-                    ranked_path_str,
-                    str(topics_file),
-                    mapped_out,
-                    original_tsv_path=str(input_path),
-                )
+                ok = _mapping_add_query_text_to_tsv(ranked_path_str, str(topics_file), mapped_out)
                 if ok:
                     clog(f"mapping completed file={mapped_out}", 'info')
                 else:
                     clog("mapping skipped (no queries parsed or no matches)", 'warning')
         except Exception as e:
             clog(f"mapping failed: {e}", 'error')
+    else:
+        # Mapping khi ranking tắt: bỏ để tránh sinh file thừa không cần thiết
+        pass
     clog(f"stats chunks={total_chunks} elapsed={elapsed:.1f}s rate={chunks_per_sec:.1f}/s avg_per_doc={avg_chunks_per_doc:.2f}{split_info}{preserve_info}", 'info')
 
 
@@ -1474,14 +1440,33 @@ def run_config(
 # ==== CONFIGURATIONS (moved near the top for easy editing) ====================
 RUN_CONFIGURATIONS: List[Dict[str, Any]] = [
     {
+        "name": "semantic_splitter_auto",
+        "method_choice": "2",
+        "params": {
+            # No fixed thresholds – let the splitter derive from data
+            "auto_params": True,
+            # Prefer more precise C99 computation when resources allow
+            "c99_use_local_rank": True,
+        },
+        "description": "Auto-tuned semantic splitter (C99 + Valley, NMS, reassignment, short-merge) – best quality"
+    },
+    {
+        "name": "semantic_grouping_auto",
+        "method_choice": "1",
+        "params": {
+            # Use RMT + multiscale modularity with adaptive sparsification
+            "auto_params": True,
+            "engine": "rmt",
+        },
+        "description": "Auto-tuned global grouping (RMT + modularity; contiguity, reassignment, short-merge) – best quality"
+    },
+    {
         "name": "semantic_splitter_global",
         "method_choice": "2",
         "params": {
-            # C99-based splitter params (no fixed size constraints)
+            # C99-based splitter params (pure hybrid, no robustness/multipass)
             "min_boundary_spacing": 12,
             "min_first_boundary_index": 8,
-            "min_chunk_len": 8,      # optional post-process merge threshold
-            "max_chunk_len": 24,     # optional post-process split threshold
             # Hybrid params
             "hybrid_mode": "intersection",  # or "union" | "union_weighted"
             "valley_tau": 0.1,
@@ -1493,45 +1478,43 @@ RUN_CONFIGURATIONS: List[Dict[str, Any]] = [
             "c99_stopping": "gain",
             "c99_knee_c": 1.3,
             "c99_smooth_window": 5,
-            "refine_max_shift": 2,
-            # New robustness knobs
+            # Minimal smoothing only
             "smooth_adj_window": 5,
-            "reassign_k": 2,
-            "reassign_margin": 0.03,
-            "dp_local_adjust": True,
-            "dp_window": 6,
-            "dp_improve_eps": 0.001,
-            # Multi-pass (disabled by default here)
-            "multi_pass_dp": True,
-            "dp_global_penalty": 0.6,
-            "dp_min_first_boundary_index": 8,
-            "multi_pass_short_len": 3,
+            # Soft cap to prevent overly long chunks
+            "soft_cap": 24,
+            "soft_cap_delta": 2,
         },
         "description": "Contiguous semantic splitter using C99 over embedding sim matrix (+ optional length post-process)"
     },
     {
-        "name": "coling2025_robust_dp_splitter",
+        "name": "semantic_splitter_weswin_paper",
         "method_choice": "4",
         "params": {
-            # robust DP defaults (tuneable)
-            "min_boundary_spacing": 10,
-            "min_first_boundary_index": 6,
-            "r_window": 4,
-            "r_w_drop": 0.6,
-            "r_w_drift": 0.35,
-            "r_w_valley": 0.05,
-            "r_tau": 1.0,
-            "rdp_penalty": 0.65,
-            # refinement and length control
-            "refine_max_shift": 2,
-            "refine_alpha": 1.0,
-            "refine_beta": 0.5,
-            "refine_balance": 0.05,
-            "min_chunk_len": 8,
-            "max_chunk_len": 24,
-            # metadata export compatible with controller
+            # WeSWin inference (unsupervised backend to mimic paper inference pipeline)
+            "stride_k": 6,
+            "max_sentences_per_window": 30,
+            "weighting": "linear",   # linear | poly | uniform
+            "weight_eps": 0.1,
+            "weight_k": 8,
+            "weight_poly_p": 2,
+            "decision_threshold": 0.75,  # Tăng từ 0.5 → 0.75 để giảm over-segmentation
+            "smooth_window": 5,
+            "min_boundary_spacing": 12,
+            "min_first_boundary_index": 10,
         },
-        "description": "COLING 2025 robust DP splitter (unified signal + DP + local refine)",
+        "description": "WeSWin (Weighted Sliding Windows) – inference không giám sát gần paper",
+    },
+    {
+        "name": "semantic_splitter_texttiling_llm",
+        "method_choice": "5",
+        "params": {
+            # TextTiling-LLM baseline như paper (max-pooling cosine giữa 2 cửa sổ k câu)
+            "k_window": 5,
+            "threshold": 0.5,
+            "min_boundary_spacing": 10,
+            "min_first_boundary_index": 8,
+        },
+        "description": "TextTiling-LLM baseline (max-pooling cosine, threshold + NMS spacing)",
     },
     {
         "name": "semantic_grouping_cluster",
@@ -1576,17 +1559,12 @@ _MODEL_PRESETS = {
     "1": ("thenlper/gte-large", "High Quality retrieval (≥4.5GB VRAM)"),
     "2": ("thenlper/gte-base", "Balanced retrieval (≈2GB VRAM)"),
     "6": ("BAAI/bge-large-en-v1.5", "High Quality retrieval (≈5GB VRAM)"),
-    "7": ("BAAI/bge-small-en-v1.5", "Lightweight retrieval (≈0.3GB VRAM)"),
     "8": ("intfloat/e5-large-v2", "Retrieval (≈3.5GB VRAM)"),
 
     # Splitter-friendly / general-purpose SBERT:
     "3": ("sentence-transformers/all-MiniLM-L12-v2", "Fast general (≈0.7GB VRAM)"),
     "4": ("sentence-transformers/all-MiniLM-L6-v2", "Ultra-Fast general (≈0.5GB VRAM)"),
     "9": ("sentence-transformers/all-mpnet-base-v2", "Strong general-purpose (≈1.0GB VRAM)"),
-
-    # Multilingual options:
-    "10": ("paraphrase-multilingual-mpnet-base-v2", "Multilingual strong (≈1.0GB VRAM)"),
-    "11": ("distiluse-base-multilingual-cased-v2", "Multilingual fast (≈0.6GB VRAM)"),
 
     # Auto suggestion:
     "5": ("auto", "Auto-select based on sys RAM/GPU"),
@@ -1624,7 +1602,7 @@ def interactive_ui():
         print("\nQUICK MODEL PRESETS:")
         for key, (model_name, desc) in _MODEL_PRESETS.items():
             print(f"  {key}. {model_name} - {desc}")  # keep user prompt prints
-        choice = input("Select preset (1-5) or press ENTER to keep current: ").strip()
+        choice = input("Select preset (1-12) or press ENTER to keep current: ").strip()
         if choice in _MODEL_PRESETS:
             selected = _MODEL_PRESETS[choice][0]
             if selected == "auto":
@@ -1678,6 +1656,8 @@ def interactive_ui():
     export_corr = export_corr_ans == 'y'
     corr_default = Path(HARD_CODED_CONTROLLER["correlation_dir"]) if HARD_CODED_CONTROLLER.get("correlation_dir") else (out_dir / "correlations")
     corr_dir = corr_default
+    # Ensure ideal_dir is always defined to avoid UnboundLocalError when export_corr is disabled
+    ideal_dir = None
     if export_corr:
         user_corr = input(f"Correlation output dir [{corr_default}]: ").strip()
         corr_dir = Path(user_corr) if user_corr else corr_default

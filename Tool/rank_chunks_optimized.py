@@ -56,7 +56,6 @@ def estimate_memory_usage(file_path: str) -> Dict[str, float]:
 _QUERY_TEXT_KEYS = {"query_text", "query", "question"}
 _CHUNK_TEXT_KEYS = {"chunk_text", "passage", "text"}
 _QUERY_ID_KEYS   = {"query_id", "qid"}
-_DOC_ID_KEYS     = {"document_id", "doc_id", "did", "doc"}
 _CHUNK_ID_KEYS   = {"chunk_id", "cid", "pid"}
 _LABEL_KEYS      = {"label", "score", "target"}
 
@@ -92,10 +91,6 @@ def _standardize_columns(df: pd.DataFrame, *, require_query_text: bool = True) -
     qid = _find_col(existing, _QUERY_ID_KEYS)
     if qid:
         mapping[qid] = "query_id"
-
-    did = _find_col(existing, _DOC_ID_KEYS)
-    if did:
-        mapping[did] = "document_id"
 
     cid = _find_col(existing, _CHUNK_ID_KEYS)
     if cid:
@@ -255,20 +250,11 @@ class OptimizedRanker:
         return result_df
 
 
-def rank_and_filter_chunks_optimized(
-    chunks_tsv: str,
-    output_dir: Path,
-    original_tsv: str,
-    upper_percentile: int = 80,
-    lower_percentile: int = 20,
-    model_name: str = "thenlper/gte-base",
-    max_workers: int = None,
-    chunk_size: int = 50000,
-    *,
-    pos_sim_thr: float = 0.6,
-    neg_sim_thr: float = 0.4,
-    filter_mode: str = "percentile",
-) -> str:
+def rank_and_filter_chunks_optimized(chunks_tsv: str, output_dir: Path,
+                                    original_tsv: str,
+                                    upper_percentile: int = 80, lower_percentile: int = 20,
+                                    model_name: str = "thenlper/gte-base", max_workers: int = None,
+                                    chunk_size: int = 50000) -> str:
     """Memory-optimized version with chunked data loading to prevent RAM overflow
     
     Args:
@@ -419,26 +405,11 @@ def rank_and_filter_chunks_optimized(
             
             # Process this chunk based on max_workers
             if max_workers and max_workers > 1:
-                chunk_results = _process_queries_parallel(
-                    df_chunk,
-                    model_name,
-                    upper_percentile,
-                    lower_percentile,
-                    max_workers,
-                    pos_sim_thr,
-                    neg_sim_thr,
-                    filter_mode,
-                )
+                chunk_results = _process_queries_parallel(df_chunk, model_name, upper_percentile, 
+                                                        lower_percentile, max_workers)
             else:
-                chunk_results = _process_queries_sequential(
-                    df_chunk,
-                    model_name,
-                    upper_percentile,
-                    lower_percentile,
-                    pos_sim_thr,
-                    neg_sim_thr,
-                    filter_mode,
-                )
+                chunk_results = _process_queries_sequential(df_chunk, model_name, upper_percentile, 
+                                                          lower_percentile)
             
             if chunk_results:
                 kept_rows.extend(chunk_results)
@@ -514,29 +485,16 @@ def rank_and_filter_chunks_optimized(
     return str(save_path)
 
 
-def _process_queries_sequential(
-    df: pd.DataFrame,
-    model_name: str,
-    upper_percentile: int,
-    lower_percentile: int,
-    pos_sim_thr: float,
-    neg_sim_thr: float,
-    filter_mode: str,
-) -> List[pd.DataFrame]:
+def _process_queries_sequential(df: pd.DataFrame, model_name: str, 
+                              upper_percentile: int, lower_percentile: int) -> List[pd.DataFrame]:
     """Sequential processing with single model instance"""
     ranker = OptimizedRanker(model_name=model_name)
     kept_rows = []
     processed_queries = 0
-    # Count unique (query, document) pairs
-    if 'document_id' in df.columns:
-        total_queries = df[['query_id','document_id']].drop_duplicates().shape[0]
-        group_iter = df.groupby(['query_id','document_id'])
-    else:
-        total_queries = df['query_id'].nunique()
-        group_iter = df.groupby('query_id')
+    total_queries = df['query_id'].nunique()
     
     # Process each query group
-    for keys, group_df in group_iter:
+    for query_id, group_df in df.groupby('query_id'):
         try:
             processed_queries += 1
             if processed_queries % 10 == 0:
@@ -544,12 +502,8 @@ def _process_queries_sequential(
                 gc.collect()  # Periodic garbage collection
             
             query_text = str(group_df['query_text'].iloc[0])
-            if isinstance(keys, tuple):
-                query_id, document_id = keys
-            else:
-                query_id, document_id = keys, group_df.get('document_id', pd.Series([''])).iloc[0]
             
-            # Skip very small groups (per document)
+            # Skip very small groups
             if len(group_df) < 2:
                 continue
             
@@ -559,39 +513,20 @@ def _process_queries_sequential(
             if ranked_df.empty:
                 continue
             
-            # Label-based filtering
-            if 'label' not in ranked_df.columns:
-                print(f"Warning: 'label' column missing for query {query_id}; skipping group")
-                continue
-            try:
-                lbl = ranked_df['label'].astype(int)
-            except Exception:
-                lbl = pd.to_numeric(ranked_df['label'], errors='coerce').fillna(0).astype(int)
-            cos = ranked_df['cosine_score'].astype(float)
-            if (filter_mode or "percentile").lower() == "percentile":
-                pos_rows = ranked_df[lbl == 1]
-                neg_rows = ranked_df[lbl == 0]
-                mask = pd.Series(False, index=ranked_df.index)
-                # Positive: keep top upper_percentile by cosine
-                if len(pos_rows) >= 1:
-                    pos_thr = np.percentile(pos_rows['cosine_score'].astype(float), upper_percentile)
-                    mask |= ((lbl == 1) & (cos >= pos_thr))
-                # Negative: keep bottom lower_percentile by cosine
-                if len(neg_rows) >= 1:
-                    neg_thr = np.percentile(neg_rows['cosine_score'].astype(float), lower_percentile)
-                    mask |= ((lbl == 0) & (cos <= neg_thr))
-            else:
-                # fixed thresholds
-                mask = ((lbl == 1) & (cos >= float(pos_sim_thr))) | ((lbl == 0) & (cos <= float(neg_sim_thr)))
-            selected = ranked_df.loc[mask].copy()
+            # Apply percentile filtering
+            scores = ranked_df['rrf_score'].to_numpy(dtype=float)
+            pos_thr = np.percentile(scores, upper_percentile)
+            neg_thr = np.percentile(scores, lower_percentile)
+            
+            selected = ranked_df[(ranked_df['rrf_score'] >= pos_thr) | 
+                               (ranked_df['rrf_score'] <= neg_thr)]
+            
             if not selected.empty:
+                selected['label'] = (selected['rrf_score'] >= pos_thr).astype(int)
                 kept_rows.append(selected)
             
         except Exception as e:
-            try:
-                print(f"Error processing query {query_id} doc {document_id}: {e}")
-            except Exception:
-                print(f"Error processing group: {e}")
+            print(f"Error processing query {query_id}: {e}")
             continue
     
     # Clean up
@@ -601,40 +536,21 @@ def _process_queries_sequential(
     return kept_rows
 
 
-def _process_queries_parallel(
-    df: pd.DataFrame,
-    model_name: str,
-    upper_percentile: int,
-    lower_percentile: int,
-    max_workers: int,
-    pos_sim_thr: float,
-    neg_sim_thr: float,
-    filter_mode: str,
-) -> List[pd.DataFrame]:
+def _process_queries_parallel(df: pd.DataFrame, model_name: str, 
+                            upper_percentile: int, lower_percentile: int, max_workers: int) -> List[pd.DataFrame]:
     """Parallel processing with dedicated model instances per worker"""
     from concurrent.futures import ProcessPoolExecutor, as_completed
     import multiprocessing
     
-    # Determine total groups: per (query_id, document_id) if available
-    if 'document_id' in df.columns:
-        group_iter = df.groupby(['query_id','document_id'])
-        group_count = df[['query_id','document_id']].drop_duplicates().shape[0]
-    else:
-        group_iter = df.groupby('query_id')
-        group_count = df['query_id'].nunique()
     # Limit workers to available resources
-    effective_workers = min(max_workers, multiprocessing.cpu_count(), group_count)
+    effective_workers = min(max_workers, multiprocessing.cpu_count(), df['query_id'].nunique())
     print(f"Using {effective_workers} effective workers for ranking")
     
     # Group queries for batch processing
     query_groups = []
-    for keys, group_df in group_iter:
-        if len(group_df) >= 2:  # Skip very small groups per document
-            if isinstance(keys, tuple):
-                qid, did = keys
-            else:
-                qid, did = keys, group_df.get('document_id', pd.Series([''])).iloc[0]
-            query_groups.append((qid, did, group_df))
+    for query_id, group_df in df.groupby('query_id'):
+        if len(group_df) >= 2:  # Skip very small groups
+            query_groups.append((query_id, group_df))
     
     if not query_groups:
         return []
@@ -649,28 +565,24 @@ def _process_queries_parallel(
         future_to_query = {}
         worker_counter = 0
         
-        for query_id, document_id, group_df in query_groups:
+        for query_id, group_df in query_groups:
             worker_id = worker_counter % effective_workers + 1
             future = executor.submit(
                 _rank_single_query_worker,
                 query_id,
-                document_id,
                 group_df,
                 model_name,
                 upper_percentile,
                 lower_percentile,
-                worker_id,
-                pos_sim_thr,
-                neg_sim_thr,
-                filter_mode,
+                worker_id
             )
-            future_to_query[future] = (query_id, document_id)
+            future_to_query[future] = query_id
             worker_counter += 1
         
         # Collect results
         completed_count = 0
         for future in as_completed(future_to_query):
-            query_id, document_id = future_to_query[future]
+            query_id = future_to_query[future]
             completed_count += 1
             
             try:
@@ -679,28 +591,18 @@ def _process_queries_parallel(
                     kept_rows.append(result)
                 
                 if completed_count % 10 == 0:
-                    print(f"Parallel: Completed {completed_count}/{len(query_groups)} query-doc groups...")
+                    print(f"Parallel: Completed {completed_count}/{len(query_groups)} queries...")
                     
             except Exception as e:
-                print(f"Error processing query {query_id} doc {document_id} in parallel: {e}")
+                print(f"Error processing query {query_id} in parallel: {e}")
                 continue
     
     print(f"Parallel processing completed. {len(kept_rows)} successful query rankings.")
     return kept_rows
 
 
-def _rank_single_query_worker(
-    query_id: str,
-    document_id: str,
-    group_df: pd.DataFrame,
-    model_name: str,
-    upper_percentile: int,
-    lower_percentile: int,
-    worker_id: int,
-    pos_sim_thr: float,
-    neg_sim_thr: float,
-    filter_mode: str,
-) -> Optional[pd.DataFrame]:
+def _rank_single_query_worker(query_id: str, group_df: pd.DataFrame, model_name: str,
+                            upper_percentile: int, lower_percentile: int, worker_id: int) -> Optional[pd.DataFrame]:
     """Worker function for parallel query ranking with dedicated model
     
     Args:
@@ -725,31 +627,23 @@ def _rank_single_query_worker(
         
         if ranked_df.empty:
             return None
-
-        if 'label' not in ranked_df.columns:
-            return None
-        try:
-            lbl = ranked_df['label'].astype(int)
-        except Exception:
-            lbl = pd.to_numeric(ranked_df['label'], errors='coerce').fillna(0).astype(int)
-        cos = ranked_df['cosine_score'].astype(float)
-        if (filter_mode or "percentile").lower() == "percentile":
-            pos_rows = ranked_df[lbl == 1]
-            neg_rows = ranked_df[lbl == 0]
-            mask = pd.Series(False, index=ranked_df.index)
-            if len(pos_rows) >= 1:
-                pos_thr = np.percentile(pos_rows['cosine_score'].astype(float), upper_percentile)
-                mask |= ((lbl == 1) & (cos >= pos_thr))
-            if len(neg_rows) >= 1:
-                neg_thr = np.percentile(neg_rows['cosine_score'].astype(float), lower_percentile)
-                mask |= ((lbl == 0) & (cos <= neg_thr))
+        
+        # Apply percentile filtering
+        scores = ranked_df['rrf_score'].to_numpy(dtype=float)
+        pos_thr = np.percentile(scores, upper_percentile)
+        neg_thr = np.percentile(scores, lower_percentile)
+        
+        selected = ranked_df[(ranked_df['rrf_score'] >= pos_thr) | 
+                           (ranked_df['rrf_score'] <= neg_thr)].copy()  # Use copy() to avoid SettingWithCopyWarning
+        
+        if not selected.empty:
+            selected['label'] = (selected['rrf_score'] >= pos_thr).astype(int)
+            return selected
         else:
-            mask = ((lbl == 1) & (cos >= float(pos_sim_thr))) | ((lbl == 0) & (cos <= float(neg_sim_thr)))
-        selected = ranked_df.loc[mask].copy()
-        return selected if not selected.empty else None
+            return None
             
     except Exception as e:
-        print(f"Worker W{worker_id} error processing query {query_id} doc {document_id}: {e}")
+        print(f"Worker W{worker_id} error processing query {query_id}: {e}")
         return None
     finally:
         # Cleanup worker resources
@@ -827,9 +721,6 @@ def _cli():
     parser.add_argument("--chunk_size", type=int, default=50000, help="Số dòng đọc mỗi lượt")
     parser.add_argument("--up", type=int, default=80, help="Upper percentile POS")
     parser.add_argument("--low", type=int, default=20, help="Lower percentile NEG")
-    parser.add_argument("--pos-sim-thr", type=float, default=0.6, help="Ngưỡng cosine cho Positive (label=1), giữ nếu >= ngưỡng")
-    parser.add_argument("--neg-sim-thr", type=float, default=0.4, help="Ngưỡng cosine cho Negative (label=0), giữ nếu <= ngưỡng")
-    parser.add_argument("--filter-mode", choices=["percentile", "fixed"], default="percentile", help="Chọn cách lọc: percentile (theo nhãn) hoặc fixed (theo ngưỡng cosine)")
     args = parser.parse_args()
 
     args.output_dir.mkdir(exist_ok=True, parents=True)
@@ -840,12 +731,9 @@ def _cli():
         original_tsv=str(args.original),
         upper_percentile=args.up,
         lower_percentile=args.low,
-    model_name=args.model,
-    max_workers=args.workers,
-    chunk_size=args.chunk_size,
-    pos_sim_thr=args.pos_sim_thr,
-    neg_sim_thr=args.neg_sim_thr,
-    filter_mode=args.filter_mode,
+        model_name=args.model,
+        max_workers=args.workers,
+        chunk_size=args.chunk_size,
     )
 
 
@@ -859,20 +747,17 @@ if __name__ == "__main__":
         print("Interactive RRF Ranking UI")
         chunks_tsv = input("Enter path to CHUNKS TSV (from simple_chunk_controller): ").strip()
         original_tsv = input("Enter path to ORIGINAL TSV (query_id\tquery_text…): ").strip()
-    output_dir = input("Enter output directory [training_datasets]: ").strip() or "training_datasets"
+        output_dir = input("Enter output directory [training_datasets]: ").strip() or "training_datasets"
 
-    model = input("Embedding model [sentence-transformers/all-MiniLM-L6-v2]: ").strip() or "sentence-transformers/all-MiniLM-L6-v2"
-    workers = int(input("Parallel workers for ranking [4]: ") or "4")
-    up = int(input("Upper percentile POS [80]: ") or "80")
-    low = int(input("Lower percentile NEG [20]: ") or "20")
-    pos_thr = float(input("Positive cosine threshold [0.6]: ") or "0.6")
-    neg_thr = float(input("Negative cosine threshold [0.4]: ") or "0.4")
-    fmode = (input("Filter mode [percentile|fixed] (default percentile): ").strip() or "percentile")
-    chunk_sz = int(input("Chunk size rows [50000]: ") or "50000")
+        model = input("Embedding model [sentence-transformers/all-MiniLM-L6-v2]: ").strip() or "sentence-transformers/all-MiniLM-L6-v2"
+        workers = int(input("Parallel workers for ranking [4]: ") or "4")
+        up = int(input("Upper percentile POS [80]: ") or "80")
+        low = int(input("Lower percentile NEG [20]: ") or "20")
+        chunk_sz = int(input("Chunk size rows [50000]: ") or "50000")
 
-    Path(output_dir).mkdir(exist_ok=True, parents=True)
+        Path(output_dir).mkdir(exist_ok=True, parents=True)
 
-    rank_and_filter_chunks_optimized(
+        rank_and_filter_chunks_optimized(
             chunks_tsv=chunks_tsv,
             output_dir=Path(output_dir),
             original_tsv=original_tsv,
@@ -881,7 +766,4 @@ if __name__ == "__main__":
             model_name=model,
             max_workers=workers,
             chunk_size=chunk_sz,
-            pos_sim_thr=pos_thr,
-            neg_sim_thr=neg_thr,
-            filter_mode=fmode,
         )

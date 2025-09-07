@@ -4,8 +4,47 @@ import numpy as np
 import os
 import sys
 import argparse
-from typing import cast
+from typing import cast, Optional
 from sklearn.model_selection import KFold
+
+# ===== Helpers for normalization =====
+def _normalize_text_series(s):
+    try:
+        s = s.astype(str)
+        s = s.str.replace('\t', ' ', regex=False)
+        s = s.str.replace('\r', ' ', regex=False)
+        s = s.str.replace('\n', ' ', regex=False)
+        s = s.str.strip()
+        # Nén khoảng trắng thừa
+        s = s.str.replace(r"\s+", " ", regex=True)
+        return s
+    except Exception:
+        return s
+
+def _normalize_label_value(v):
+    """Map label theo các giá trị phổ biến, sau đó ép về int nếu là số."""
+    if v is None:
+        return None
+    try:
+        s = str(v).strip().lower()
+        if s == "" or s == "nan":
+            return None
+        # Map boolean/text to numeric
+        pos_set = {"1", "+1", "true", "yes", "y", "relevant", "rel", "pos", "+", "positive"}
+        neg_set = {"0", "-1", "false", "no", "n", "irrelevant", "nonrelevant", "neg", "-", "negative"}
+        if s in pos_set:
+            return 1
+        if s in neg_set:
+            # Với IR có thể coi -1 là 0 (không liên quan)
+            return 0
+        # Thử parse số
+        fv = float(s)
+        if fv != fv:
+            return None
+        # Giữ nguyên miền giá trị nhưng cast int cho MatchZoo
+        return int(fv)
+    except Exception:
+        return None
 
 # ===== Hardcoded defaults (optional one-shot mode) =====
 # Adjust these paths to your environment, then run:
@@ -13,7 +52,7 @@ from sklearn.model_selection import KFold
 HARD_CODED_CONFIG = {
     # Input should be a 3-column TSV: query_text (or query), chunk_text (or passage), label
     # Recommended: the mapping output produced by controller ranking: *_with_querytext.tsv
-    "input_file": "training_datasets/semantic_splitter_global_chunks_rrf_filtered_with_querytext.tsv",
+    "input_file": "F:/SematicSearch/final_with_querytext.tsv",
     # Where to write cv_folds/*.dam files
     "output_dir": "datapacks/semantic_splitter_global",
     # Data properties
@@ -257,7 +296,7 @@ def main():
         print(f"Lỗi: {e}")
         sys.exit(1)
 
-def create_and_split_datapack(input_file: str, train_ratio: float, has_header: bool, create_cv_folds: bool = True, n_folds: int = 5, output_dir: str | None = None):
+def create_and_split_datapack(input_file: str, train_ratio: float, has_header: bool, create_cv_folds: bool = True, n_folds: int = 5, output_dir: Optional[str] = None):
     """
     Đọc file TSV, chuyển đổi thành các DataPack của MatchZoo cho Cross-Validation.
     
@@ -302,16 +341,40 @@ def create_and_split_datapack(input_file: str, train_ratio: float, has_header: b
         print(f"Lỗi khi đọc file: {e}")
         sys.exit(1)
 
-    # 2) Chuẩn hoá tên cột
-    df = cast(pd.DataFrame, df_raw.rename(columns={
-        df_raw.columns[0]: 'text_left',
-        df_raw.columns[1]: 'text_right',
-        df_raw.columns[2]: 'label'
-    }))
+    # 2) Chuẩn hoá tên cột (tự động dò theo header nếu có)
+    def _select_columns_by_name(df_in: pd.DataFrame):
+        cols = [str(c).strip().lower() for c in df_in.columns]
+        name_map = {c: df_in.columns[i] for i, c in enumerate(cols)}
+        left_names = ['query_text', 'query', 'q', 'question']
+        right_names = ['chunk_text', 'passage', 'document', 'doc', 'text', 'answer']
+        label_names = ['label', 'relevance', 'rel', 'y']
 
-    # 3) Làm sạch dữ liệu
-    df['label'] = pd.to_numeric(df['label'], errors='coerce')
+        left_col = next((name_map[n] for n in left_names if n in name_map), None)
+        right_col = next((name_map[n] for n in right_names if n in name_map), None)
+        label_col = next((name_map[n] for n in label_names if n in name_map), None)
+        return left_col, right_col, label_col
+
+    left_col, right_col, label_col = _select_columns_by_name(df_raw) if has_header else (None, None, None)
+
+    if left_col and right_col and label_col:
+        use_df = df_raw[[left_col, right_col, label_col]].copy()
+        use_df.columns = ['text_left', 'text_right', 'label']
+    else:
+        # Fallback: dùng 3 cột đầu
+        if len(df_raw.columns) < 3:
+            print(f"Lỗi: File cần tối thiểu 3 cột, nhận được {len(df_raw.columns)}")
+            sys.exit(1)
+        use_df = df_raw.iloc[:, :3].copy()
+        use_df.columns = ['text_left', 'text_right', 'label']
+
+    df = cast(pd.DataFrame, use_df)
+
+    # 3) Làm sạch dữ liệu (chuẩn hoá text và label)
+    df['text_left'] = _normalize_text_series(df['text_left'])
+    df['text_right'] = _normalize_text_series(df['text_right'])
+    df['label'] = df['label'].map(_normalize_label_value)
     df.dropna(subset=['text_left', 'text_right', 'label'], inplace=True)
+    df = df[(df['text_left'] != '') & (df['text_right'] != '')]
     df['label'] = df['label'].astype(int)
     df.reset_index(drop=True, inplace=True)
     
@@ -320,6 +383,16 @@ def create_and_split_datapack(input_file: str, train_ratio: float, has_header: b
         sys.exit(1)
         
     print(f"Tìm thấy {len(df)} dòng dữ liệu hợp lệ.")
+    # Sanity check: số lượng text_left duy nhất quá lớn có thể là sai cột (ví dụ dùng document_id thay vì query_text)
+    try:
+        uniq_left = int(df['text_left'].nunique())
+        uniq_right = int(df['text_right'].nunique())
+        print(f"Unique text_left: {uniq_left}, Unique text_right: {uniq_right}")
+        if uniq_left > 5000:
+            print("[Cảnh báo] Số lượng text_left duy nhất rất lớn. Có thể bạn đã chọn sai cột cho query_text.")
+            print("[Gợi ý] Đảm bảo cột đầu tiên là query_text (không phải query_id/document_id).")
+    except Exception:
+        pass
 
     # 4) Đóng gói thành DataPack
     pack = mz.pack(df[['text_left', 'text_right', 'label']])
@@ -371,9 +444,12 @@ def create_cv_folds_from_large_file(input_file: str, has_header: bool, n_folds: 
                     chunk.columns[2]: 'label'
                 })
             
-            # Clean chunk
-            chunk['label'] = pd.to_numeric(chunk['label'], errors='coerce')
+            # Clean chunk: normalize text and label mapping
+            chunk['text_left'] = _normalize_text_series(chunk['text_left'])
+            chunk['text_right'] = _normalize_text_series(chunk['text_right'])
+            chunk['label'] = chunk['label'].map(_normalize_label_value)
             chunk.dropna(subset=['text_left', 'text_right', 'label'], inplace=True)
+            chunk = chunk[(chunk['text_left'] != '') & (chunk['text_right'] != '')]
             total_rows += len(chunk)
             
         print(f"Total valid rows: {total_rows:,}")
@@ -413,9 +489,12 @@ def create_cv_folds_from_large_file(input_file: str, has_header: bool, n_folds: 
                     chunk.columns[2]: 'label'
                 })
             
-            # Clean chunk
-            chunk['label'] = pd.to_numeric(chunk['label'], errors='coerce')
+            # Clean chunk: normalize text and label mapping
+            chunk['text_left'] = _normalize_text_series(chunk['text_left'])
+            chunk['text_right'] = _normalize_text_series(chunk['text_right'])
+            chunk['label'] = chunk['label'].map(_normalize_label_value)
             chunk.dropna(subset=['text_left', 'text_right', 'label'], inplace=True)
+            chunk = chunk[(chunk['text_left'] != '') & (chunk['text_right'] != '')]
             chunk.reset_index(drop=True, inplace=True)
             
             for idx, row in chunk.iterrows():
