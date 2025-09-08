@@ -188,6 +188,9 @@ _MODEL_PRESETS = {
     "5": ("auto", "Auto-select based on sys RAM/GPU"),
 }
 
+# Notes: new pipeline options added: cross_encoder_re-score (high-quality boundary scoring)
+# and global_dp_penalty (float) to run DP-based global segmentation on top of splitter candidates.
+
 """
 
 # ==== Ranking defaults and hardcoded parameters (user-editable) ====
@@ -1544,6 +1547,33 @@ RUN_CONFIGURATIONS: List[Dict[str, Any]] = [
         "description": "RMT + multiscale modularity (primary) with Spectral fallback; split/merge + one‑pass reassignment"
     },
     {
+        "name": "semantic_splitter_ce_dp",
+        "method_choice": "2",
+        "params": {
+            "auto_params": True,
+            # Use cross-encoder re-scoring of candidate boundaries plus global DP
+            "use_cross_encoder": True,
+            # cross-encoder model name (None -> recommend external config or default)
+            "cross_encoder_model": "cross-encoder/ms-marco-MiniLM-L-6-v2",
+            # DP penalty: default small (favor coherence), user can tune
+            "global_dp_penalty": 0.05,
+        },
+        "description": "High-quality splitter: over-seg -> cross-encoder re-score -> DP global segmentation (best-quality, slow)"
+    },
+    {
+        "name": "semantic_grouping_consensus",
+        "method_choice": "1",
+        "params": {
+            "auto_params": True,
+            # Conservative consensus sweep for modularity
+            "mod_gamma_start": 0.4,
+            "mod_gamma_end": 1.8,
+            "mod_gamma_step": 0.12,
+            "consensus_quantile": 0.50,
+        },
+        "description": "Consensus-stable grouping (multiscale modularity + co-association spectral consensus)"
+    },
+    {
         "name": "text_splitter_char_naive",
         "method_choice": "3",
         "params": {
@@ -1823,6 +1853,9 @@ def main():
         "--configs",
         help="Comma separated config names or numbers to run (default all)",
     )
+    # High-quality options
+    ap.add_argument("--cross-encoder-model", default=None, help="Cross-encoder model name (for boundary re-scoring, e.g., cross-encoder/ms-marco-MiniLM-L-6-v2)")
+    ap.add_argument("--global-dp-penalty", type=float, default=None, help="DP penalty per cut when using DP global segmentation (float, default from config)")
     # Controller hardcoded toggle (with alias for convenience)
     ap.add_argument("--use-hardcoded", action="store_true", dest="use_hardcoded", help="Use HARD_CODED_CONTROLLER for input/output and heatmap options")
     ap.add_argument("--use-hardcode", action="store_true", dest="use_hardcoded", help=argparse.SUPPRESS)
@@ -1949,6 +1982,20 @@ def main():
                 if cfg.get("method_choice") == "1":
                     cfg.setdefault("params", {})
                     cfg["params"]["engine"] = args.grouping_engine
+            except Exception:
+                pass
+
+    # Propagate cross-encoder / DP CLI overrides into splitter configs if present
+    if args.cross_encoder_model is not None or args.global_dp_penalty is not None:
+        for cfg in configs:
+            try:
+                if cfg.get("method_choice") == "2":
+                    cfg.setdefault("params", {})
+                    if args.cross_encoder_model is not None:
+                        cfg["params"]["cross_encoder_model"] = args.cross_encoder_model
+                        cfg["params"]["use_cross_encoder"] = True
+                    if args.global_dp_penalty is not None:
+                        cfg["params"]["global_dp_penalty"] = float(args.global_dp_penalty)
             except Exception:
                 pass
 

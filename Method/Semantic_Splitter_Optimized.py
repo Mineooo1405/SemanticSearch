@@ -4,6 +4,138 @@ import numpy as np
 import re
 from Tool.Sentence_Segmenter import extract_sentences_spacy
 from .semantic_common import normalize_device, embed_sentences_batched, log_msg
+import math
+from functools import lru_cache
+
+# Optional cross-encoder support (used for high-quality boundary scoring / global DP)
+_CE_TOKENIZER = None
+_CE_MODEL = None
+
+def _load_cross_encoder(model_name: str, device: Optional[str] = None):
+    """Lazy-load a HuggingFace cross-encoder model (if available).
+
+    Returns (tokenizer, model) or (None, None) on failure. Non-fatal.
+    """
+    global _CE_TOKENIZER, _CE_MODEL
+    if _CE_TOKENIZER is not None and _CE_MODEL is not None:
+        return _CE_TOKENIZER, _CE_MODEL
+    try:
+        from transformers import AutoTokenizer, AutoModelForSequenceClassification
+        tok = AutoTokenizer.from_pretrained(model_name)
+        mdl = AutoModelForSequenceClassification.from_pretrained(model_name)
+        if device is not None:
+            try:
+                mdl.to(device)
+            except Exception:
+                pass
+        mdl.eval()
+        _CE_TOKENIZER, _CE_MODEL = tok, mdl
+        return tok, mdl
+    except Exception:
+        return None, None
+
+def _cross_encoder_pair_score(tokenizer, model, left: str, right: str, device: Optional[str] = None) -> float:
+    """Return a probability-like score that there should be a boundary between left and right.
+
+    If the cross-encoder returns logits for 2 classes, we take softmax[1]. Otherwise fallback to a heuristic.
+    """
+    try:
+        inp = tokenizer([left], [right], padding=True, truncation=True, return_tensors='pt')
+        if device is not None:
+            try:
+                inp = {k: v.to(device) for k, v in inp.items()}
+            except Exception:
+                pass
+        with __import__('torch').no_grad():
+            out = model(**inp)
+        logits = out.logits
+        if logits is None:
+            return 0.0
+        import torch
+        probs = torch.nn.functional.softmax(logits, dim=-1)
+        # If binary, assume class 1 => boundary
+        if probs.shape[-1] >= 2:
+            return float(probs[0, 1].cpu().item())
+        return float(probs[0].max().cpu().item())
+    except Exception:
+        return 0.0
+
+def _segment_coherence_score(sentences: List[str], tokenizer=None, model=None, device=None) -> float:
+    """Compute a coherence score for a segment: average adjacent cross-encoder pair scores if CE available,
+    otherwise average adjacent embedding cosine (fallback).
+    """
+    if not sentences:
+        return 0.0
+    if tokenizer is not None and model is not None:
+        s = 0.0
+        cnt = 0
+        for i in range(len(sentences) - 1):
+            s += _cross_encoder_pair_score(tokenizer, model, sentences[i], sentences[i + 1], device=device)
+            cnt += 1
+        return s / max(1, cnt)
+    # Fallback: simple bi-encoder-ish dot on sentence embeddings (use embed_sentences_batched)
+    try:
+        embs = embed_sentences_batched(sentences, base_batch_size=16, model_name=None, device=device, silent=True)
+        if embs is None or len(embs) <= 1:
+            return 0.0
+        norms = (embs * embs).sum(axis=1) ** 0.5
+        norms[norms == 0] = 1e-9
+        embs = embs / norms[:, None]
+        ssum = 0.0
+        for i in range(len(embs) - 1):
+            ssum += float((embs[i] @ embs[i + 1].T))
+        return float(ssum / max(1, len(embs) - 1))
+    except Exception:
+        return 0.0
+
+def _dp_optimal_segmentation(sentences: List[str], candidates: List[int], coherence_fn, penalty: float = 0.0):
+    """Dynamic programming segmentation where cuts are allowed only at indices in `candidates`.
+
+    sentences: list of sentences
+    candidates: indices where a cut may occur (1..n-1)
+    coherence_fn(segment_sentences) -> float
+    penalty: cost subtracted per cut to discourage oversegmentation
+    Returns chosen cuts (sorted list)
+    """
+    n = len(sentences)
+    allowed = set([0, n] + list(candidates))
+    positions = sorted([p for p in allowed if 0 <= p <= n])
+    idx_of = {p: i for i, p in enumerate(positions)}
+    m = len(positions)
+    # Precompute coherence for any segment from pos i to j (positions[index_i] .. positions[index_j])
+    seg_score = [[0.0] * m for _ in range(m)]
+    for i in range(m):
+        for j in range(i + 1, m):
+            a = positions[i]
+            b = positions[j]
+            seg = sentences[a:b]
+            seg_score[i][j] = coherence_fn(seg)
+    # DP
+    dp = [-1e12] * m
+    prev = [-1] * m
+    dp[0] = 0.0
+    for i in range(1, m):
+        for j in range(0, i):
+            # add segment j->i (positions[j]..positions[i])
+            score = dp[j] + seg_score[j][i]
+            # subtract penalty for making a cut at positions[i] if it's not the final end
+            if positions[i] != n:
+                score -= penalty
+            if score > dp[i]:
+                dp[i] = score
+                prev[i] = j
+    # reconstruct cuts
+    cur = m - 1
+    cuts = []
+    while cur > 0:
+        p = prev[cur]
+        if p is None or p < 0:
+            break
+        pos = positions[cur]
+        if pos != n:
+            cuts.append(pos)
+        cur = p
+    return sorted(cuts)
 
 def _embed(sentences: List[str], model_name: str, device, silent: bool) -> Optional[np.ndarray]:
     """Embed a list of sentences into L2‑normalized vectors.

@@ -205,11 +205,13 @@ def semantic_grouping_main(
             if G.number_of_edges() == 0:
                 return None
 
-            # Sweep gamma
+            # Sweep gamma, but build a consensus across multiple resolutions to increase stability.
             cur = float(gamma_start)
             gamma_end_eff = float(gamma_end)
             gamma_step_eff = float(gamma_step if gamma_step > 0 else 0.2)
             tried_any = False
+            label_list = []
+            gamma_list = []
             while cur <= gamma_end_eff + 1e-9:
                 tried_any = True
                 try:
@@ -217,36 +219,49 @@ def semantic_grouping_main(
                     labels_arr = np.array([int(part.get(i, 0)) for i in range(n_local)], dtype=int)
                     k = int(np.max(labels_arr) + 1) if labels_arr.size else 0
                     if 2 <= k <= int(max(2, min(kmax_cap, n_local - 1))):
-                        # Score = k minus separation (encourage smaller K and tighter groups)
-                        clusters = [[] for _ in range(k)]
-                        for i_node, labc in enumerate(labels_arr.tolist()):
-                            clusters[int(labc)].append(i_node)
-                        within_vals = []
-                        between_vals = []
-                        for a in range(k):
-                            ca = clusters[a]
-                            if len(ca) >= 2:
-                                for i2 in range(len(ca)):
-                                    for j2 in range(i2 + 1, len(ca)):
-                                        within_vals.append(float(A[ca[i2], ca[j2]]))
-                            for b in range(a + 1, k):
-                                cb = clusters[b]
-                                for ia in ca:
-                                    for ib in cb:
-                                        between_vals.append(float(A[ia, ib]))
-                        w_mean = float(np.mean(within_vals)) if within_vals else 0.0
-                        b_mean = float(np.mean(between_vals)) if between_vals else 0.0
-                        sep = max(0.0, w_mean - b_mean)
-                        score = float(k) - sep  # smaller is better
-                        if score < best_score - 1e-6 or (abs(score - best_score) <= 1e-6 and k < best_k):
-                            best_score = score
-                            best_k = k
-                            best_labels = labels_arr
+                        label_list.append(labels_arr)
+                        gamma_list.append(float(cur))
                 except Exception:
                     pass
                 cur += gamma_step_eff
-            if tried_any:
-                return best_labels
+
+            if not label_list:
+                return None
+
+            # Consensus: compute pairwise co-association matrix and do spectral clustering on it.
+            try:
+                m = len(label_list)
+                C = np.zeros((n_local, n_local), dtype=float)
+                for lab in label_list:
+                    for i in range(n_local):
+                        for j in range(i + 1, n_local):
+                            if lab[i] == lab[j]:
+                                C[i, j] += 1.0
+                                C[j, i] += 1.0
+                C = C / float(m)
+                # threshold weak co-associations
+                thr = float(np.quantile(C[np.triu_indices(n_local, 1)], 0.5)) if n_local > 1 else 0.0
+                Wc = np.where(C >= thr, C, 0.0)
+                Wc = np.maximum(Wc, Wc.T)
+                # choose K via eigengap on Laplacian of Wc
+                if np.allclose(Wc, 0.0):
+                    return label_list[-1]
+                Lc = _normalized_laplacian(Wc)
+                evals, evecs = np.linalg.eigh(Lc)
+                order = np.argsort(evals)
+                evals = evals[order]
+                gaps = np.diff(evals[: min(len(evals)-1, kmax_cap) + 1])
+                if gaps.size == 0:
+                    k_final = 2
+                else:
+                    k_final = int(max(2, min(kmax_cap, int(np.argmax(gaps) + 1))))
+                U = evecs[:, :k_final]
+                row_norm = np.linalg.norm(U, axis=1) + 1e-9
+                U_norm = U / row_norm[:, None]
+                labels = _kmeans(U_norm, k=k_final, n_init=10, max_iter=200, seed=0)
+                return labels
+            except Exception:
+                return label_list[-1]
         except Exception:
             # networkx/community not available → no modularity
             return None
@@ -476,6 +491,67 @@ def semantic_grouping_main(
             merged.append(g)
 
     # ===== One‑pass boundary sentence re‑assignment =====
+    # ===== Refinement pass: adaptive split of loose clusters and merge near-duplicate neighbors =====
+    try:
+        # Compute internal means for all merged clusters
+        internal_means = [float(_mean_within(g)) for g in merged]
+        # Adaptive low threshold: clusters with internal mean below this are candidates to split
+        if len(internal_means) >= 2:
+            low_thr = float(np.percentile(np.array(internal_means, dtype=float), 25))
+        else:
+            low_thr = 0.0
+
+        refined: List[List[int]] = []
+        for idx, g in enumerate(merged):
+            if len(g) >= 6 and float(_mean_within(g)) < max(0.5, low_thr):
+                # Try spectral k=2 split if cluster is large but internally loose
+                sp = _spectral_split_k2(g)
+                if sp is not None:
+                    left, right = sp
+                    # Accept split only if both halves have higher internal coherence than parent
+                    parent_mean = float(_mean_within(g))
+                    left_mean = float(_mean_within(left))
+                    right_mean = float(_mean_within(right))
+                    if left_mean > parent_mean and right_mean > parent_mean:
+                        refined.append(sorted(left))
+                        refined.append(sorted(right))
+                        continue
+            refined.append(g)
+
+        # Merge adjacent clusters when inter similarity is nearly as high as internal similarity
+        merged_adj: List[List[int]] = []
+        i = 0
+        while i < len(refined):
+            cur = refined[i]
+            j = i + 1
+            # attempt to merge with following clusters greedily when inter_mean >= 0.9 * min(internal_cur, internal_next)
+            while j < len(refined):
+                inter = _mean_between(cur, refined[j])
+                cur_mean = float(_mean_within(cur))
+                next_mean = float(_mean_within(refined[j]))
+                cmp_thr = 0.9 * min(max(cur_mean, 1e-6), max(next_mean, 1e-6))
+                # also allow merge if inter is above an absolute adaptive quantile of sim_sharp
+                try:
+                    all_vals = np.asarray(sim_sharp, dtype=float)
+                    vals = all_vals[all_vals > 0.0]
+                    global_merge_thr = float(np.quantile(vals, 0.60)) if vals.size else 0.5
+                except Exception:
+                    global_merge_thr = 0.5
+
+                if inter >= max(cmp_thr, global_merge_thr):
+                    # merge
+                    cur = sorted(cur + refined[j])
+                    j += 1
+                else:
+                    break
+            merged_adj.append(cur)
+            i = j
+
+        merged = merged_adj
+    except Exception:
+        # On any error, keep original merged
+        pass
+
     if len(merged) >= 2:
         # Auto reassignment improvement threshold
         if auto_params:

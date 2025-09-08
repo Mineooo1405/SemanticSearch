@@ -1,5 +1,7 @@
 import os
 import re
+import hashlib
+from collections import defaultdict
 
 def parse_topics(topics_file_path):
     """
@@ -40,6 +42,14 @@ def parse_topics(topics_file_path):
     return topics_data
 
 def main():
+    # ---- Config (simple toggles; adjust as needed) ----
+    DEDUP_BY_PAIR = True  # Bỏ trùng theo (query_id, document_id)
+    DEDUP_SAME_CONTENT_WITHIN_QUERY = True  # Bỏ trùng khi cùng query_id và nội dung document sau clean giống nhau
+    MIN_QUERY_LEN = 1  # Bỏ dòng nếu query_text (sau clean) ngắn hơn
+    MIN_DOC_LEN = 1    # Bỏ dòng nếu document (sau clean) ngắn hơn
+    SKIP_FILE_NOT_FOUND = True
+    SKIP_ERROR_READING = True
+
     workspace_root = "f:/SematicSearch/"  # Sửa đường dẫn nếu cần, ví dụ: "C:/Users/YourName/SemanticSearch/"
     qrels_file_path = os.path.join(workspace_root, "robustirdata/qrels.robust04.txt")
     topics_file_path = os.path.join(workspace_root, "robustirdata/topics.robust04.txt")
@@ -55,6 +65,16 @@ def main():
 
     output_lines_count = 0
     skipped_no_info_count = 0  # Track documents skipped for having no information
+    skipped_empty_query = 0
+    skipped_empty_doc = 0
+    skipped_file_missing = 0
+    skipped_read_error = 0
+    skipped_dupe_pair = 0
+    skipped_dupe_content = 0
+
+    # Dedup trackers
+    seen_pairs = set()  # (query_id, document_id)
+    seen_doc_hash_by_query = defaultdict(set)  # query_id -> {md5(document_cleaned)}
     try:
         with open(output_file_path, 'w', encoding='utf-8') as outfile:
             outfile.write("query_id\tquery_text\tdocument_id\tdocument\tlabel\n")  # Header
@@ -74,46 +94,86 @@ def main():
 
                     topic_info = topics.get(query_id)
                     if not topic_info:
-                        print(f"Warning: No topic for query {query_id}. Skipping.")
+                        # Missing topic mapping → cannot provide query_text
+                        # Skip to maintain downstream 5-column integrity
                         continue
 
                     query_text = topic_info.get('query_text', '').replace('\t', ' ')
+                    query_text = re.sub(r'\s+', ' ', query_text).strip()
                     # Clean query text quotes for TSV consistency
                     query_text = query_text.replace('""', '"').replace('"', "'")  # Normalize quotes
+
+                    # Filter empty query
+                    if len(query_text) < MIN_QUERY_LEN:
+                        skipped_empty_query += 1
+                        continue
+
+                    # Dedup by (query_id, document_id)
+                    if DEDUP_BY_PAIR:
+                        key = (query_id, document_id)
+                        if key in seen_pairs:
+                            skipped_dupe_pair += 1
+                            continue
 
                     actual_data_file_path = os.path.join(data_dir, document_id)
                     document = ""
                     try:
                         with open(actual_data_file_path, 'r', encoding='utf-8', errors='ignore') as df:
                             document = df.read()
-                            # Clean document text for TSV format
-                            document = document.replace('\t', ' ').replace('\n', ' ').replace('\r', '').strip()
-                            document = re.sub(r'\s+', ' ', document)  # Remove extra whitespace
-                            
-                            # FILTER: Skip documents with no information
-                            if document.strip() == "This document has no information.":
-                                print(f"Skipping document {document_id} - marked as having no information")
-                                skipped_no_info_count += 1
-                                continue
-                            
-                            # Fix quotes for TSV format - normalize nested quotes and escape properly
-                            # Replace double quotes with single quotes to avoid TSV parsing issues
-                            document = document.replace('""', '"')  # Fix double-double quotes first
-                            document = document.replace('"', "'")   # Convert all quotes to single quotes
-                            
                     except FileNotFoundError:
+                        if SKIP_FILE_NOT_FOUND:
+                            skipped_file_missing += 1
+                            continue
                         document = "FILE_NOT_FOUND"
-                    except Exception as e:
+                    except Exception:
+                        if SKIP_ERROR_READING:
+                            skipped_read_error += 1
+                            continue
                         document = "ERROR_READING_FILE"
+
+                    # Clean document text for TSV format
+                    document = document.replace('\t', ' ').replace('\n', ' ').replace('\r', '').strip()
+                    document = re.sub(r'\s+', ' ', document)  # Remove extra whitespace
+
+                    # FILTER: Skip documents with no information
+                    if document == "This document has no information.":
+                        skipped_no_info_count += 1
+                        continue
+
+                    # Normalize quotes for TSV
+                    document = document.replace('""', '"')  # Fix double-double quotes first
+                    document = document.replace('"', "'")   # Convert all quotes to single quotes
+
+                    # Filter empty/short doc
+                    if len(document) < MIN_DOC_LEN:
+                        skipped_empty_doc += 1
+                        continue
+
+                    # Dedup by same content within the same query
+                    if DEDUP_SAME_CONTENT_WITHIN_QUERY:
+                        doc_hash = hashlib.md5(document.encode('utf-8', errors='ignore')).hexdigest()
+                        if doc_hash in seen_doc_hash_by_query[query_id]:
+                            skipped_dupe_content += 1
+                            continue
+
+                    # Passed all filters → record and write
+                    if DEDUP_BY_PAIR:
+                        seen_pairs.add((query_id, document_id))
+                    if DEDUP_SAME_CONTENT_WITHIN_QUERY:
+                        seen_doc_hash_by_query[query_id].add(doc_hash)
 
                     outfile.write(f"{query_id}\t{query_text}\t{document_id}\t{document}\t{label}\n")
                     output_lines_count += 1
+
+                    # Light progress
+                    if output_lines_count % 200000 == 0:
+                        print(f"Progress: written {output_lines_count:,} rows (line {line_num:,})")
 
     except Exception as e:
         print(f"Error: {e}")
 
     print(f"Finished. {output_lines_count} records written to {output_file_path}.")
-    print(f"Skipped {skipped_no_info_count} documents marked as having no information.")
+    print(f"Skipped: no_info={skipped_no_info_count}, empty_query={skipped_empty_query}, empty_doc={skipped_empty_doc}, file_missing={skipped_file_missing}, read_error={skipped_read_error}, dupe_pair={skipped_dupe_pair}, dupe_content={skipped_dupe_content}")
 
 if __name__ == "__main__":
     main()
