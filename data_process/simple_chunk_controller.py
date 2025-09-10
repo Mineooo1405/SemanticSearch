@@ -108,8 +108,7 @@ from Method.Semantic_Splitter_Optimized import (
     chunk_passage_text_splitter as semantic_splitter,
 )
 from Method.Text_Splitter_Char_Naive import chunk_passage_text_splitter as chunk_passage_text_splitter_char_naive
-from Method.WeSWin_Paper_Splitter import weswin_paper_splitter
-from Method.TextTiling_LLM_Splitter import texttiling_llm_splitter
+# Removed WeSWin/TextTiling experimental splitters along with their configs
 from Tool.rank_chunks_optimized import rank_and_filter_chunks_optimized
 
 # ==== Default constants ====
@@ -553,7 +552,7 @@ def _process_batch(
     params = dict(config["params"])  # shallow copy
 
     # map
-    func_map = {"1": semantic_grouping, "2": semantic_splitter, "3": chunk_passage_text_splitter_char_naive, "4": weswin_paper_splitter, "5": texttiling_llm_splitter}
+    func_map = {"1": semantic_grouping, "2": semantic_splitter, "3": chunk_passage_text_splitter_char_naive}
     chunk_func = func_map[method_choice]
 
     import os
@@ -730,7 +729,7 @@ def _process_batch(
 
         # Optional: overwrite correlation heatmap with red boundary lines (Splitter only)
         try:
-            if export_correlation and correlation_dir and method_choice in {"2", "4", "5"}:
+            if export_correlation and correlation_dir and method_choice in {"2"}:
                 sents_full = extract_sentences_spacy(passage)
                 if isinstance(sents_full, list) and len(sents_full) > 1:
                     import matplotlib
@@ -1489,36 +1488,7 @@ RUN_CONFIGURATIONS: List[Dict[str, Any]] = [
         },
         "description": "Contiguous semantic splitter using C99 over embedding sim matrix (+ optional length post-process)"
     },
-    {
-        "name": "semantic_splitter_weswin_paper",
-        "method_choice": "4",
-        "params": {
-            # WeSWin inference (unsupervised backend to mimic paper inference pipeline)
-            "stride_k": 6,
-            "max_sentences_per_window": 30,
-            "weighting": "linear",   # linear | poly | uniform
-            "weight_eps": 0.1,
-            "weight_k": 8,
-            "weight_poly_p": 2,
-            "decision_threshold": 0.75,  # Tăng từ 0.5 → 0.75 để giảm over-segmentation
-            "smooth_window": 5,
-            "min_boundary_spacing": 12,
-            "min_first_boundary_index": 10,
-        },
-        "description": "WeSWin (Weighted Sliding Windows) – inference không giám sát gần paper",
-    },
-    {
-        "name": "semantic_splitter_texttiling_llm",
-        "method_choice": "5",
-        "params": {
-            # TextTiling-LLM baseline như paper (max-pooling cosine giữa 2 cửa sổ k câu)
-            "k_window": 5,
-            "threshold": 0.5,
-            "min_boundary_spacing": 10,
-            "min_first_boundary_index": 8,
-        },
-        "description": "TextTiling-LLM baseline (max-pooling cosine, threshold + NMS spacing)",
-    },
+    
     {
         "name": "semantic_grouping_cluster",
         "method_choice": "1",
